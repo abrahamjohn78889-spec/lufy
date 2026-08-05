@@ -50,6 +50,7 @@ TRADING_KEYS: Final[tuple[str, ...]] = (
     "entry_price_max",
     "tick_size",
     "min_tradable_size",
+    "submission_count",
     "cancel_lead_ms",
     "cancel_ack_timeout_ms",
     "feed_stale_warn_ms",
@@ -121,6 +122,10 @@ class ArcSettings(BaseSettings):
     entry_price_max: str = ""
     tick_size: str = ""
     min_tradable_size: str = ""
+
+    # How many independent passive orders one approved exposure is DIVIDED into.
+    # Never a multiplier: N submissions sum to the single approved size.
+    submission_count: int = 1
 
     cancel_lead_ms: int = 500
     cancel_ack_timeout_ms: int = 1000
@@ -240,6 +245,7 @@ class TradingConfig:
     entry_price_max: Decimal
     tick_size: Decimal
     min_tradable_size: Decimal
+    submission_count: int
     cancel_lead_ms: int
     cancel_ack_timeout_ms: int
     feed_stale_warn_ms: int
@@ -290,6 +296,7 @@ class TradingConfig:
             "entry_price_max": dec_str(self.entry_price_max),
             "tick_size": dec_str(self.tick_size),
             "min_tradable_size": dec_str(self.min_tradable_size),
+            "submission_count": str(self.submission_count),
             "cancel_lead_ms": str(self.cancel_lead_ms),
             "cancel_ack_timeout_ms": str(self.cancel_ack_timeout_ms),
             "feed_stale_warn_ms": str(self.feed_stale_warn_ms),
@@ -521,6 +528,27 @@ def build_trading_config(values: dict[str, str]) -> TradingConfig:
             "Every order at the top of the band would be rejected."
         )
 
+    # 16. Submission count. The approved exposure is DIVIDED into this many passive
+    #     orders; it is never a multiplier. Zero or negative would produce a window
+    #     that submits nothing while every other value reads as configured. The
+    #     upper bound is the number of whole exchange minimums the budget can buy at
+    #     the top of the band: beyond that every split is below the venue minimum and
+    #     the engine would silently reduce N on every single window.
+    submission_count = _int_value(values, "submission_count")
+    if submission_count <= 0:
+        raise ConfigInvariantError(
+            f"SUBMISSION_COUNT must be at least 1, got {submission_count}. "
+            "Zero would submit no order for a window that had been approved."
+        )
+    max_splits = int(max_affordable / min_tradable)
+    if submission_count > max_splits:
+        raise ConfigInvariantError(
+            f"SUBMISSION_COUNT {submission_count} exceeds {max_splits}, the number of "
+            f"exchange minimums ({min_tradable}) that POSITION_NOTIONAL_USD "
+            f"{position_notional} buys at ENTRY_PRICE_MAX {entry_max}. Every split "
+            "would fall below the venue minimum and be reduced away."
+        )
+
     cancel_lead_ms = _int_value(values, "cancel_lead_ms")
     cancel_ack_timeout_ms = _int_value(values, "cancel_ack_timeout_ms")
 
@@ -631,6 +659,7 @@ def build_trading_config(values: dict[str, str]) -> TradingConfig:
         entry_price_max=entry_max,
         tick_size=tick_size,
         min_tradable_size=min_tradable,
+        submission_count=submission_count,
         cancel_lead_ms=cancel_lead_ms,
         cancel_ack_timeout_ms=cancel_ack_timeout_ms,
         feed_stale_warn_ms=feed_warn,
@@ -706,6 +735,7 @@ def env_trading_values(env: ArcSettings) -> dict[str, str]:
         "entry_price_max": env.entry_price_max,
         "tick_size": env.tick_size,
         "min_tradable_size": env.min_tradable_size,
+        "submission_count": str(env.submission_count),
         "cancel_lead_ms": str(env.cancel_lead_ms),
         "cancel_ack_timeout_ms": str(env.cancel_ack_timeout_ms),
         "feed_stale_warn_ms": str(env.feed_stale_warn_ms),
