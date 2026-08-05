@@ -23,6 +23,7 @@ __all__ = [
     "MarketPhaseError",
     "NoDirectionError",
     "ObservationRejectedError",
+    "PostOnlyWouldCrossError",
     "PriceToBeatUnavailableError",
     "SchemaMigrationError",
     "StorageError",
@@ -95,6 +96,24 @@ class TransientLatencyRejectError(ArcError):
     Despite the wording this is a transient latency reject, not a rate limit, and
     it is retried WITHOUT backoff. Backing off here spends the remaining
     milliseconds of a 3-second window waiting and loses the window entirely (A14).
+    """
+
+
+class PostOnlyWouldCrossError(ArcError):
+    """The venue refused a post-only order because it would have crossed the spread.
+
+    TERMINAL for that submission, and deliberately not retried. The limit price is
+    not this layer's to change: it was frozen upstream from the frozen PTB, the
+    frozen signal TWAP, the frozen direction, the locked trigger and the configured
+    buffer, inside an immutable ExecutionIntent. Retrying the same intent would
+    re-cross for the same reason; retrying a DIFFERENT price would be the execution
+    layer inventing a trading decision nobody approved, and the resulting fill would
+    look exactly like an approved one afterwards.
+
+    So the rejection is recorded, persisted and displayed, and the market keeps
+    being monitored under the original decision, unchanged. Any repricing,
+    replacement or operator-driven recovery policy for this condition has to arrive
+    as an explicit specification; it is not inferred here.
     """
 
 

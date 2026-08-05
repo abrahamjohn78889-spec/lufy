@@ -14,6 +14,8 @@ __all__ = [
     "DISPLAYED_ORDER_STATES",
     "LIVE_ORDER_STATES",
     "ORDER_STATE_DISPLAY",
+    "POST_ONLY_WOULD_CROSS_REASON",
+    "REJECTION_REASON_DISPLAY",
     "TERMINAL_ORDER_STATES",
     "DenialReason",
     "Direction",
@@ -118,6 +120,21 @@ ORDER_STATE_DISPLAY: Final[dict[OrderState, str]] = {
     OrderState.EXPIRED: "Cancelled",
     OrderState.REJECTED: "Rejected",
     OrderState.INDETERMINATE: "Unknown ⚠",
+}
+
+# The dedicated rejection reason for a post-only order the venue refused because it
+# would have crossed. Stored verbatim in orders.rejection_reason and matched exactly
+# by the dashboard, so it reads as its own outcome rather than as one more opaque
+# venue string. The execution layer never acts on it beyond recording it: repricing
+# would mean rewriting a frozen decision.
+POST_ONLY_WOULD_CROSS_REASON: Final[str] = "POST_ONLY_WOULD_CROSS"
+
+# Operator-facing wording for that reason. A REASON label, shown beside the order's
+# state — deliberately NOT a seventh entry in ORDER_STATE_DISPLAY. A13 freezes the
+# displayed state list at six values, and the order's state here is genuinely
+# Rejected; what is new is why, and why belongs in the reason column.
+REJECTION_REASON_DISPLAY: Final[dict[str, str]] = {
+    POST_ONLY_WOULD_CROSS_REASON: "Would cross - not repriced",
 }
 
 DISPLAYED_ORDER_STATES: Final[tuple[str, ...]] = (

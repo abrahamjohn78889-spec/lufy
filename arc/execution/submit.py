@@ -34,11 +34,16 @@ from typing import Final
 from arc.domain.enums import Direction, MarketPhase, OrderState
 from arc.domain.models import ExecutionIntent, Order
 from arc.domain.money import dec_str, quantize_size
-from arc.errors import ArcError, MarketPhaseError
+from arc.errors import ArcError, MarketPhaseError, PostOnlyWouldCrossError
 from arc.execution.orders import new_order, transition
 from arc.execution.protocol import Executor
 from arc.execution.ratelimit import TokenBucket
-from arc.execution.retry import IMMEDIATE_RETRY_LIMIT, Disposition, classify
+from arc.execution.retry import (
+    IMMEDIATE_RETRY_LIMIT,
+    Disposition,
+    classify,
+    rejection_reason,
+)
 from arc.logging_setup import log_event
 from arc.storage.store import Store
 
@@ -249,11 +254,17 @@ class Submitter:
                         logger=self._logger,
                     )
                     return order
-                transition(order, OrderState.REJECTED, now, str(exc))
+                reason = rejection_reason(exc)
+                transition(order, OrderState.REJECTED, now, reason)
                 self._store.save_order(order)
                 log_event(
                     logging.WARNING,
-                    "Order Rejected",
+                    # Its own event name, so the post-only cross is greppable in the
+                    # log as the distinct outcome it is rather than as one more
+                    # rejection among the venue's other refusals.
+                    "Post-Only Would Cross"
+                    if isinstance(exc, PostOnlyWouldCrossError)
+                    else "Order Rejected",
                     f"{order.order_id}  {exc}",
                     logger=self._logger,
                 )

@@ -40,6 +40,7 @@ from arc.errors import (
     ArcError,
     CancelAckTimeoutError,
     ConnectionLostError,
+    PostOnlyWouldCrossError,
     TransientLatencyRejectError,
 )
 from arc.execution.protocol import VenueOrder
@@ -60,6 +61,12 @@ _TOO_MANY_REQUESTS: Final[int] = 429
 # A trade the chain refused. Counting it as filled quantity would report a
 # position that does not exist.
 _DEAD_TRADE_STATUS: Final[str] = "FAILED"
+
+# The venue's reject code for a post-only order that would have taken liquidity.
+# Terminal for the submission and never retried: the limit price came from an
+# immutable intent, so a retry either re-crosses at the same price or invents a
+# price the risk gates never saw.
+_POST_ONLY_WOULD_CROSS: Final[str] = "post_only_would_cross"
 
 
 class TokenResolver(Protocol):
@@ -156,6 +163,11 @@ class LiveExecutor:
             raise _wrap(exc) from exc
 
         if not response.ok:
+            if response.code == _POST_ONLY_WOULD_CROSS:
+                raise PostOnlyWouldCrossError(
+                    f"post-only order {order.order_id} would have crossed at "
+                    f"{order.price}: {response.message}"
+                )
             raise ArcError(
                 f"venue rejected {order.order_id}: {response.code} {response.message}"
             )

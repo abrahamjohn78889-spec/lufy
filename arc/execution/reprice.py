@@ -26,7 +26,7 @@ from arc.domain.money import dec_str, quantize_price
 from arc.execution.orders import new_order, next_generation_id, transition
 from arc.execution.protocol import Executor
 from arc.execution.ratelimit import TokenBucket
-from arc.execution.retry import Disposition, classify
+from arc.execution.retry import Disposition, classify, rejection_reason
 from arc.logging_setup import log_event
 from arc.storage.store import Store
 
@@ -147,7 +147,7 @@ class Repricer:
                 if classify(exc) is Disposition.INDETERMINATE
                 else OrderState.REJECTED
             )
-            transition(successor, state, now, str(exc))
+            transition(successor, state, now, rejection_reason(exc))
             self._store.save_order(successor)
             return successor
 

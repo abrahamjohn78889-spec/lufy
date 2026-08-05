@@ -33,15 +33,22 @@ from polymarket.models import (
     RejectedOrder,
 )
 
-from arc.domain.enums import Direction, Mode, OrderState
+from arc.domain.enums import (
+    POST_ONLY_WOULD_CROSS_REASON,
+    Direction,
+    Mode,
+    OrderState,
+)
 from arc.errors import (
     ArcError,
     CancelAckTimeoutError,
     ConnectionLostError,
+    PostOnlyWouldCrossError,
     TransientLatencyRejectError,
 )
 from arc.execution.orders import new_order, transition
 from arc.execution.protocol import Executor
+from arc.execution.retry import Disposition, classify, rejection_reason
 from arc.execution.v2_live import LiveExecutor
 from arc.storage.store import Store
 
@@ -318,13 +325,40 @@ class TestPlacement:
 
     def test_a_post_only_cross_is_a_definite_failure_too(self, wired) -> None:  # type: ignore[no-untyped-def]
         """The passive posture refusing to become an aggressive one. Not a retry:
-        the price would have to change, and prices are frozen upstream."""
+        the price would have to change, and prices are frozen upstream.
+
+        Raised as its OWN type rather than a generic ArcError, because the caller
+        persists a dedicated reason code for it and the dashboard matches that code
+        exactly. Folded into ArcError it would reach the operator as one more
+        unexplained venue string.
+        """
         _store, venue, executor, market = wired
         venue.place_result = RejectedOrder(
             code="post_only_would_cross", message="would cross the book"
         )
-        with pytest.raises(ArcError):
+        with pytest.raises(PostOnlyWouldCrossError) as caught:
             asyncio.run(executor.place(_order(market.slug)))
+        assert classify(caught.value) is Disposition.FAIL
+        assert rejection_reason(caught.value) == POST_ONLY_WOULD_CROSS_REASON
+
+    def test_the_crossing_price_is_in_the_message(self, wired) -> None:  # type: ignore[no-untyped-def]
+        """The operator needs to see the price that was refused to judge whether
+        the book moved or the configuration is wrong."""
+        _store, venue, executor, market = wired
+        venue.place_result = RejectedOrder(
+            code="post_only_would_cross", message="would cross the book"
+        )
+        with pytest.raises(PostOnlyWouldCrossError) as caught:
+            asyncio.run(executor.place(_order(market.slug)))
+        assert "0.70" in str(caught.value)
+
+    def test_another_reject_code_is_not_mistaken_for_a_cross(self, wired) -> None:  # type: ignore[no-untyped-def]
+        """The dedicated policy applies to exactly one code."""
+        _store, venue, executor, market = wired
+        venue.place_result = RejectedOrder(code="not_enough_balance", message="no funds")
+        with pytest.raises(ArcError) as caught:
+            asyncio.run(executor.place(_order(market.slug)))
+        assert not isinstance(caught.value, PostOnlyWouldCrossError)
 
     def test_an_acceptance_without_an_id_is_unknown_not_success(self, wired) -> None:  # type: ignore[no-untyped-def]
         """Recording no id leaves an order that can never be cancelled."""
