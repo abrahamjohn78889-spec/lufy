@@ -62,11 +62,23 @@ TRADING_KEYS: Final[tuple[str, ...]] = (
     "observation_retention_days",
 )
 
-_SECRET_FIELDS: Final[tuple[str, ...]] = (
+# Credentials MODE=V2 requires. Kept separate from the full secret list below,
+# because "V2 needs keys" is a statement about the venue only: a Chainlink secret
+# left blank must not make a live-mode boot fail.
+_VENUE_SECRET_FIELDS: Final[tuple[str, ...]] = (
     "polymarket_api_key",
     "polymarket_api_secret",
     "polymarket_api_passphrase",
     "polymarket_private_key",
+)
+
+# Every secret, for redaction and for the log filter. Redaction is not conditional
+# on which provider is live: a value present in the environment can reach a traceback
+# whether or not the code that uses it ever runs.
+_SECRET_FIELDS: Final[tuple[str, ...]] = (
+    *_VENUE_SECRET_FIELDS,
+    "chainlink_api_key",
+    "chainlink_api_secret",
 )
 
 
@@ -123,6 +135,17 @@ class ArcSettings(BaseSettings):
     outbound_rate_burst: int = 16
 
     allow_opposing_directions: bool = False
+
+    # Which price stream feeds the running TWAP. Bootstrap-only, deliberately NOT a
+    # trading value: the source of the data is an infrastructure choice, and putting
+    # it on the Settings page would let it be swapped mid-market.
+    twap_provider: str = "RTDS"
+
+    # Chainlink is configuration-ready and unimplemented (see market/providers.py).
+    # No feed ID is defaulted: a guessed identifier would yield prices that look real.
+    chainlink_api_key: SecretStr = SecretStr("")
+    chainlink_api_secret: SecretStr = SecretStr("")
+    chainlink_feed_id: str = ""
 
     # SecretStr so the value never appears in repr(), str(), an f-string, a
     # pydantic validation error, or a traceback. Pydantic renders it as
@@ -192,7 +215,8 @@ class ArcSettings(BaseSettings):
         return tuple(v for v in values if v)
 
     def has_credentials(self) -> bool:
-        return all(getattr(self, n).get_secret_value() for n in _SECRET_FIELDS)
+        """Venue credentials only. MODE=V2 does not depend on any provider secret."""
+        return all(getattr(self, n).get_secret_value() for n in _VENUE_SECRET_FIELDS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -724,7 +748,7 @@ def load_settings(
     if settings.mode is Mode.V2 and not settings.has_credentials():
         missing = [
             n.upper()
-            for n in _SECRET_FIELDS
+            for n in _VENUE_SECRET_FIELDS
             if not getattr(settings, n).get_secret_value()
         ]
         raise ConfigInvariantError(

@@ -36,7 +36,7 @@ from arc.domain.timing import MARKET_DURATION_SECONDS, slug_for
 from arc.errors import FeedError, ObservationRejectedError
 from arc.logging_setup import log_event
 from arc.market.discovery import MarketDiscovery, open_discovery
-from arc.market.feed import RtdsFeed
+from arc.market.providers import TwapProvider, build_provider
 from arc.market.ptb import (
     DEAD_REASON_PTB_UNAVAILABLE,
     PreviousClosePtbCache,
@@ -134,7 +134,7 @@ class ObservationRun:
         clock: Clock,
         runtime: RuntimeState,
         discovery: MarketDiscovery,
-        feed: RtdsFeed,
+        feed: TwapProvider,
         out: TextIO,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -477,7 +477,7 @@ async def observe(
             clock=clock,
             runtime=runtime,
             discovery=discovery,
-            feed=RtdsFeed(clock, logger=logger),
+            feed=build_provider(settings.env.twap_provider, clock, logger=logger),
             out=out,
             logger=logger,
         )
