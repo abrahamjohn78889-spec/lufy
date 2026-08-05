@@ -621,6 +621,24 @@ class Store:
         ).fetchall()
         return tuple(self._order_from_row(r) for r in rows)
 
+    def local_order_id(self, slug: str, venue_order_id: str) -> str:
+        """ARC's derived order id for a venue id, or "" when it is not ours.
+
+        The V2 adapter's only way back from a venue row to a local row: the CLOB
+        assigns its own ids and documents no client-id field. Read from SQLite
+        rather than from a process-local dict, because the process that most needs
+        this mapping is the one that just restarted holding nothing in memory —
+        without it every fill after a restart would be recorded as unlinked and
+        would never advance the order it belongs to.
+        """
+        if not venue_order_id:
+            return ""
+        row = self._conn.execute(
+            "SELECT order_id FROM orders WHERE market_slug = ? AND venue_order_id = ?",
+            (slug, venue_order_id),
+        ).fetchone()
+        return "" if row is None else str(row["order_id"])
+
     @staticmethod
     def _order_from_row(row: sqlite3.Row) -> Order:
         return Order(

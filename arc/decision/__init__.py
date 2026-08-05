@@ -9,7 +9,7 @@ What this layer does NOT do, deliberately:
 
     it never submits, modifies or cancels an order
     it never touches a wallet, a key or a credential
-    it never calls Polymarket or Chainlink
+    it never calls the venue or any price provider
     it never mutates a window's frozen values or any runtime flag
     it never recomputes PTB, signal TWAP, direction, buffer or locked trigger
 

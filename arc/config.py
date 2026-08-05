@@ -27,7 +27,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final
 
-from pydantic import SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from arc.domain.enums import Mode
@@ -150,7 +150,20 @@ class ArcSettings(BaseSettings):
     # No feed ID is defaulted: a guessed identifier would yield prices that look real.
     chainlink_api_key: SecretStr = SecretStr("")
     chainlink_api_secret: SecretStr = SecretStr("")
-    chainlink_feed_id: str = ""
+    # Two accepted spellings. The specification writes the variable
+    # ARC_CHAINLINK_FEBS_ID and this codebase has always written
+    # ARC_CHAINLINK_FEED_ID; both are read so an operator who copies either one
+    # into .env gets the value they typed rather than a silent empty string, which
+    # is indistinguishable from "no feed configured" and would look like a
+    # configuration that had simply never been filled in.
+    chainlink_feed_id: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "ARC_CHAINLINK_FEED_ID",
+            "ARC_CHAINLINK_FEBS_ID",
+            "chainlink_feed_id",
+        ),
+    )
 
     # SecretStr so the value never appears in repr(), str(), an f-string, a
     # pydantic validation error, or a traceback. Pydantic renders it as

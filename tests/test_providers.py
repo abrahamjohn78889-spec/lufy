@@ -178,3 +178,39 @@ class TestTheStrategyPathIsProviderBlind:
             text = path.read_text(encoding="utf-8").upper()
             assert "TWAP_PROVIDER" not in text, path
             assert "RTDS" not in text, path
+
+
+class TestTheProviderNameAppearsInNoEngine:
+    """A21, executed as a test rather than trusted as a guideline.
+
+    The literal sweep the specification names:
+
+        grep -ri "rtds\\|chainlink" arc/strategy/ arc/windows/ arc/decision/ \\
+            arc/risk/ arc/execution/
+
+    must return nothing. Deliberately cruder than the import walk above and kept
+    alongside it: this one also catches a provider name in a docstring, a comment
+    or a log line. Prose is not harmless here — a comment naming the active
+    provider is the first step of someone adding the branch it describes, and once
+    an engine can tell which provider is live, "configuration only" has stopped
+    being true.
+    """
+
+    ENGINES = ("strategy", "windows", "decision", "risk", "execution")
+    NAMES = ("rtds", "chainlink")
+
+    def test_no_engine_source_file_contains_a_provider_name(
+        self, source_root: Path
+    ) -> None:
+        offenders: list[str] = []
+        for package in self.ENGINES:
+            directory = source_root / "arc" / package
+            assert directory.is_dir(), f"{directory} is missing; the A21 list is stale"
+            for path in sorted(directory.rglob("*.py")):
+                lowered = path.read_text(encoding="utf-8").lower()
+                offenders.extend(
+                    f"{path.relative_to(source_root)}: {name}"
+                    for name in self.NAMES
+                    if name in lowered
+                )
+        assert not offenders, f"A21 provider-name leak: {offenders}"
