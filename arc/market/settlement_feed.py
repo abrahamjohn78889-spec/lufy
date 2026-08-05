@@ -27,11 +27,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Final
 
 from arc.domain.models import Observation
-from arc.domain.timing import SETTLEMENT_WINDOW_SECONDS
+from arc.domain.timing import SETTLEMENT_WINDOW_SECONDS, TWAP_SETTLEMENT_EFFECTIVE_TS
 from arc.errors import FeedError, ObservationRejectedError
 from arc.logging_setup import log_event
 from arc.market.validation import parse_payload
@@ -46,6 +47,14 @@ __all__ = [
 # 30, taken from the timing module rather than restated, so a change to the venue's
 # settlement window cannot leave two different constants disagreeing.
 EXPECTED_WINDOW_SECONDS: Final[int] = SETTLEMENT_WINDOW_SECONDS
+
+# Rendered once, for the refusal message only. A correct pre-switchover refusal and a
+# genuine wrong-stream fault are the same exception with the same consequence, and
+# without this note they read identically in the log — so an operator debugging a
+# silent bot cannot tell "waiting for the venue" from "connected to the wrong feed".
+_TWAP_EFFECTIVE_TEXT: Final[str] = (
+    datetime.fromtimestamp(TWAP_SETTLEMENT_EFFECTIVE_TS, UTC).strftime("%Y-%m-%d %H:%M UTC")
+)
 
 
 class SettlementWindowAssertionError(FeedError):
@@ -73,7 +82,11 @@ def assert_settlement_window(payload: object) -> int:
     if raw is None:
         raise SettlementWindowAssertionError(
             "settlement payload carries no windowSeconds field — this is a reference "
-            "stream, not the 30-second TWAP stream (TRAP 2)"
+            "stream, not the 30-second TWAP stream (TRAP 2). Note: before "
+            f"{_TWAP_EFFECTIVE_TEXT} the venue has not switched crypto up/down markets "
+            "to TWAP settlement and NO stream carries this field, so this is also the "
+            "expected pre-switchover reading; either way the stream is not a "
+            "30-second TWAP and trading stays disabled"
         )
     try:
         declared = int(float(raw))

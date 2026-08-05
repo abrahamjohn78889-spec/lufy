@@ -26,6 +26,7 @@ __all__ = [
     "MARKET_DURATION_SECONDS",
     "SETTLEMENT_WINDOW_SECONDS",
     "SLUG_PREFIX",
+    "TWAP_SETTLEMENT_EFFECTIVE_TS",
     "activation_ts",
     "cancel_ts",
     "close_ts_for",
@@ -49,6 +50,24 @@ SLUG_PREFIX: Final[str] = "btc-updown-5m-"
 # feed emits. Never infer one from the other and never health-check one with the
 # other — they are unrelated quantities.
 SETTLEMENT_WINDOW_SECONDS: Final[int] = 30
+
+# When the venue switches crypto up/down markets to Chainlink-TWAP settlement
+# (A5): 2026-08-07 00:00:00 UTC.
+#
+# Recorded because before this instant the settlement stream carries no
+# `windowSeconds` field at all, so spec verification fails and trading stays
+# disabled — which is the correct fail-closed outcome, but is otherwise
+# indistinguishable from a broken feed. Confirmed against the live venue on
+# 2026-08-05: every 5-minute market carries
+# `cryptoMarketConfig.twapEnabled = false` (btc-5m and eth-5m alike), and the
+# market description states the pre-TWAP rule — resolution against "the price at
+# the beginning of that range", not an average of it.
+#
+# This constant is DIAGNOSTIC ONLY. Nothing branches on it, and in particular it
+# never relaxes the TRAP 2 assertion: a date is not evidence about which stream is
+# connected, and letting a clock grant permission that only a payload can grant is
+# how a reference stream gets recorded as a settlement mean.
+TWAP_SETTLEMENT_EFFECTIVE_TS: Final[int] = 1_786_060_800
 
 
 def window_ts_for(ts: float) -> int:

@@ -14,8 +14,10 @@ used. The venue settles the market, so the venue's clock is the one that decides
 when it closes; a bot that trusted its own arithmetic over the venue's would cancel
 and settle at the wrong instant and the error would look like a latency problem.
 
-Nothing here computes a Price To Beat. `ptb` arrives as an opaque string from the
-metadata and is handed on untouched (see ptb.py).
+Nothing here computes a Price To Beat. The official value is read from the venue's
+metadata at `events[0].eventMetadata.priceToBeat` — a nested path, confirmed against
+the live endpoint, because the field does not exist at the top level — and is carried
+on untouched as exact text (see ptb.py).
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Final
 
 import httpx
@@ -39,6 +42,7 @@ __all__ = [
     "MarketDiscovery",
     "MarketMetadata",
     "SlugMath",
+    "decode_json",
     "next_slug_math",
     "open_discovery",
     "parse_market_metadata",
@@ -60,6 +64,20 @@ _TOKEN_KEYS: Final[tuple[str, ...]] = ("clobTokenIds", "clob_token_ids", "tokens
 _PTB_KEYS: Final[tuple[str, ...]] = ("priceToBeat", "price_to_beat", "strikePrice", "openingPrice")
 _ACTIVE_KEYS: Final[tuple[str, ...]] = ("active",)
 _CLOSED_KEYS: Final[tuple[str, ...]] = ("closed",)
+
+# Where Gamma actually carries the official PTB. Established against the live
+# endpoint on 2026-08-05: it is NOT a top-level market field — a flat scan of all 70+
+# keys finds nothing, and a regex for beat/strike/reference/opening over the key names
+# matches nothing either. It is nested one level down, on the market's event:
+#
+#     markets[0].events[0].eventMetadata = {"finalPrice": …, "priceToBeat": …}
+#
+# Verified self-consistent on a settled market: finalPrice 64260.55 < priceToBeat
+# 64276.70 and outcomePrices ["0","1"] — i.e. Down. A lookup that searched only the
+# top level would find no PTB on any market ever and send every single one down the
+# fail-closed DEAD path, which reads identically to the venue being down.
+_EVENT_KEYS: Final[tuple[str, ...]] = ("events",)
+_EVENT_METADATA_KEYS: Final[tuple[str, ...]] = ("eventMetadata", "event_metadata")
 
 _MS_THRESHOLD: Final[float] = 1e11
 
@@ -192,6 +210,13 @@ def _as_ptb_text(raw: Any) -> str | None:
     number is already binary-rounded, and `str()` of it would preserve the rounding
     while looking like an exact value — which is precisely the failure that A1's
     "always use the official value" is guarding against.
+
+    Gamma does send `priceToBeat` as a bare JSON number, so refusing floats here
+    would refuse every real PTB. The resolution is upstream, in `decode_json`: the
+    body is decoded with `parse_float=Decimal`, so the venue's exact digits arrive as
+    a Decimal and never pass through binary floating point at all. A float reaching
+    this function therefore means some caller decoded the body with the stdlib
+    default, and refusing is the correct response to that.
     """
     if raw is None:
         return None
@@ -199,10 +224,56 @@ def _as_ptb_text(raw: Any) -> str | None:
         return None
     if isinstance(raw, bool):
         return None
+    if isinstance(raw, Decimal):
+        # Exact by construction (see decode_json). `str` on a Decimal is lossless.
+        return format(raw, "f")
     if isinstance(raw, (int, str)):
         text = str(raw).strip()
         return text or None
     return None
+
+
+def decode_json(text: str) -> Any:
+    """Decode a venue response with every JSON number kept exact.
+
+    `parse_float=Decimal` is the whole point. The official PTB arrives as a bare JSON
+    number, and the stdlib default would bind it to a C double before any ARC code
+    could see it — losing digits irrecoverably, before the "never estimate the PTB"
+    rule has anything left to protect. Decoding exactly means the only conversion
+    applied to the official value is a lossless one.
+
+    Exposed so any other venue-payload reader decodes the same way; `fetch_metadata`
+    passes the same parser through httpx.
+    """
+    return json.loads(text, parse_float=Decimal)
+
+
+def _event_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    """The `eventMetadata` object off the market's first event, or an empty dict.
+
+    Empty rather than None so callers need no branch: an absent PTB and an absent
+    event object must reach the same fail-closed path in ptb.py.
+    """
+    events = _first_key(payload, _EVENT_KEYS)
+    if not isinstance(events, (list, tuple)) or not events:
+        return {}
+    first = events[0]
+    if not isinstance(first, dict):
+        return {}
+    metadata = _first_key(first, _EVENT_METADATA_KEYS)
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _official_ptb(payload: dict[str, Any]) -> str | None:
+    """The official PTB text, looked up top-level first and then on the event.
+
+    Top level first only because a future payload that promotes the field should be
+    preferred without a code change; today every hit comes from the event.
+    """
+    direct = _as_ptb_text(_first_key(payload, _PTB_KEYS))
+    if direct is not None:
+        return direct
+    return _as_ptb_text(_first_key(_event_metadata(payload), _PTB_KEYS))
 
 
 def parse_market_metadata(payload: object, *, slug: str) -> MarketMetadata:
@@ -223,7 +294,7 @@ def parse_market_metadata(payload: object, *, slug: str) -> MarketMetadata:
         condition_id=condition_id.strip(),
         token_ids=_as_token_ids(_first_key(payload, _TOKEN_KEYS)),
         venue_close_ts=_as_epoch_seconds(_first_key(payload, _CLOSE_TS_KEYS)),
-        ptb_raw=_as_ptb_text(_first_key(payload, _PTB_KEYS)),
+        ptb_raw=_official_ptb(payload),
         active=_as_bool(_first_key(payload, _ACTIVE_KEYS), default=True),
         closed=_as_bool(_first_key(payload, _CLOSED_KEYS), default=False),
         raw=payload,
@@ -282,7 +353,10 @@ class MarketDiscovery:
                 self._url, params={"slug": slug}, timeout=_REQUEST_TIMEOUT_SECONDS
             )
             response.raise_for_status()
-            body = response.json()
+            # parse_float=Decimal, not the stdlib default: httpx forwards kwargs to
+            # json.loads, and the default would bind the official PTB — which Gamma
+            # sends as a bare JSON number — to a C double before ARC ever sees it.
+            body = response.json(parse_float=Decimal)
         except httpx.HTTPError as exc:
             raise FeedError(f"metadata request for {slug} failed: {exc}") from exc
         except ValueError as exc:

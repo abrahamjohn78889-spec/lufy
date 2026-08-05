@@ -21,6 +21,7 @@ from arc.clock import FrozenClock
 from arc.errors import FeedError
 from arc.market.feed import (
     CHAINLINK_TOPIC,
+    CHAINLINK_TYPE,
     KEEPALIVE_FRAME,
     RTDS_URL,
     SDK_STALE_THRESHOLD_MS,
@@ -102,17 +103,28 @@ class TestProtocolProperties:
     def test_the_url_is_the_live_data_relay(self) -> None:
         assert RTDS_URL == "wss://ws-live-data.polymarket.com"
 
-    def test_the_subscribe_frame_carries_the_topic_and_nothing_else(self) -> None:
+    def test_the_subscribe_frame_carries_the_topic_and_its_type(self) -> None:
         """Property 1: a filter list produces a subscription that delivers nothing on
-        an otherwise healthy connection, which reads as a quiet market."""
+        an otherwise healthy connection, which reads as a quiet market.
+
+        `type` is not a filter. Verified against the live relay on 2026-08-05: without
+        it the subscribe is answered `{"message": "Invalid request body"}` and no price
+        ever arrives — the same silent shape a filter would produce.
+        """
         frame = subscribe_frame()
-        assert frame == {"action": "subscribe", "subscriptions": [{"topic": CHAINLINK_TOPIC}]}
-        assert frame["subscriptions"] == [{"topic": CHAINLINK_TOPIC}]
+        assert frame == {
+            "action": "subscribe",
+            "subscriptions": [{"topic": CHAINLINK_TOPIC, "type": CHAINLINK_TYPE}],
+        }
+
+    def test_the_subscription_type_is_update(self) -> None:
+        assert CHAINLINK_TYPE == "update"
 
     def test_the_subscription_object_has_no_filter_keys(self) -> None:
         subscription = subscribe_frame()["subscriptions"][0]
         for forbidden in ("filters", "symbols", "assets", "feedIds", "feed_ids", "pairs"):
             assert forbidden not in subscription
+        assert set(subscription) == {"topic", "type"}
 
     def test_the_topic_is_the_chainlink_price_topic(self) -> None:
         assert CHAINLINK_TOPIC == "crypto_prices_chainlink"

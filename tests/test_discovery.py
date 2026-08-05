@@ -9,7 +9,9 @@ that path only exists because the venue is the authority.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from decimal import Decimal
 from typing import Any, cast
 
 import httpx
@@ -20,6 +22,7 @@ from arc.errors import FeedError
 from arc.market.discovery import (
     GAMMA_MARKETS_URL,
     MarketDiscovery,
+    decode_json,
     next_slug_math,
     parse_market_metadata,
     slug_math,
@@ -32,12 +35,21 @@ class _Response:
     def __init__(self, body: object, *, raise_error: Exception | None = None) -> None:
         self._body = body
         self._raise_error = raise_error
+        self.json_kwargs: list[dict[str, Any]] = []
 
     def raise_for_status(self) -> None:
         if self._raise_error is not None:
             raise self._raise_error
 
-    def json(self) -> object:
+    def json(self, **kwargs: Any) -> object:
+        """Mirrors httpx.Response.json, which forwards kwargs to json.loads.
+
+        The kwargs are recorded rather than ignored: the production call site passes
+        `parse_float=Decimal`, and a double that silently dropped it would let a
+        regression to the stdlib default pass every test in this file while rounding
+        the official PTB in production.
+        """
+        self.json_kwargs.append(dict(kwargs))
         if isinstance(self._body, ValueError):
             raise self._body
         return self._body
@@ -53,13 +65,17 @@ class _Client:
     def __init__(self, *outcomes: object) -> None:
         self._outcomes = list(outcomes)
         self.requests: list[tuple[str, dict[str, str]]] = []
+        # Kept so a test can assert how the body was decoded, not just what it held.
+        self.responses: list[_Response] = []
 
     async def get(self, url: str, *, params: dict[str, str], timeout: float) -> _Response:
         self.requests.append((url, dict(params)))
         outcome = self._outcomes.pop(0) if self._outcomes else None
         if isinstance(outcome, Exception):
             raise outcome
-        return _Response(outcome)
+        response = _Response(outcome)
+        self.responses.append(response)
+        return response
 
 
 def _discovery(*outcomes: object) -> tuple[MarketDiscovery, _Client]:
@@ -78,6 +94,93 @@ def _payload(**overrides: Any) -> dict[str, Any]:
     }
     base.update(overrides)
     return base
+
+
+class TestOfficialPtbLocation:
+    """Where the official PTB actually lives, verified against the live endpoint.
+
+    Established on 2026-08-05 against gamma-api: `priceToBeat` is NOT a top-level
+    market field. A flat scan of all 70+ keys finds nothing, and a regex over the key
+    names for beat/strike/reference/opening matches nothing either. The value sits on
+    the market's event:
+
+        markets[0].events[0].eventMetadata = {"finalPrice": …, "priceToBeat": …}
+
+    A lookup that searched only the top level would find no PTB on any market ever
+    and route every one down the fail-closed DEAD path — which on the dashboard reads
+    exactly like the venue being unreachable, so the bot would look correctly cautious
+    while being permanently unable to trade.
+    """
+
+    def test_the_ptb_is_read_from_the_event_metadata(self) -> None:
+        payload = _payload(
+            priceToBeat=None,
+            events=[{"eventMetadata": {"finalPrice": "64260.55", "priceToBeat": "64276.69"}}],
+        )
+        assert parse_market_metadata(payload, slug="s").ptb_raw == "64276.69"
+
+    def test_a_top_level_field_wins_when_the_venue_ever_promotes_one(self) -> None:
+        payload = _payload(
+            priceToBeat="1",
+            events=[{"eventMetadata": {"priceToBeat": "2"}}],
+        )
+        assert parse_market_metadata(payload, slug="s").ptb_raw == "1"
+
+    def test_a_live_market_with_null_event_metadata_yields_no_ptb(self) -> None:
+        """Exactly what the live endpoint returns before a market settles. It must
+        reach the fail-closed path, never a fabricated value."""
+        payload = _payload(priceToBeat=None, events=[{"eventMetadata": None}])
+        assert parse_market_metadata(payload, slug="s").ptb_raw is None
+
+    def test_an_absent_events_list_yields_no_ptb(self) -> None:
+        assert parse_market_metadata(_payload(priceToBeat=None), slug="s").ptb_raw is None
+
+    def test_an_empty_events_list_yields_no_ptb(self) -> None:
+        payload = _payload(priceToBeat=None, events=[])
+        assert parse_market_metadata(payload, slug="s").ptb_raw is None
+
+    def test_a_non_object_event_yields_no_ptb(self) -> None:
+        payload = _payload(priceToBeat=None, events=["not-an-object"])
+        assert parse_market_metadata(payload, slug="s").ptb_raw is None
+
+    def test_a_decimal_ptb_survives_as_exact_text(self) -> None:
+        """The venue sends priceToBeat as a bare JSON number. Decoded with
+        parse_float=Decimal it arrives exact, and must not be re-rounded here."""
+        payload = _payload(
+            priceToBeat=None,
+            events=[{"eventMetadata": {"priceToBeat": Decimal("64276.69623037441")}}],
+        )
+        assert parse_market_metadata(payload, slug="s").ptb_raw == "64276.69623037441"
+
+    def test_a_decimal_ptb_is_not_rendered_in_exponent_form(self) -> None:
+        """`str(Decimal("1E+5"))` is "1E+5", which to_decimal would still read but
+        which no longer looks like the price the venue quoted."""
+        payload = _payload(
+            priceToBeat=None,
+            events=[{"eventMetadata": {"priceToBeat": Decimal("1E+5")}}],
+        )
+        assert parse_market_metadata(payload, slug="s").ptb_raw == "100000"
+
+
+class TestExactNumberDecoding:
+    def test_the_body_is_decoded_with_parse_float_decimal(self) -> None:
+        """The one guard that keeps the official PTB out of binary floating point.
+        Without it the value is a C double before any ARC code can see it, and A1's
+        "never estimate the PTB" has already been violated at the transport layer."""
+        discovery, client = _discovery([_payload()])
+        asyncio.run(discovery.fetch_metadata("btc-updown-5m-1"))
+        assert client.responses[0].json_kwargs == [{"parse_float": Decimal}]
+
+    def test_decode_json_keeps_numbers_exact(self) -> None:
+        decoded = decode_json('{"priceToBeat": 64276.69623037441}')
+        assert decoded["priceToBeat"] == Decimal("64276.69623037441")
+
+    def test_the_stdlib_default_would_have_lost_digits(self) -> None:
+        """States the failure numerically, so the guard above cannot be removed as
+        cosmetic: the float round-trip does not reproduce the venue's digits."""
+        text = "64276.69623037441123"
+        assert str(json.loads(f'[{text}]')[0]) != text
+        assert format(decode_json(f"[{text}]")[0], "f") == text
 
 
 class TestSlugMath:

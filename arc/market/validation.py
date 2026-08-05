@@ -59,6 +59,24 @@ _SYMBOL_KEYS: Final[tuple[str, ...]] = ("symbol", "pair", "asset")
 _WINDOW_KEYS: Final[tuple[str, ...]] = ("windowSeconds", "window_seconds")
 _FEED_KEYS: Final[tuple[str, ...]] = ("feedId", "feed_id")
 
+# The exact-precision price, preferred over `value` whenever present.
+#
+# Confirmed against the live relay on 2026-08-05. Every payload carries both:
+#
+#     "value":               64195.85640491587          <- a bare JSON number
+#     "full_accuracy_value": "64195856404915870000000"  <- exact integer TEXT
+#
+# and full_accuracy_value / 10**18 reproduces value exactly. `value` is a JSON
+# number, so it is already bound to a C double by the time any parser sees it, and
+# _as_price refuses floats by design — meaning a build that read only `value` would
+# reject EVERY live observation and accumulate no signal TWAP at all. Reading the
+# integer text instead keeps the whole pipeline exact and never touches a float.
+_FULL_ACCURACY_KEYS: Final[tuple[str, ...]] = ("full_accuracy_value", "fullAccuracyValue")
+
+# The fixed-point scale of full_accuracy_value: 18 decimal places, the Chainlink
+# convention. Applied as an exact Decimal shift, never as a division by a float.
+_FULL_ACCURACY_SCALE: Final[int] = 18
+
 # Above this a numeric timestamp cannot be seconds: 1e11 seconds is the year 5138.
 # Used to tell a millisecond stamp from a second stamp, never to correct one.
 _MS_THRESHOLD: Final[float] = 1e11
@@ -69,6 +87,7 @@ _TS_FLOOR: Final[float] = 1_577_836_800.0
 _TS_CEILING: Final[float] = 4_102_444_800.0
 
 _ZERO: Final[Decimal] = Decimal(0)
+_ONE: Final[Decimal] = Decimal(1)
 _HUNDRED: Final[Decimal] = Decimal(100)
 
 
@@ -132,6 +151,44 @@ def _as_price(raw: Any) -> Decimal:
     return price
 
 
+def _as_full_accuracy_price(raw: Any) -> Decimal:
+    """Scale the 18-decimal fixed-point integer to a price. Raises on anything else.
+
+    `scaleb(-18)` is an exact Decimal exponent shift, not a division: no quotient is
+    computed and no rounding context applies, so the venue's digits survive intact.
+
+    A float here is refused for the same reason as in `_as_price`. This field exists
+    precisely because `value` is lossy, so a float arriving in it means something
+    upstream already destroyed the precision the field was read for.
+    """
+    if isinstance(raw, float):
+        raise ObservationRejectedError(
+            f"{REJECT_BAD_PRICE}: full-accuracy price arrived as a float ({raw!r}); "
+            "exact integer text is required"
+        )
+    if isinstance(raw, bool) or not isinstance(raw, (int, str, Decimal)):
+        raise ObservationRejectedError(f"{REJECT_BAD_PRICE}: {raw!r} is not a price")
+    try:
+        scaled = to_decimal(raw).scaleb(-_FULL_ACCURACY_SCALE)
+    except (InvalidOperation, ValueError, ArithmeticError) as exc:
+        raise ObservationRejectedError(f"{REJECT_BAD_PRICE}: {raw!r} is not a number") from exc
+    if not scaled.is_finite():
+        raise ObservationRejectedError(f"{REJECT_BAD_PRICE}: {raw!r} is not finite")
+    if scaled <= _ZERO:
+        raise ObservationRejectedError(f"{REJECT_BAD_PRICE}: {scaled} is not positive")
+    # Strip the fixed-point padding. 18 decimal places of trailing zeros carry no
+    # information, and leaving them makes every stored and logged price 18 digits
+    # wide while comparing unequal to the same value written plainly. `normalize`
+    # would render an integral result in exponent form ("6E+4"), so an integral result
+    # is re-quantized to exponent zero. Tested via `to_integral_value` rather than the
+    # tuple exponent because `as_tuple().exponent` is a string for non-finite values,
+    # which makes the comparison unsound even though the guard above rules them out.
+    trimmed = scaled.normalize()
+    if trimmed == trimmed.to_integral_value():
+        trimmed = trimmed.quantize(_ONE)
+    return trimmed
+
+
 def _as_window_seconds(raw: Any) -> int | None:
     """The payload's declared lookback length, or None when absent.
 
@@ -173,15 +230,23 @@ def parse_payload(payload: object, *, expected_symbol: str) -> Observation:
     if raw_ts is None:
         raise ObservationRejectedError(f"{REJECT_MALFORMED}: no timestamp field")
 
-    raw_price = _first_key(payload, _PRICE_KEYS)
-    if raw_price is None:
-        raise ObservationRejectedError(f"{REJECT_MALFORMED}: no price field")
+    # The exact field first. The live relay always sends it, and `value` beside it is
+    # a JSON number that has already lost digits — so preferring `value` would both
+    # degrade precision and, because floats are refused, reject every real payload.
+    raw_full = _first_key(payload, _FULL_ACCURACY_KEYS)
+    if raw_full is not None:
+        price = _as_full_accuracy_price(raw_full)
+    else:
+        raw_price = _first_key(payload, _PRICE_KEYS)
+        if raw_price is None:
+            raise ObservationRejectedError(f"{REJECT_MALFORMED}: no price field")
+        price = _as_price(raw_price)
 
     feed_id = _first_key(payload, _FEED_KEYS)
 
     return Observation(
         ts=_as_seconds(raw_ts),
-        price=_as_price(raw_price),
+        price=price,
         feed_id=feed_id if isinstance(feed_id, str) else "",
         window_seconds=_as_window_seconds(_first_key(payload, _WINDOW_KEYS)),
     )

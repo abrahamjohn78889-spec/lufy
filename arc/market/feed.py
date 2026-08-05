@@ -43,6 +43,7 @@ from arc.logging_setup import log_event
 
 __all__ = [
     "CHAINLINK_TOPIC",
+    "CHAINLINK_TYPE",
     "KEEPALIVE_FRAME",
     "RTDS_URL",
     "SDK_STALE_THRESHOLD_MS",
@@ -54,6 +55,19 @@ __all__ = [
 
 RTDS_URL: Final[str] = "wss://ws-live-data.polymarket.com"
 CHAINLINK_TOPIC: Final[str] = "crypto_prices_chainlink"
+
+# Required alongside the topic. Established against the live relay on 2026-08-05:
+# a subscription carrying only `topic` is answered `{"message": "Invalid request
+# body"}`, and probing made the relay leak its own lookup —
+#
+#     leger GetTopics error: rpc error: code = NotFound desc =
+#     topic: crypto_prices_chainlink and type: crypto_prices_chainlink not found
+#
+# — which shows the relay keys subscriptions on the (topic, type) PAIR and, absent a
+# type, substitutes the topic for it and finds nothing. The failure this prevents is
+# the worst shape available: the connection opens, the subscribe is rejected, and no
+# price ever arrives, which is indistinguishable from a quiet market.
+CHAINLINK_TYPE: Final[str] = "update"
 
 # Literal text, not JSON. See property 2 in the module docstring.
 KEEPALIVE_FRAME: Final[str] = "PING"
@@ -72,12 +86,18 @@ _CONNECT_TIMEOUT_SECONDS: Final[float] = 15.0
 
 
 def subscribe_frame() -> dict[str, Any]:
-    """The subscribe message. Carries the topic and NOTHING else.
+    """The subscribe message. Carries the topic and its type, and NOTHING else.
 
     No `filters`, no `symbols`, no `assets` key. Adding one produces a subscription
     that delivers no messages on an otherwise healthy connection (property 1).
+
+    `type` is not a filter — it is half of the relay's subscription key, and the
+    subscribe is rejected outright without it (see CHAINLINK_TYPE).
     """
-    return {"action": "subscribe", "subscriptions": [{"topic": CHAINLINK_TOPIC}]}
+    return {
+        "action": "subscribe",
+        "subscriptions": [{"topic": CHAINLINK_TOPIC, "type": CHAINLINK_TYPE}],
+    }
 
 
 @dataclass(frozen=True, slots=True)
