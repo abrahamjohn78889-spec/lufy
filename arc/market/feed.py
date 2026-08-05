@@ -1,0 +1,289 @@
+"""RTDS websocket: the Chainlink price stream.
+
+Four properties of this relay that a conventional websocket client gets wrong (A5):
+
+    1. NO subscribe filters. The topic is subscribed whole. Sending a filter list
+       is not merely ignored — it produces a subscription that delivers nothing, and
+       the connection stays open, so the failure looks like a quiet market.
+    2. The keepalive is the LITERAL STRING "PING", not a JSON frame and not a
+       websocket ping opcode. A JSON {"type":"ping"} is discarded and the relay
+       closes the connection on its own idle timer.
+    3. NO snapshot on connect. The first message arrives with the next tick. Code
+       that waits for an initial state before declaring the feed up waits forever.
+    4. The stale threshold is 600,000 ms — ten minutes. That is the relay's own
+       notion of a dead subscription, not ARC's staleness policy, which is far
+       tighter and lives in watchdog.py.
+
+TRAP 1: the interval between messages is NEVER used to infer the TWAP window
+length, and never used as a health check for it. This module measures gaps only to
+decide whether data is arriving. `windowSeconds` is a field in the payload and is
+read as a field; see settlement_feed.py.
+
+Boundary continuity: the feed records whether the connection stayed up across each
+market boundary. That flag is the gate on the L2 PTB source (see ptb.py) — across a
+reconnect the process did not observe the boundary, so it holds no official value
+for it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any, Final
+
+import websockets
+
+from arc.clock import Clock
+from arc.errors import ConnectionLostError, FeedError
+from arc.logging_setup import log_event
+
+__all__ = [
+    "CHAINLINK_TOPIC",
+    "KEEPALIVE_FRAME",
+    "RTDS_URL",
+    "SDK_STALE_THRESHOLD_MS",
+    "BackoffPolicy",
+    "BoundaryTracker",
+    "RtdsFeed",
+    "subscribe_frame",
+]
+
+RTDS_URL: Final[str] = "wss://ws-live-data.polymarket.com"
+CHAINLINK_TOPIC: Final[str] = "crypto_prices_chainlink"
+
+# Literal text, not JSON. See property 2 in the module docstring.
+KEEPALIVE_FRAME: Final[str] = "PING"
+
+# The relay's own threshold for calling a subscription dead. Recorded here because
+# it explains the keepalive cadence below; ARC's trading staleness policy is
+# unrelated and much tighter (watchdog.py).
+SDK_STALE_THRESHOLD_MS: Final[int] = 600_000
+
+# Comfortably inside any plausible relay idle timeout while adding negligible
+# traffic. A keepalive tuned close to the timeout turns one dropped frame into a
+# disconnect.
+_KEEPALIVE_INTERVAL_SECONDS: Final[float] = 20.0
+
+_CONNECT_TIMEOUT_SECONDS: Final[float] = 15.0
+
+
+def subscribe_frame() -> dict[str, Any]:
+    """The subscribe message. Carries the topic and NOTHING else.
+
+    No `filters`, no `symbols`, no `assets` key. Adding one produces a subscription
+    that delivers no messages on an otherwise healthy connection (property 1).
+    """
+    return {"action": "subscribe", "subscriptions": [{"topic": CHAINLINK_TOPIC}]}
+
+
+@dataclass(frozen=True, slots=True)
+class BackoffPolicy:
+    """Bounded exponential backoff for reconnection.
+
+    Bounded on purpose. Unbounded backoff eventually reaches delays measured in
+    minutes, and a bot that takes four minutes to notice the feed came back has
+    missed most of a session while reporting that it is reconnecting.
+    """
+
+    initial_seconds: float = 0.5
+    max_seconds: float = 30.0
+    multiplier: float = 2.0
+
+    def __post_init__(self) -> None:
+        if self.initial_seconds <= 0:
+            raise ValueError(f"initial_seconds must be positive, got {self.initial_seconds}")
+        if self.max_seconds < self.initial_seconds:
+            raise ValueError(
+                f"max_seconds ({self.max_seconds}) must not be below "
+                f"initial_seconds ({self.initial_seconds})"
+            )
+        if self.multiplier <= 1.0:
+            raise ValueError(f"multiplier must exceed 1, got {self.multiplier}")
+
+    def delay_for(self, attempt: int) -> float:
+        """Delay before attempt N (1-based). Capped at max_seconds."""
+        if attempt < 1:
+            raise ValueError(f"attempt is 1-based, got {attempt}")
+        delay = self.initial_seconds * (self.multiplier ** (attempt - 1))
+        return min(delay, self.max_seconds)
+
+
+class BoundaryTracker:
+    """Tracks whether the connection held across each 300s market boundary.
+
+    Per-connection instance state. A module-level flag would be shared by a
+    reconnected feed and would report the new connection's continuity for a boundary
+    the old one actually missed (A11).
+    """
+
+    __slots__ = ("_broken_since", "_continuous")
+
+    def __init__(self) -> None:
+        # False until a boundary has been crossed on an unbroken connection. A fresh
+        # connection has observed no boundary, so it can vouch for none.
+        self._continuous = False
+        self._broken_since = True
+
+    @property
+    def continuous(self) -> bool:
+        return self._continuous
+
+    def mark_connected(self) -> None:
+        """A connection opened. Continuity is not restored until a boundary passes."""
+        self._continuous = False
+        self._broken_since = False
+
+    def mark_disconnected(self) -> None:
+        """The connection dropped. Everything after this is discontinuous."""
+        self._continuous = False
+        self._broken_since = True
+
+    def observe_boundary(self) -> bool:
+        """Record that a market boundary was crossed. Returns the continuity flag.
+
+        Continuity becomes true only when the boundary is crossed while connected,
+        which is the exact condition under which the recorded boundary price is the
+        official one rather than an estimate of it.
+        """
+        self._continuous = not self._broken_since
+        return self._continuous
+
+
+class RtdsFeed:
+    """One RTDS connection. Yields raw payloads; validates nothing.
+
+    Parsing and validation live in validation.py so that a payload the relay
+    changes the shape of is rejected in one place with a reason, rather than raising
+    an attribute error somewhere inside the read loop.
+
+    The connector is injected so the reconnect ladder, the keepalive and the
+    continuity flag can all be driven from a test without a socket.
+    """
+
+    __slots__ = (
+        "_backoff",
+        "_clock",
+        "_connect",
+        "_keepalive_seconds",
+        "_logger",
+        "_url",
+        "boundary",
+        "connect_attempts",
+        "connected",
+        "keepalives_sent",
+        "messages_received",
+    )
+
+    def __init__(
+        self,
+        clock: Clock,
+        *,
+        url: str = RTDS_URL,
+        connect: Callable[[str], Awaitable[Any]] | None = None,
+        backoff: BackoffPolicy | None = None,
+        keepalive_seconds: float = _KEEPALIVE_INTERVAL_SECONDS,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self._clock = clock
+        self._url = url
+        self._connect = connect if connect is not None else _default_connect
+        self._backoff = backoff if backoff is not None else BackoffPolicy()
+        self._keepalive_seconds = keepalive_seconds
+        self._logger = logger
+        self.boundary = BoundaryTracker()
+        self.connected = False
+        self.connect_attempts = 0
+        self.messages_received = 0
+        self.keepalives_sent = 0
+
+    @property
+    def url(self) -> str:
+        return self._url
+
+    @property
+    def backoff(self) -> BackoffPolicy:
+        return self._backoff
+
+    async def _open(self) -> Any:
+        self.connect_attempts += 1
+        try:
+            socket = await asyncio.wait_for(
+                self._connect(self._url), timeout=_CONNECT_TIMEOUT_SECONDS
+            )
+        except TimeoutError as exc:
+            raise FeedError(f"connecting to {self._url} timed out") from exc
+        except OSError as exc:
+            raise FeedError(f"connecting to {self._url} failed: {exc}") from exc
+        except websockets.WebSocketException as exc:
+            raise FeedError(f"connecting to {self._url} failed: {exc}") from exc
+
+        # Subscribe immediately. There is no snapshot to wait for (property 3), so a
+        # connection that has subscribed is a connection that is up.
+        await socket.send(json.dumps(subscribe_frame()))
+        self.connected = True
+        self.boundary.mark_connected()
+        log_event(logging.INFO, "Feed Connected", self._url, logger=self._logger)
+        return socket
+
+    async def _keepalive_loop(self, socket: Any) -> None:
+        """Send the literal "PING" on a timer until cancelled (property 2)."""
+        while True:
+            await asyncio.sleep(self._keepalive_seconds)
+            await socket.send(KEEPALIVE_FRAME)
+            self.keepalives_sent += 1
+
+    async def messages(self) -> AsyncIterator[str | bytes]:
+        """Yield raw frames forever, reconnecting with bounded backoff.
+
+        A dropped connection is surfaced through BoundaryTracker rather than by
+        raising: the caller wants the stream to continue, and the fact that a gap
+        occurred is what the continuity flag is for. Only the caller's own
+        cancellation ends this loop.
+        """
+        attempt = 0
+        while True:
+            socket: Any = None
+            keepalive: asyncio.Task[None] | None = None
+            try:
+                socket = await self._open()
+                attempt = 0
+                keepalive = asyncio.create_task(self._keepalive_loop(socket))
+                async for frame in socket:
+                    self.messages_received += 1
+                    # The relay echoes the keepalive. Swallowed here so a caller
+                    # never has to know the keepalive exists to parse the stream.
+                    if isinstance(frame, str) and frame.strip().upper() in ("PING", "PONG"):
+                        continue
+                    yield frame
+                raise ConnectionLostError(f"{self._url} closed the stream")
+            except asyncio.CancelledError:
+                raise
+            except (ConnectionLostError, FeedError, OSError, websockets.WebSocketException) as exc:
+                self.connected = False
+                self.boundary.mark_disconnected()
+                attempt += 1
+                delay = self._backoff.delay_for(attempt)
+                log_event(
+                    logging.WARNING,
+                    "Feed Disconnected",
+                    f"{exc}  reconnecting in {delay:.1f}s (attempt {attempt})",
+                    logger=self._logger,
+                )
+                await asyncio.sleep(delay)
+            finally:
+                if keepalive is not None:
+                    keepalive.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await keepalive
+                if socket is not None:
+                    with contextlib.suppress(Exception):
+                        await socket.close()
+
+
+async def _default_connect(url: str) -> Any:
+    """Open a real websocket. Replaced by an injected connector in tests."""
+    return await websockets.connect(url, open_timeout=_CONNECT_TIMEOUT_SECONDS)

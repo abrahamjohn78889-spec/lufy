@@ -1,17 +1,23 @@
 """Command line interface.
 
     arc doctor    validate configuration and storage, print a full report
-    arc run       errors clearly — the runtime does not exist yet
+    arc observe   run the market engine with no trading, ever
+    arc run       errors clearly — the trading runtime does not exist yet
 
-`arc run` deliberately fails. Phase 1 builds the deterministic foundation and
-nothing that connects to a feed, discovers a market, or submits an order. A `run`
-that started a loop which appeared to work would be exactly the fake implementation
-that is forbidden (A1 Rule 2), and its worst property is that it would look fine.
+`arc run` deliberately fails. The feed connection, market discovery and PTB
+fetching exist as of phase 2, but the decision engine, risk engine and execution
+adapters do not. A `run` that started a loop which appeared to trade would be
+exactly the fake implementation that is forbidden (A1 Rule 2), and its worst
+property is that it would look fine.
+
+`arc observe` is the honest half of that: it runs everything that does exist, and it
+cannot trade because no execution adapter is in its import graph at all.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 from decimal import Decimal
 from typing import TextIO
@@ -27,10 +33,14 @@ from arc.domain.timing import (
     window_ts_for,
 )
 from arc.errors import ArcFatalError
-from arc.logging_setup import ensure_utf8_streams
+from arc.logging_setup import ensure_utf8_streams, setup_logging
+from arc.runtime.observe import observe as run_observe
 from arc.storage.store import Store
 
 __all__ = ["main"]
+
+# `observe`, `doctor` and `run` are module-level functions rather than exports so the
+# entry point stays the single documented surface.
 
 _RULE = "─" * 68
 
@@ -178,20 +188,77 @@ def _report(out: TextIO, settings: Settings, store: Store, version: int, clock: 
         out.write("  none\n")
 
 
+def observe(out: TextIO, clock: Clock, *, market_target: int) -> int:
+    """Run the market engine with no trading. Startup order per A8.
+
+    Step 1 (config) is the only step that may refuse: a bad configuration must not
+    boot. Everything after it starts regardless — a feed that will not connect or a
+    settlement spec that cannot be verified disables trading and records why, and the
+    process stays up collecting the data that resolves the problem.
+    """
+    out.write(f"\nARC observe\n{_RULE}\n")
+
+    try:
+        env = ArcSettings()
+    except Exception as exc:
+        out.write(f"\nFATAL  configuration rejected\n\n  {exc}\n\n")
+        return 1
+
+    store: Store | None = None
+    try:
+        store = Store(env.db_path)
+        store.migrate(clock.now())
+        stored = store.load_settings()
+        settings: Settings = load_settings(env, stored)
+    except ArcFatalError as exc:
+        out.write(f"\nFATAL  configuration rejected\n\n  {exc}\n\n")
+        if store is not None:
+            store.close()
+        return 1
+    except Exception as exc:
+        out.write(f"\nFATAL  storage could not be opened\n\n  {exc}\n\n")
+        if store is not None:
+            store.close()
+        return 1
+
+    if settings.seeded_from_env:
+        store.save_settings(settings.trading.as_storage_dict(), clock.now())
+
+    logger = setup_logging(
+        settings.log_dir,
+        secrets=settings.env.secret_values(),
+        retention_days=settings.trading.observation_retention_days,
+    )
+
+    try:
+        return asyncio.run(
+            run_observe(
+                settings, store, clock, out, market_target=market_target, logger=logger
+            )
+        )
+    except KeyboardInterrupt:
+        out.write("\n  interrupted\n\n")
+        return 0
+    finally:
+        store.close()
+
+
 def run(out: TextIO) -> int:
     """Refuse to run. There is no runtime yet, and pretending otherwise is worse."""
     out.write(
         "\nARC run is not available.\n"
         "\n"
-        "Phase 1 built the deterministic foundation only: configuration, timing,\n"
-        "domain models, storage, clock and logging. The feed connection, market\n"
-        "discovery, PTB fetching, window activation loop, decision engine, risk\n"
-        "engine, execution adapters and dashboard are not implemented yet.\n"
+        "Phases 1 and 2 built the deterministic foundation and the market engine:\n"
+        "configuration, timing, domain models, storage, clock, logging, feed\n"
+        "connection, market discovery, PTB fetching and market rotation. The window\n"
+        "activation loop, decision engine, risk engine, execution adapters and\n"
+        "dashboard are not implemented yet.\n"
         "\n"
         "Nothing here is stubbed to make this command appear to work — a runtime\n"
         "that looked healthy while trading nothing would be worse than this error.\n"
         "\n"
-        "Validate what exists with:  arc doctor\n\n"
+        "Validate what exists with:  arc doctor\n"
+        "Watch the market engine with:  arc observe\n\n"
     )
     return 1
 
@@ -203,7 +270,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("doctor", help="validate configuration and storage")
-    subparsers.add_parser("run", help="start the trading engine (not available in phase 1)")
+    observe_parser = subparsers.add_parser(
+        "observe", help="run the market engine with no trading"
+    )
+    observe_parser.add_argument(
+        "--markets",
+        type=int,
+        default=3,
+        help="stop after this many consecutive markets (default 3)",
+    )
+    subparsers.add_parser("run", help="start the trading engine (not available yet)")
 
     args = parser.parse_args(argv)
 
@@ -213,6 +289,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "doctor":
         return doctor(sys.stdout, SystemClock())
+    if args.command == "observe":
+        return observe(sys.stdout, SystemClock(), market_target=args.markets)
     return run(sys.stdout)
 
 

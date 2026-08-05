@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from arc.clock import FrozenClock
+from arc.logging_setup import LOGGER_NAME
 from arc.storage.store import Store
 
 # A grid-aligned timestamp: 1754400000 % 300 == 0.
@@ -42,6 +44,38 @@ VALID_TRADING_VALUES: dict[str, str] = {
 def trading_values() -> dict[str, str]:
     """A configuration that passes every invariant. Tests mutate a copy."""
     return dict(VALID_TRADING_VALUES)
+
+
+@pytest.fixture(autouse=True)
+def _restore_arc_logger() -> Iterator[None]:
+    """Undo global logging mutations between tests.
+
+    `setup_logging` deliberately sets `propagate = False` on the shared "arc" logger
+    and installs file handlers on it — correct in production, where the root logger
+    belongs to uvicorn and would re-render ARC lines in a foreign format.
+
+    But `logging` is process-global. Once any test calls `setup_logging`, every
+    subsequent test's `arc.*` child logger stops reaching caplog's root handler, so
+    log assertions pass alone and fail in a full run purely on file ordering. Handlers
+    also stay open on rotating files, which on Windows keeps tmp_path locked.
+
+    Restoring here fixes the class of bug rather than each symptom.
+    """
+    logger = logging.getLogger(LOGGER_NAME)
+    saved_level = logger.level
+    saved_propagate = logger.propagate
+    saved_handlers = list(logger.handlers)
+    logger.handlers.clear()
+    logger.propagate = True
+    try:
+        yield
+    finally:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+        logger.handlers.extend(saved_handlers)
+        logger.propagate = saved_propagate
+        logger.setLevel(saved_level)
 
 
 @pytest.fixture
