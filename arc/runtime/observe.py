@@ -51,6 +51,7 @@ from arc.market.validation import ObservationValidator
 from arc.market.watchdog import FeedWatchdog
 from arc.runtime.state import RuntimeState
 from arc.storage.store import Store
+from arc.windows.engine import WindowEngine
 
 __all__ = ["ObservationRun", "ObserveStats", "observe"]
 
@@ -122,6 +123,7 @@ class ObservationRun:
         "_watchdog",
         "rotator",
         "stats",
+        "windows",
     )
 
     def __init__(
@@ -158,10 +160,14 @@ class ObservationRun:
         # state — two runs in one process must not share a cached price (A11).
         self._previous_close = PreviousClosePtbCache()
         self._next_ptb_attempt: float = 0.0
+        # The Window Engine holds no per-market state, so one instance correctly serves
+        # both markets that are alive across a close boundary (A11).
+        self.windows = WindowEngine(store, trading, logger=logger)
         self.rotator = MarketRotator(
             store,
             clock,
             offsets=trading.windows_by_priority,
+            windows=self.windows,
             logger=logger,
         )
         self.stats = ObserveStats()
@@ -309,6 +315,12 @@ class ObservationRun:
             if collector is not None and collector.offer(observation):
                 self.stats.settlement_samples += 1
                 self.stats.settlement_stream_found = True
+
+        # Re-evaluate frozen triggers now, not on the next rotation tick. The signal TWAP
+        # only moves when an observation lands, so this is the only instant at which a
+        # trigger can newly become satisfied; deferring it to the 200 ms loop would make
+        # the check sampled rather than continuous (A12, criterion 11).
+        self.rotator.evaluate_windows(received_at)
 
     # ── loops ────────────────────────────────────────────────────────────────
 

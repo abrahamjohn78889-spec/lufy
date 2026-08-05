@@ -47,6 +47,7 @@ from arc.domain.timing import window_ts_for
 from arc.errors import ObservationRejectedError
 from arc.logging_setup import log_event
 from arc.storage.store import Store
+from arc.windows.engine import WindowEngine
 
 __all__ = ["MAX_LIVE_MARKETS", "MarketRotator", "RotationEvent"]
 
@@ -82,6 +83,7 @@ class MarketRotator:
         "_offsets",
         "_on_settle",
         "_store",
+        "_windows",
         "closing",
         "current",
         "markets_archived",
@@ -97,6 +99,7 @@ class MarketRotator:
         *,
         offsets: tuple[int, ...],
         on_settle: Callable[[MarketInstance], None] | None = None,
+        windows: WindowEngine | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._store = store
@@ -106,6 +109,10 @@ class MarketRotator:
         # by the rotation path, which is what keeps N's settlement off N+1's
         # critical path.
         self._on_settle = on_settle
+        # Optional so the rotator remains testable on its own. When absent, rotation
+        # behaves exactly as before and windows are simply never driven — which is
+        # why the observation runtime supplies one.
+        self._windows = windows
         self._logger = logger
         self.current: MarketInstance | None = None
         self.closing: MarketInstance | None = None
@@ -143,6 +150,7 @@ class MarketRotator:
 
         if self.current is not None and self.current.window_ts == window_ts:
             self._reap(now)
+            self._drive_windows(now)
             return RotationEvent()
 
         closed = ""
@@ -162,7 +170,28 @@ class MarketRotator:
 
         opened = self._open(window_ts, now)
         self.assert_at_most_two_live()
+        # Drive the new market's windows on the SAME pass that opened it. A 15s window
+        # of a market the process only reached late — after a stall, or on the first
+        # pass following a restart — is already due at open, and waiting for the next
+        # pass to notice would add a whole loop interval to a latency that is already
+        # behind.
+        self._drive_windows(now)
         return RotationEvent(opened=opened, closed=closed, archived=archived)
+
+    def _drive_windows(self, now: float) -> None:
+        """One level-triggered window pass over the live market. Never scheduled.
+
+        Called on EVERY advance(), including the no-op ones inside a window, which is
+        what makes window activation converge from any starting point: a pass that
+        arrives 200 ms after an activation instant still opens the window on that pass
+        (A12, criteria 1-2).
+
+        Only `current` is driven. The closing market is past close_ts, so every one of
+        its windows has already been expired by _close and none can activate.
+        """
+        if self._windows is None or self.current is None:
+            return
+        self._windows.pass_over(self.current, now)
 
     def _open(self, window_ts: int, now: float) -> str:
         """Create and persist market N+1. PTB is NOT frozen here.
@@ -225,6 +254,21 @@ class MarketRotator:
         )
         market.dead_reason = str(row["dead_reason"])
 
+        # Frozen windows come back VERBATIM, including direction and locked_trigger.
+        # Recomputation is impossible from here — restore reads the row and passes it
+        # through, and never consults the signal TWAP, which has moved since the freeze.
+        # A recomputed trigger would differ from the one the window actually locked and
+        # the process would trade a strategy nobody configured (A4, criterion 9).
+        if self._windows is not None:
+            restored = self._windows.restore(market)
+            if restored:
+                log_event(
+                    logging.INFO,
+                    "Windows Restored",
+                    f"{market.slug}  {', '.join(f'{o}s' for o in restored)}",
+                    logger=self._logger,
+                )
+
         try:
             phase = MarketPhase(str(row["phase"]))
         except ValueError:
@@ -252,6 +296,19 @@ class MarketRotator:
             market.slug, market.running_sum, market.observation_count, now
         )
         self._store.save_phase(market.slug, MarketPhase.SETTLING, now)
+        # Every window that never crossed ends here, at NO_SIGNAL. Done at close rather
+        # than left to the next pass because this market stops being `current` on this
+        # very transition and would otherwise never be driven again — leaving windows
+        # PENDING forever, which is the orphaned-window state criterion 19 forbids.
+        if self._windows is not None:
+            expired = self._windows.expire_all(market)
+            if expired:
+                log_event(
+                    logging.INFO,
+                    "Windows Expired",
+                    f"{market.slug}  no signal on {', '.join(f'{o}s' for o in expired)}",
+                    logger=self._logger,
+                )
         log_event(
             logging.INFO,
             "Market Closed",
@@ -329,3 +386,19 @@ class MarketRotator:
         else:
             self.observations_dropped += 1
         return tuple(accepted)
+
+    def evaluate_windows(self, now: float) -> None:
+        """Re-evaluate the live market's frozen triggers. Called per accepted observation.
+
+        The signal TWAP only moves when an observation lands, so this is the moment a
+        trigger can newly become satisfied. Evaluating here rather than only once per
+        rotation pass is what makes the check continuous (A12) instead of sampled at
+        whatever cadence the market loop happens to run.
+
+        Synchronous and cheap: at most five windows, two Decimal comparisons each, no
+        I/O unless a window actually fires. It runs on the feed path, so anything
+        blocking here would stall every market and every other window (criteria 11, 17).
+        """
+        if self._windows is None or self.current is None:
+            return
+        self._windows.pass_over(self.current, now)
