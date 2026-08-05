@@ -24,6 +24,13 @@ converges on the correct state from any starting point, including after a restar
 A closed market is persisted, archived, and DEREFERENCED. There is no reset() — a
 new market is a new object (A11), so there is no clearing path that can be forgotten
 in one of the places that needed it.
+
+Reopening the window a restarted process is already inside RESTORES rather than
+recreates. A crash, a PM2 restart or a VPS reboot lands the process back inside the
+same 300-second window, and a blank instance would throw away the official PTB the
+venue published once for that market and then try to resolve a new one. Restored
+state comes from the row: the PTB verbatim, and the accumulator as the exact stored
+sum and count rather than a mean.
 """
 
 from __future__ import annotations
@@ -35,7 +42,7 @@ from typing import Final
 
 from arc.clock import Clock
 from arc.domain.enums import MarketPhase
-from arc.domain.models import MarketInstance, Observation
+from arc.domain.models import MarketInstance, Observation, TwapAccumulator
 from arc.domain.timing import window_ts_for
 from arc.errors import ObservationRejectedError
 from arc.logging_setup import log_event
@@ -164,20 +171,74 @@ class MarketRotator:
         wiring it in here would put a network round trip inside the boundary
         transition. The instance exists and is collecting immediately; the PTB is
         frozen onto it by ptb.freeze_ptb_for as soon as metadata is in hand.
+
+        If a row for this window already exists, the persisted state is reloaded onto
+        the new instance instead. That is restart recovery: a process that dies
+        mid-market comes back inside the SAME window, and a blank instance would
+        discard the official PTB the venue published once and will not publish again
+        for this market, then re-resolve one — which is the recomputation A4 forbids.
+        The accumulator is restored from the exact stored sum and count, never a mean,
+        so a restarted market's signal TWAP matches an uninterrupted one (hazard H1).
         """
         market = MarketInstance.create(window_ts, self._offsets)
-        market.phase = MarketPhase.ACTIVE
-        self._store.create_market(market, now)
-        self._store.save_phase(market.slug, MarketPhase.ACTIVE, now)
+        created = self._store.create_market(market, now)
+        if created:
+            market.phase = MarketPhase.ACTIVE
+            self._store.save_phase(market.slug, MarketPhase.ACTIVE, now)
+        else:
+            self._restore(market, now)
         self.current = market
         self.markets_opened += 1
         log_event(
             logging.INFO,
-            "Market Opened",
+            "Market Recovered" if not created else "Market Opened",
             f"{market.slug}  closes {market.close_ts}",
             logger=self._logger,
         )
         return market.slug
+
+    def _restore(self, market: MarketInstance, now: float) -> None:
+        """Reload a market that this process was already running before it restarted.
+
+        Restores rather than recomputes. The PTB especially: it is read back verbatim
+        through restore_ptb, which refuses to overwrite, so there is no path here that
+        can hand a market a second, different opening reference.
+
+        A market persisted as DEAD stays DEAD. Reviving it would trade a market whose
+        official PTB was established to be unavailable, which is precisely the outcome
+        the fail-closed path exists to prevent.
+        """
+        row = self._store.load_market_row(market.slug)
+        if row is None:
+            # The insert was ignored, so a row exists. Reaching here means it vanished
+            # between the two statements, which is not a state to guess at.
+            market.phase = MarketPhase.ACTIVE
+            self._store.save_phase(market.slug, MarketPhase.ACTIVE, now)
+            return
+
+        stored_ptb = row["ptb"]
+        if stored_ptb is not None:
+            market.restore_ptb(str(stored_ptb))
+
+        market.accumulator = TwapAccumulator.restore(
+            str(row["running_sum"]), int(row["observation_count"])
+        )
+        market.dead_reason = str(row["dead_reason"])
+
+        try:
+            phase = MarketPhase(str(row["phase"]))
+        except ValueError:
+            phase = MarketPhase.ACTIVE
+
+        # SETTLING/SETTLED belong to a market that already closed. Being reopened for
+        # this window means the clock says it is live, so a terminal-ish phase on the
+        # row is stale; DEAD is the one verdict that must survive.
+        if phase is MarketPhase.DEAD:
+            market.phase = MarketPhase.DEAD
+            return
+
+        market.phase = MarketPhase.ACTIVE
+        self._store.save_phase(market.slug, MarketPhase.ACTIVE, now)
 
     def _close(self, market: MarketInstance, now: float) -> None:
         """Persist N's state and hand it to settlement. Never blocks.
