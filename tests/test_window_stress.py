@@ -49,8 +49,10 @@ LATE_DEVIATIONS = (Decimal("0"), Decimal("300"), Decimal("600"))
 LATE_WINDOW_SECONDS = 15
 
 # Markets alternate direction. A DOWN market's PTB sits above the flat price, so its
-# opening TWAP is below the PTB; an UP market's PTB equals it (equality resolves UP).
-DOWN_PTB_PREMIUM = Decimal("50")
+# opening TWAP is below the PTB; an UP market's PTB sits below it. Both are STRICTLY
+# offset: direction determination uses strict comparison, and a PTB equal to the flat
+# price would yield NO_DIRECTION for every UP market rather than an UP direction.
+PTB_OFFSET = Decimal("50")
 
 
 def _trading() -> TradingConfig:
@@ -62,7 +64,7 @@ def _is_down_market(index: int) -> bool:
 
 
 def _ptb_for(index: int) -> Decimal:
-    return BASE_PRICE + (DOWN_PTB_PREMIUM if _is_down_market(index) else Decimal("0"))
+    return BASE_PRICE + (PTB_OFFSET if _is_down_market(index) else -PTB_OFFSET)
 
 
 def _price_for(step: int) -> Decimal:

@@ -21,6 +21,7 @@ __all__ = [
     "ConnectionLostError",
     "FeedError",
     "MarketPhaseError",
+    "NoDirectionError",
     "ObservationRejectedError",
     "PriceToBeatUnavailableError",
     "SchemaMigrationError",
@@ -133,3 +134,18 @@ class WindowFreezeError(ArcError):
     opening_twap next to a defaulted buffer, producing a locked trigger that was
     never configured, and nothing downstream can tell the difference (A12).
     """
+
+
+class NoDirectionError(ArcError):
+    """The frozen TWAP equalled the official PTB exactly, so no direction exists.
+
+    Deliberately NOT a WindowFreezeError. A freeze rejection is RETRYABLE — the
+    usual cause is that no observation has arrived yet, and the level-triggered
+    pass leaves the window PENDING and tries again on the next tick. This is the
+    opposite: direction is determined exactly once, at the window's opening
+    instant, and equality at that instant is a final verdict. If it were folded
+    into WindowFreezeError the window would be retried on every subsequent pass and
+    would freeze a direction from a LATER TWAP — the exact recalculation the
+    strict-comparison contract forbids.
+    """
+

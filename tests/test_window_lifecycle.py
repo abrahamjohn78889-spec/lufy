@@ -45,6 +45,7 @@ ALL_STATES = (
     WindowState.FROZEN,
     WindowState.FIRED,
     WindowState.EXPIRED,
+    WindowState.NO_DIRECTION,
 )
 
 
@@ -68,7 +69,13 @@ class TestTheTransitionGraph:
         WindowState has no REJECTED member, so "partial freeze is impossible" is a
         property of the type rather than of the code that must remember to check.
         """
-        assert {s.value for s in WindowState} == {"PENDING", "FROZEN", "FIRED", "EXPIRED"}
+        assert {s.value for s in WindowState} == {
+            "PENDING",
+            "FROZEN",
+            "FIRED",
+            "EXPIRED",
+            "NO_DIRECTION",
+        }
 
     def test_terminal_states_have_no_outgoing_edges(self) -> None:
         for state in TERMINAL_WINDOW_STATES:

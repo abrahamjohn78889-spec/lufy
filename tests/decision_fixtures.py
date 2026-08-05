@@ -136,15 +136,17 @@ def fired_market(
     fields, so a test cannot construct a window state the production code would
     have refused — a frozen window with an inconsistent trigger, for instance.
 
-    The opening TWAP is placed on the correct side of the PTB for the requested
-    direction, because freeze() derives the direction itself and would otherwise
-    lock the opposite one.
+    The opening TWAP is placed STRICTLY on the correct side of the PTB for the
+    requested direction, because freeze() derives the direction itself with strict
+    comparison and refuses equality outright (NoDirectionError). An UP fixture built
+    on `opening == ptb` would raise rather than freeze.
     """
     cfg = config if config is not None else trading()
     market = MarketInstance.create(window_ts, offsets)
     market.phase = MarketPhase.ACTIVE
     market.freeze_ptb(ptb)
-    opening = ptb if direction is Direction.UP else ptb - Decimal("100")
+    gap = Decimal("100")
+    opening = ptb + gap if direction is Direction.UP else ptb - gap
     # The signal TWAP must satisfy every frozen trigger, so it is pushed one whole
     # buffer past the widest one in the firing direction.
     widest = max(cfg.buffer_for(o) for o in offsets)

@@ -31,6 +31,7 @@ from arc.domain.enums import (
 from arc.domain.money import dec_str, to_decimal
 from arc.domain.timing import close_ts_for, slug_for, windows_by_priority
 from arc.errors import (
+    NoDirectionError,
     ObservationRejectedError,
     WindowFreezeError,
 )
@@ -210,7 +211,25 @@ class ExecutionWindow:
                 f"got {twap}"
             )
 
-        direction = Direction.UP if twap >= price_to_beat else Direction.DOWN
+        # STRICT COMPARISON ONLY. `>=` and `<=` are forbidden here by the direction
+        # contract, and equality is not a tie to be broken — it is the absence of a
+        # direction. Resolving it to UP (as an earlier revision did) would open a
+        # real position on a market where the TWAP had not moved off the reference
+        # at all, in whichever direction the tie-break happened to name.
+        #
+        # Raised BEFORE the assignment block, so the window is left completely
+        # untouched and the caller decides its terminal state. This is the one
+        # rejection that must not be retried on the next pass: direction is
+        # determined once, at the opening instant, and a retry would freeze against
+        # a later TWAP.
+        if twap == price_to_beat:
+            raise NoDirectionError(
+                f"window {self.offset_seconds}s: frozen TWAP {twap} equals the official "
+                f"PTB {price_to_beat}; strict comparison yields no direction, so no "
+                "intent and no order (direction contract)"
+            )
+
+        direction = Direction.UP if twap > price_to_beat else Direction.DOWN
         trigger = twap + buf if direction is Direction.UP else twap - buf
 
         # Single assignment block, reached only when everything above succeeded.
@@ -263,6 +282,12 @@ class ExecutionWindow:
         trigger sits BELOW the opening TWAP, so at the freeze instant
         twap >= trigger is ALREADY true, and every DOWN window would fire
         immediately and unconditionally (A12).
+
+        This is NOT the direction comparison and does not share its operators.
+        Direction determination is strict (> and <, equality yields no direction);
+        trigger firing is inclusive, because the locked trigger IS the threshold the
+        buffer defines and landing exactly on it is reaching it. Requiring an
+        overshoot would silently discard every exact touch.
         """
         if not self.is_frozen or self.locked_trigger is None or self.direction is None:
             return False

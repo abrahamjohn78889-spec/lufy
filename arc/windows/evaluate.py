@@ -13,9 +13,16 @@ the trigger is the configured distance away, the fire is logged normally. There 
 regression test whose entire job is to prove `>=`-only breaks DOWN.
 
 EQUALITY FIRES, in both directions. `>=` and `<=`, never `>` and `<`. The trigger is the
-threshold the buffer defines, so reaching it exactly is reaching it. U4 (whether the
-VENUE settles on `>=` or `>`) is a separate, still-unverified question about outcome
-determination and does not reach this comparison.
+threshold the buffer defines, so reaching it exactly is reaching it.
+
+This is deliberately the OPPOSITE of the direction comparison, which is strict (`>` and
+`<`, with equality yielding no direction at all). The two answer different questions:
+direction asks "which side does this window trade", where a TWAP sitting exactly on the
+PTB names no side; trigger asks "has the frozen target been reached", where landing
+exactly on the target has reached it. Sharing one operator between them would either
+invent a direction from a tie or throw away every exact touch. U4 (whether the VENUE
+settles on `>=` or `>`) is a separate, still-unverified question about outcome
+determination and does not reach either comparison.
 
 CONTINUOUS AND CHEAP (criteria 11, 17). `evaluate_market` is a plain synchronous
 function over at most five windows: two Decimal comparisons each, no I/O, no lock, no

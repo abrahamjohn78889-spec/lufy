@@ -122,7 +122,7 @@ class TestTheSnapshotIsTakenOnce:
         market.phase = MarketPhase.ACTIVE
         market.accumulator.add(BASE_PTB)
         market.window(3).freeze(
-            opening_twap=BASE_PTB,
+            opening_twap=BASE_PTB + Decimal("100"),
             ptb=BASE_PTB,
             buffer=Decimal("1.00"),
             frozen_at=float(WINDOW_TS),
@@ -136,7 +136,7 @@ class TestTheSnapshotIsTakenOnce:
         market.phase = MarketPhase.ACTIVE
         market.freeze_ptb(BASE_PTB)
         market.window(3).freeze(
-            opening_twap=BASE_PTB,
+            opening_twap=BASE_PTB + Decimal("100"),
             ptb=BASE_PTB,
             buffer=Decimal("1.00"),
             frozen_at=float(WINDOW_TS),

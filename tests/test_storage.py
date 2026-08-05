@@ -226,7 +226,7 @@ class TestSaveWindowFrozenRefusesAPartialFreeze:
         store.create_market(market, 1.0)
         window = market.window(3)
         window.freeze(
-            opening_twap=Decimal("100"), ptb=Decimal("100"), buffer=Decimal("1"), frozen_at=1.0
+            opening_twap=Decimal("100"), ptb=Decimal("99"), buffer=Decimal("1"), frozen_at=1.0
         )
         assert store.save_window_frozen(market.slug, window, 1.0) is True
         row = store.windows_for(market.slug)
@@ -285,7 +285,7 @@ class TestRestoreFrozenIsVerbatim:
         store.create_market(market, 1.0)
         window = market.window(3)
         window.freeze(
-            opening_twap=Decimal("100"), ptb=Decimal("100"), buffer=Decimal("1"), frozen_at=1.0
+            opening_twap=Decimal("100"), ptb=Decimal("99"), buffer=Decimal("1"), frozen_at=1.0
         )
         store.save_window_frozen(market.slug, window, 1.0)
         assert store.restore_frozen(market.slug, 15) is None

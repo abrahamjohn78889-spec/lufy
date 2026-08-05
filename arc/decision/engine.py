@@ -130,6 +130,25 @@ class DecisionOutcome:
         return bool(self.intents)
 
 
+def _skip_for(state: WindowState) -> SkipReason:
+    """Why a window that is not FIRED produced nothing.
+
+    NO_DIRECTION is reported as itself rather than as NOT_FROZEN. Both are true of the
+    window, but they mean opposite things to an operator: NOT_FROZEN is a window still
+    waiting for its instant (or one whose freeze was rejected and will be retried),
+    while NO_DIRECTION is a final strategy verdict — the frozen TWAP equalled the
+    official PTB, so strict comparison yielded no side to trade. Collapsing them would
+    make a deliberate no-trade look like a stalled window.
+    """
+    if state is WindowState.NO_DIRECTION:
+        return SkipReason.NO_DIRECTION
+    if state is WindowState.PENDING:
+        return SkipReason.NOT_FIRED
+    if state in (WindowState.FROZEN, WindowState.FIRED):
+        return SkipReason.NOT_FIRED
+    return SkipReason.NOT_FROZEN
+
+
 class DecisionEngine:
     """Turns fired windows into persisted ExecutionIntents, or into a named refusal.
 
@@ -206,11 +225,7 @@ class DecisionEngine:
                 decisions.append(
                     WindowDecision(
                         offset_seconds=window.offset_seconds,
-                        skip=(
-                            SkipReason.NOT_FIRED
-                            if window.is_frozen or window.state is WindowState.PENDING
-                            else SkipReason.NOT_FROZEN
-                        ),
+                        skip=_skip_for(window.state),
                     )
                 )
                 continue

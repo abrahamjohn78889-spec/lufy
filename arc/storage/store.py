@@ -458,6 +458,23 @@ class Store:
             "fired_at": row["fired_at"],
         }
 
+    def window_state(self, slug: str, offset_seconds: int) -> WindowState | None:
+        """One window's persisted state. None when no row exists.
+
+        Exists for the terminal states that carry NO frozen values — NO_DIRECTION is
+        the only one — because restore_frozen deliberately refuses a row with a null
+        trigger. Without this, a NO_DIRECTION window would reload as PENDING after a
+        restart and the next pass would freeze it against a later TWAP, determining
+        direction a second time from a value the contract forbids consulting.
+        """
+        row = self._conn.execute(
+            "SELECT state FROM windows WHERE market_slug = ? AND offset_seconds = ?",
+            (slug, offset_seconds),
+        ).fetchone()
+        if row is None:
+            return None
+        return WindowState(row["state"])
+
     def windows_for(self, slug: str) -> tuple[sqlite3.Row, ...]:
         rows = self._conn.execute(
             "SELECT * FROM windows WHERE market_slug = ? ORDER BY offset_seconds", (slug,)

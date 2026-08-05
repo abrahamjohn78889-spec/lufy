@@ -525,7 +525,7 @@ class TestTheGatesThatCannotBeReachedFromHere:
         instance.phase = MarketPhase.ACTIVE
         instance.accumulator.add(BASE_PTB)
         instance.window(3).freeze(
-            opening_twap=BASE_PTB,
+            opening_twap=BASE_PTB + Decimal("100"),
             ptb=BASE_PTB,
             buffer=Decimal("1.00"),
             frozen_at=float(1754400000),

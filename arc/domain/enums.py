@@ -70,16 +70,26 @@ class MarketPhase(StrEnum):
 class WindowState(StrEnum):
     """State of one execution window.
 
-    PENDING   not yet activated, or a freeze was rejected and left it untouched
-    FROZEN    all five values locked atomically; immutable, including across restart
-    FIRED     the direction-appropriate trigger comparison passed
-    EXPIRED   the market closed without the trigger passing
+    PENDING       not yet activated, or a freeze was rejected and left it untouched
+    FROZEN        all five values locked atomically; immutable, including across restart
+    FIRED         the direction-appropriate trigger comparison passed
+    EXPIRED       the market closed without the trigger passing
+    NO_DIRECTION  the frozen TWAP equalled the official PTB exactly
+
+    NO_DIRECTION is terminal and is NOT an error. Direction determination uses strict
+    comparison only: TWAP > PTB is UP, TWAP < PTB is DOWN, and equality resolves to
+    neither. The window freezes no direction, authorises no intent and submits no
+    order. It is a distinct state rather than folded into EXPIRED because EXPIRED
+    means "a real trigger existed and was never crossed" — a buffer that was too
+    wide — while this means "no direction was determinable". An operator tuning
+    buffers must be able to tell those apart.
     """
 
     PENDING = "PENDING"
     FROZEN = "FROZEN"
     FIRED = "FIRED"
     EXPIRED = "EXPIRED"
+    NO_DIRECTION = "NO_DIRECTION"
 
 
 class OrderState(StrEnum):
