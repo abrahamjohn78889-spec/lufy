@@ -161,6 +161,10 @@ class DenialReason(StrEnum):
     Every denial carries one of these into the log stream. There is deliberately
     no lead-time reason here: the lead-time gate is repealed entirely (A10/D1) and
     MARKET_CANCELLING is a PHASE gate, not a timing gate.
+
+    Each gate owns exactly one member. Two gates sharing a reason would make a
+    rejection log unactionable: the operator would know a trade was refused but
+    not which of two independent conditions refused it.
     """
 
     TRADING_DISABLED_SPEC_UNVERIFIED = "TRADING_DISABLED_SPEC_UNVERIFIED"
@@ -169,15 +173,20 @@ class DenialReason(StrEnum):
     MARKET_DEAD = "MARKET_DEAD"
     MARKET_NOT_ACTIVE = "MARKET_NOT_ACTIVE"
     PTB_UNAVAILABLE = "PTB_UNAVAILABLE"
+    WINDOW_NOT_TRIGGERED = "WINDOW_NOT_TRIGGERED"
+    STRATEGY_DISABLED = "STRATEGY_DISABLED"
     ENTRY_PRICE_LIMIT = "ENTRY_PRICE_LIMIT"
     ENTRY_PRICE_BELOW_MIN = "ENTRY_PRICE_BELOW_MIN"
     SIZE_BELOW_EXCHANGE_MINIMUM = "SIZE_BELOW_EXCHANGE_MINIMUM"
     TRADE_QUOTA_EXHAUSTED = "TRADE_QUOTA_EXHAUSTED"
     OPPOSING_DIRECTION_BLOCKED = "OPPOSING_DIRECTION_BLOCKED"
+    POSITION_LIMIT_REACHED = "POSITION_LIMIT_REACHED"
+    LOSS_LIMIT_REACHED = "LOSS_LIMIT_REACHED"
     DUPLICATE_INTENT = "DUPLICATE_INTENT"
     INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
     FEED_STALE = "FEED_STALE"
     CLOCK_DRIFT_CRITICAL = "CLOCK_DRIFT_CRITICAL"
+    RUNTIME_UNHEALTHY = "RUNTIME_UNHEALTHY"
     NO_BOOK_LIQUIDITY = "NO_BOOK_LIQUIDITY"
 
 

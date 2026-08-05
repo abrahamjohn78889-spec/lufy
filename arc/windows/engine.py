@@ -18,8 +18,10 @@ cannot block the market loop, another window, or feed processing (criterion 11),
 there is no timer or background task to leak (criterion 19).
 
 This engine determines ONLY whether a frozen trigger has been satisfied. It produces no
-ExecutionIntent, sizes nothing, reads no order book and touches no wallet. What a fired
-window becomes is a question for engines that do not exist yet.
+ExecutionIntent, sizes nothing, reads no order book and touches no wallet. A fired window
+is handed to the Decision Engine (arc/decision/), which is the only creator of intents;
+the split is what keeps trigger evaluation free of risk state, and risk evaluation free of
+any ability to re-derive a trigger.
 """
 
 from __future__ import annotations

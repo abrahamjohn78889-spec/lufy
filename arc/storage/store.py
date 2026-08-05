@@ -472,13 +472,20 @@ class Store:
         Arbitration is the UNIQUE(market_slug, offset_seconds) constraint, not an
         in-memory guard, so exactly-one-per-window holds across a crash between
         the decision and the submission (A12).
+
+        Every snapshot column is written in the same statement. Persisting the
+        decision without the price and size it was made with would leave a
+        recovered intent unable to be submitted without recomputing them from
+        state that has since moved.
         """
         try:
             with self._conn:
                 cur = self._conn.execute(
                     "INSERT OR IGNORE INTO intents "
                     "(intent_id, market_slug, offset_seconds, direction, signal_twap, "
-                    " locked_trigger, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    " locked_trigger, created_at, opening_twap, ptb, buffer, "
+                    " limit_price, size, strategy_id, close_ts) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         intent.intent_id or f"{intent.market_slug}:{intent.offset_seconds}",
                         intent.market_slug,
@@ -487,6 +494,13 @@ class Store:
                         dec_str(intent.signal_twap),
                         dec_str(intent.locked_trigger),
                         intent.created_at,
+                        dec_str(intent.opening_twap),
+                        dec_str(intent.ptb),
+                        dec_str(intent.buffer),
+                        dec_str(intent.limit_price),
+                        dec_str(intent.size),
+                        intent.strategy_id,
+                        intent.close_ts,
                     ),
                 )
                 return cur.rowcount > 0
@@ -506,6 +520,13 @@ class Store:
                 locked_trigger=to_decimal(r["locked_trigger"]),
                 created_at=float(r["created_at"]),
                 intent_id=str(r["intent_id"]),
+                opening_twap=to_decimal(r["opening_twap"]),
+                ptb=to_decimal(r["ptb"]),
+                buffer=to_decimal(r["buffer"]),
+                limit_price=to_decimal(r["limit_price"]),
+                size=to_decimal(r["size"]),
+                strategy_id=str(r["strategy_id"]),
+                close_ts=int(r["close_ts"]),
             )
             for r in rows
         )

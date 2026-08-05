@@ -28,7 +28,7 @@ from arc.domain.enums import (
     Outcome,
     WindowState,
 )
-from arc.domain.money import to_decimal
+from arc.domain.money import dec_str, to_decimal
 from arc.domain.timing import close_ts_for, slug_for, windows_by_priority
 from arc.errors import (
     ObservationRejectedError,
@@ -290,13 +290,23 @@ class ExecutionWindow:
             self.state = WindowState.EXPIRED
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ExecutionIntent:
-    """The decision to trade one window. Exactly one per window.
+    """The decision to trade one window. Exactly one per window. Immutable.
 
     Uniqueness is arbitrated by a SQLite UNIQUE constraint on
     (market_slug, offset_seconds) rather than by an in-memory set, so it survives
     a crash between the decision and the submission (A12).
+
+    Frozen, and SELF-SUFFICIENT: every value execution needs to place the order is
+    carried here. That is the point. If execution re-read `market.signal_twap` or
+    `window.locked_trigger` at submission time it would submit against numbers
+    that moved after the decision was made — the TWAP moves continuously, which is
+    the whole thing the window watches for. A frozen snapshot cannot drift.
+
+    `close_ts` is carried for the same reason: execution needs the market's own
+    close instant for its records without holding a reference to the mutable
+    MarketInstance, which is dropped at close (A11).
     """
 
     market_slug: str
@@ -306,6 +316,48 @@ class ExecutionIntent:
     locked_trigger: Decimal
     created_at: float
     intent_id: str = ""
+    # ── the frozen snapshot execution acts on ────────────────────────────────
+    opening_twap: Decimal = _ZERO
+    ptb: Decimal = _ZERO
+    buffer: Decimal = _ZERO
+    limit_price: Decimal = _ZERO
+    size: Decimal = _ZERO
+    strategy_id: str = ""
+    close_ts: int = 0
+
+    def serialize(self) -> str:
+        """A stable, byte-identical rendering of the whole intent.
+
+        Determinism is asserted on this string rather than on the object, because
+        `==` on two dataclasses would pass for values that print differently —
+        Decimal("0.80") == Decimal("0.8") — and a venue receives the printed form,
+        not the object. `dec_str` is used for every money field so the comparison
+        is over exactly the text that would go on the wire.
+
+        `intent_id` is included: two runs of the same input must produce the same
+        id, which forbids deriving it from a clock reading or a counter.
+
+        `created_at` is deliberately EXCLUDED. It is a wall-clock reading, so two
+        runs of the same observation stream on different days would differ on it
+        and the determinism assertion would be about the clock rather than about
+        the decision. Nothing on the wire depends on it.
+        """
+        parts = (
+            f"intent_id={self.intent_id}",
+            f"market_slug={self.market_slug}",
+            f"offset_seconds={self.offset_seconds}",
+            f"direction={self.direction.value}",
+            f"signal_twap={dec_str(self.signal_twap)}",
+            f"locked_trigger={dec_str(self.locked_trigger)}",
+            f"opening_twap={dec_str(self.opening_twap)}",
+            f"ptb={dec_str(self.ptb)}",
+            f"buffer={dec_str(self.buffer)}",
+            f"limit_price={dec_str(self.limit_price)}",
+            f"size={dec_str(self.size)}",
+            f"strategy_id={self.strategy_id}",
+            f"close_ts={self.close_ts}",
+        )
+        return "|".join(parts)
 
 
 @dataclass(slots=True)
@@ -394,6 +446,11 @@ class MarketInstance:
     intents: list[ExecutionIntent] = field(default_factory=list)
     orders: list[Order] = field(default_factory=list)
     fills: list[Fill] = field(default_factory=list)
+    # Windows admitted but not yet resolved to a fill or a terminal non-fill
+    # (hazard H2). Held HERE rather than in a process-level ledger so it is dropped
+    # with the instance at close: a reservation that outlived its market would
+    # consume the next market's quota and read as a correctly-enforced limit.
+    reservations: set[int] = field(default_factory=set)
     settlement: Settlement | None = None
     settlement_twap: Decimal | None = None
     dead_reason: str = ""

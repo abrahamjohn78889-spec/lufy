@@ -9,7 +9,7 @@ Four modules, one question each:
 
 This layer decides NOTHING about trading. It produces no intent, sizes no order,
 touches no wallet and reads no book. A window that fires is a window whose frozen
-comparison came true; what happens next belongs to engines that do not exist yet.
+comparison came true; what happens next belongs to arc/decision/.
 """
 
 from __future__ import annotations

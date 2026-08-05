@@ -41,13 +41,14 @@ from dataclasses import dataclass
 from typing import Final
 
 from arc.clock import Clock
+from arc.decision.engine import DecisionEngine
 from arc.domain.enums import MarketPhase
 from arc.domain.models import MarketInstance, Observation, TwapAccumulator
 from arc.domain.timing import window_ts_for
 from arc.errors import ObservationRejectedError
 from arc.logging_setup import log_event
 from arc.storage.store import Store
-from arc.windows.engine import WindowEngine
+from arc.windows.engine import WindowEngine, WindowPass
 
 __all__ = ["MAX_LIVE_MARKETS", "MarketRotator", "RotationEvent"]
 
@@ -79,6 +80,7 @@ class MarketRotator:
 
     __slots__ = (
         "_clock",
+        "_decisions",
         "_logger",
         "_offsets",
         "_on_settle",
@@ -100,6 +102,7 @@ class MarketRotator:
         offsets: tuple[int, ...],
         on_settle: Callable[[MarketInstance], None] | None = None,
         windows: WindowEngine | None = None,
+        decisions: DecisionEngine | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._store = store
@@ -113,6 +116,11 @@ class MarketRotator:
         # behaves exactly as before and windows are simply never driven — which is
         # why the observation runtime supplies one.
         self._windows = windows
+        # Also optional, and for the same reason. When absent, fired windows are
+        # recorded and nothing more — which is exactly the behaviour of every
+        # existing rotator test, so wiring the decision layer in cannot change what
+        # they observe.
+        self._decisions = decisions
         self._logger = logger
         self.current: MarketInstance | None = None
         self.closing: MarketInstance | None = None
@@ -191,7 +199,23 @@ class MarketRotator:
         """
         if self._windows is None or self.current is None:
             return
-        self._windows.pass_over(self.current, now)
+        result = self._windows.pass_over(self.current, now)
+        self._decide(result, now)
+
+    def _decide(self, result: WindowPass, now: float) -> None:
+        """Hand a completed window pass to the Decision Engine.
+
+        Called only when the pass actually fired something. The engine is idempotent
+        and would refuse a duplicate anyway, but running it on every pass would put a
+        `has_intent` query and a fills scan on the feed path several times a second
+        for markets where nothing has fired — which is most of them, most of the time.
+
+        `now` is forwarded as the intent's created_at only. Nothing in the decision
+        layer reads a clock to decide admissibility (A10/D1).
+        """
+        if self._decisions is None or self.current is None or not result.fired:
+            return
+        self._decisions.decide(self.current, now)
 
     def _open(self, window_ts: int, now: float) -> str:
         """Create and persist market N+1. PTB is NOT frozen here.
@@ -401,4 +425,5 @@ class MarketRotator:
         """
         if self._windows is None or self.current is None:
             return
-        self._windows.pass_over(self.current, now)
+        result = self._windows.pass_over(self.current, now)
+        self._decide(result, now)

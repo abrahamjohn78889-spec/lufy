@@ -26,7 +26,7 @@ from arc.errors import SchemaMigrationError
 
 __all__ = ["EXPECTED_TABLES", "SCHEMA_VERSION", "apply_pragmas", "migrate", "schema_version"]
 
-SCHEMA_VERSION: Final[int] = 1
+SCHEMA_VERSION: Final[int] = 2
 
 EXPECTED_TABLES: Final[tuple[str, ...]] = (
     "schema_migrations",
@@ -215,7 +215,28 @@ CREATE TABLE IF NOT EXISTS runtime_state (
 );
 """
 
-_MIGRATIONS: Final[dict[int, str]] = {1: _MIGRATION_1}
+_MIGRATION_2: Final[str] = """
+-- Version 2 widens `intents` into the SELF-SUFFICIENT snapshot the execution layer
+-- acts on. Before this, an intent carried only the direction and the two TWAP
+-- numbers, so anything placing an order had to go back to the live MarketInstance
+-- for the price, the size and the frozen reference values. Those move: the signal
+-- TWAP advances with every observation and the instance itself is dropped at close
+-- (A11). Re-reading them at submission time submits against different numbers than
+-- the ones the decision was made on.
+--
+-- ALTER rather than a rebuild: an existing database carries real recorded intents
+-- and dropping the table to widen it would destroy the only evidence of what was
+-- decided. Every added column is NOT NULL with a default so old rows stay legal.
+ALTER TABLE intents ADD COLUMN opening_twap   TEXT NOT NULL DEFAULT '0';
+ALTER TABLE intents ADD COLUMN ptb            TEXT NOT NULL DEFAULT '0';
+ALTER TABLE intents ADD COLUMN buffer         TEXT NOT NULL DEFAULT '0';
+ALTER TABLE intents ADD COLUMN limit_price    TEXT NOT NULL DEFAULT '0';
+ALTER TABLE intents ADD COLUMN size           TEXT NOT NULL DEFAULT '0';
+ALTER TABLE intents ADD COLUMN strategy_id    TEXT NOT NULL DEFAULT '';
+ALTER TABLE intents ADD COLUMN close_ts       INTEGER NOT NULL DEFAULT 0;
+"""
+
+_MIGRATIONS: Final[dict[int, str]] = {1: _MIGRATION_1, 2: _MIGRATION_2}
 
 
 def schema_version(conn: sqlite3.Connection) -> int:

@@ -43,6 +43,9 @@ TRADING_KEYS: Final[tuple[str, ...]] = (
     "buffers",
     "position_notional_usd",
     "max_trades_per_market",
+    "max_concurrent_positions",
+    "max_daily_loss_usd",
+    "max_consecutive_losses",
     "entry_price_min",
     "entry_price_max",
     "tick_size",
@@ -92,6 +95,15 @@ class ArcSettings(BaseSettings):
 
     position_notional_usd: str = ""
     max_trades_per_market: int = 0
+    # Concurrent open positions across the whole process, not per market. Two
+    # markets overlap (D6), so a per-market cap alone permits twice the intended
+    # exposure at every boundary.
+    max_concurrent_positions: int = 0
+    # 0 disables each limit. They are separate numbers because they fail
+    # differently: a large single loss and a run of small ones are different
+    # signals, and collapsing them into one threshold hides whichever fires second.
+    max_daily_loss_usd: str = "0"
+    max_consecutive_losses: int = 0
 
     entry_price_min: str = ""
     entry_price_max: str = ""
@@ -197,6 +209,9 @@ class TradingConfig:
     buffers: dict[int, Decimal]
     position_notional_usd: Decimal
     max_trades_per_market: int
+    max_concurrent_positions: int
+    max_daily_loss_usd: Decimal
+    max_consecutive_losses: int
     entry_price_min: Decimal
     entry_price_max: Decimal
     tick_size: Decimal
@@ -244,6 +259,9 @@ class TradingConfig:
             ),
             "position_notional_usd": dec_str(self.position_notional_usd),
             "max_trades_per_market": str(self.max_trades_per_market),
+            "max_concurrent_positions": str(self.max_concurrent_positions),
+            "max_daily_loss_usd": dec_str(self.max_daily_loss_usd),
+            "max_consecutive_losses": str(self.max_consecutive_losses),
             "entry_price_min": dec_str(self.entry_price_min),
             "entry_price_max": dec_str(self.entry_price_max),
             "tick_size": dec_str(self.tick_size),
@@ -399,6 +417,43 @@ def build_trading_config(values: dict[str, str]) -> TradingConfig:
             f"MAX_TRADES_PER_MARKET must be at least 1, got {max_trades}"
         )
 
+    # 14. Concurrent-position cap. Zero would refuse every trade while every other
+    #     value read as correctly configured — a bot that never trades and never
+    #     says why. Negative is meaningless.
+    max_concurrent = _int_value(values, "max_concurrent_positions")
+    if max_concurrent <= 0:
+        raise ConfigInvariantError(
+            f"MAX_CONCURRENT_POSITIONS must be at least 1, got {max_concurrent}. "
+            "Zero would deny every trade."
+        )
+
+    # 15. Loss limits. Zero DISABLES each one, so only a negative value is invalid:
+    #     a negative daily loss cap compares as already-breached on the first pass
+    #     and would silently stop trading forever.
+    max_daily_loss = _require_decimal(
+        values.get("max_daily_loss_usd", ""), "max_daily_loss_usd"
+    )
+    if max_daily_loss < 0:
+        raise ConfigInvariantError(
+            f"MAX_DAILY_LOSS_USD must not be negative, got {max_daily_loss}. "
+            "Use 0 to disable the limit."
+        )
+    max_consecutive_losses = _int_value(values, "max_consecutive_losses")
+    if max_consecutive_losses < 0:
+        raise ConfigInvariantError(
+            f"MAX_CONSECUTIVE_LOSSES must not be negative, got {max_consecutive_losses}. "
+            "Use 0 to disable the limit."
+        )
+    if max_daily_loss == 0:
+        warnings.append(
+            "MAX_DAILY_LOSS_USD is 0, so the daily loss limit is disabled and a losing "
+            "day has no automatic stop."
+        )
+    if max_consecutive_losses == 0:
+        warnings.append(
+            "MAX_CONSECUTIVE_LOSSES is 0, so a losing streak has no automatic stop."
+        )
+
     entry_min = _require_decimal(values.get("entry_price_min", ""), "entry_price_min")
     entry_max = _require_decimal(values.get("entry_price_max", ""), "entry_price_max")
     tick_size = _require_decimal(values.get("tick_size", ""), "tick_size")
@@ -545,6 +600,9 @@ def build_trading_config(values: dict[str, str]) -> TradingConfig:
         buffers={w: buffers[w] for w in windows},
         position_notional_usd=position_notional,
         max_trades_per_market=max_trades,
+        max_concurrent_positions=max_concurrent,
+        max_daily_loss_usd=max_daily_loss,
+        max_consecutive_losses=max_consecutive_losses,
         entry_price_min=entry_min,
         entry_price_max=entry_max,
         tick_size=tick_size,
@@ -617,6 +675,9 @@ def env_trading_values(env: ArcSettings) -> dict[str, str]:
         "buffers": env.buffers,
         "position_notional_usd": env.position_notional_usd,
         "max_trades_per_market": str(env.max_trades_per_market),
+        "max_concurrent_positions": str(env.max_concurrent_positions),
+        "max_daily_loss_usd": env.max_daily_loss_usd,
+        "max_consecutive_losses": str(env.max_consecutive_losses),
         "entry_price_min": env.entry_price_min,
         "entry_price_max": env.entry_price_max,
         "tick_size": env.tick_size,
