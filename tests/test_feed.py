@@ -26,7 +26,6 @@ from arc.market.feed import (
     RTDS_URL,
     SDK_STALE_THRESHOLD_MS,
     BackoffPolicy,
-    BoundaryTracker,
     RtdsFeed,
     subscribe_frame,
 )
@@ -241,79 +240,6 @@ class TestReconnection:
         feed, _ = _feed(socket)
         asyncio.run(_take(feed, 1))
         assert socket.closed is True
-
-
-class TestBoundaryContinuity:
-    def test_a_fresh_tracker_vouches_for_nothing(self) -> None:
-        """It has observed no boundary, so it can vouch for none."""
-        assert BoundaryTracker().continuous is False
-
-    def test_connecting_does_not_by_itself_restore_continuity(self) -> None:
-        tracker = BoundaryTracker()
-        tracker.mark_connected()
-        assert tracker.continuous is False
-
-    def test_a_boundary_crossed_while_connected_is_continuous(self) -> None:
-        tracker = BoundaryTracker()
-        tracker.mark_connected()
-        assert tracker.observe_boundary() is True
-        assert tracker.continuous is True
-
-    def test_a_drop_clears_continuity_immediately(self) -> None:
-        """This flag is the gate on the L2 PTB source (ptb.py)."""
-        tracker = BoundaryTracker()
-        tracker.mark_connected()
-        tracker.observe_boundary()
-        assert tracker.continuous is True
-        tracker.mark_disconnected()
-        assert tracker.continuous is False
-
-    def test_a_boundary_the_reconnect_preceded_is_continuous(self) -> None:
-        """The gap ended before the boundary, so the connection did span it.
-
-        Continuity is a claim about the interval containing the boundary, not about
-        the whole session. A boundary that falls INSIDE the gap produces no
-        observation at all, so observe_boundary is never called for it and ptb.py
-        refuses the stale reference on boundary_ts instead.
-        """
-        tracker = BoundaryTracker()
-        tracker.mark_connected()
-        tracker.mark_disconnected()
-        tracker.mark_connected()
-        assert tracker.observe_boundary() is True
-
-    def test_continuity_is_not_claimed_between_the_drop_and_the_reconnect(self) -> None:
-        """Nothing observed in the gap can be vouched for."""
-        tracker = BoundaryTracker()
-        tracker.mark_connected()
-        tracker.observe_boundary()
-        tracker.mark_disconnected()
-        assert tracker.observe_boundary() is False
-
-    def test_the_feed_marks_the_boundary_broken_on_a_disconnect(self) -> None:
-        feed, _ = _feed(_Socket("first"), _Socket("second"))
-
-        async def scenario() -> None:
-            stream = _stream(feed)
-            async for _ in stream:
-                pass_through = feed.boundary
-                pass_through.mark_connected()
-                pass_through.observe_boundary()
-                break
-            # Force the drop by exhausting the first socket.
-            async for _ in stream:
-                break
-            await stream.aclose()
-
-        asyncio.run(scenario())
-        assert feed.boundary.continuous is False
-
-    def test_the_feed_marks_the_boundary_connected_on_connect(self) -> None:
-        feed, _ = _feed(_Socket("tick"))
-        asyncio.run(_take(feed, 1))
-        # mark_connected clears continuity: a new connection has crossed no boundary.
-        assert feed.boundary.continuous is False
-        assert feed.boundary.observe_boundary() is True
 
 
 class TestConnectFailures:

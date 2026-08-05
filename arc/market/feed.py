@@ -19,10 +19,12 @@ length, and never used as a health check for it. This module measures gaps only 
 decide whether data is arriving. `windowSeconds` is a field in the payload and is
 read as a field; see settlement_feed.py.
 
-Boundary continuity: the feed records whether the connection stayed up across each
-market boundary. That flag is the gate on the L2 PTB source (see ptb.py) — across a
-reconnect the process did not observe the boundary, so it holds no official value
-for it.
+This module holds no notion of a market boundary. It once tracked whether the
+connection spanned each 300s boundary, to gate a PTB source that read the price
+observed at that instant. That source is gone: live measurement showed the observed
+boundary price differs from the venue's published close price, so it was an estimate,
+and A1 forbids estimating the PTB. The official value now comes from the venue's own
+published `finalPrice` (see ptb.py), which no property of this connection can affect.
 """
 
 from __future__ import annotations
@@ -48,7 +50,6 @@ __all__ = [
     "RTDS_URL",
     "SDK_STALE_THRESHOLD_MS",
     "BackoffPolicy",
-    "BoundaryTracker",
     "RtdsFeed",
     "subscribe_frame",
 ]
@@ -132,47 +133,6 @@ class BackoffPolicy:
         return min(delay, self.max_seconds)
 
 
-class BoundaryTracker:
-    """Tracks whether the connection held across each 300s market boundary.
-
-    Per-connection instance state. A module-level flag would be shared by a
-    reconnected feed and would report the new connection's continuity for a boundary
-    the old one actually missed (A11).
-    """
-
-    __slots__ = ("_broken_since", "_continuous")
-
-    def __init__(self) -> None:
-        # False until a boundary has been crossed on an unbroken connection. A fresh
-        # connection has observed no boundary, so it can vouch for none.
-        self._continuous = False
-        self._broken_since = True
-
-    @property
-    def continuous(self) -> bool:
-        return self._continuous
-
-    def mark_connected(self) -> None:
-        """A connection opened. Continuity is not restored until a boundary passes."""
-        self._continuous = False
-        self._broken_since = False
-
-    def mark_disconnected(self) -> None:
-        """The connection dropped. Everything after this is discontinuous."""
-        self._continuous = False
-        self._broken_since = True
-
-    def observe_boundary(self) -> bool:
-        """Record that a market boundary was crossed. Returns the continuity flag.
-
-        Continuity becomes true only when the boundary is crossed while connected,
-        which is the exact condition under which the recorded boundary price is the
-        official one rather than an estimate of it.
-        """
-        self._continuous = not self._broken_since
-        return self._continuous
-
-
 class RtdsFeed:
     """One RTDS connection. Yields raw payloads; validates nothing.
 
@@ -180,8 +140,8 @@ class RtdsFeed:
     changes the shape of is rejected in one place with a reason, rather than raising
     an attribute error somewhere inside the read loop.
 
-    The connector is injected so the reconnect ladder, the keepalive and the
-    continuity flag can all be driven from a test without a socket.
+    The connector is injected so the reconnect ladder and the keepalive can both be
+    driven from a test without a socket.
     """
 
     __slots__ = (
@@ -191,7 +151,6 @@ class RtdsFeed:
         "_keepalive_seconds",
         "_logger",
         "_url",
-        "boundary",
         "connect_attempts",
         "connected",
         "keepalives_sent",
@@ -214,7 +173,6 @@ class RtdsFeed:
         self._backoff = backoff if backoff is not None else BackoffPolicy()
         self._keepalive_seconds = keepalive_seconds
         self._logger = logger
-        self.boundary = BoundaryTracker()
         self.connected = False
         self.connect_attempts = 0
         self.messages_received = 0
@@ -245,7 +203,6 @@ class RtdsFeed:
         # connection that has subscribed is a connection that is up.
         await socket.send(json.dumps(subscribe_frame()))
         self.connected = True
-        self.boundary.mark_connected()
         log_event(logging.INFO, "Feed Connected", self._url, logger=self._logger)
         return socket
 
@@ -259,10 +216,9 @@ class RtdsFeed:
     async def messages(self) -> AsyncIterator[str | bytes]:
         """Yield raw frames forever, reconnecting with bounded backoff.
 
-        A dropped connection is surfaced through BoundaryTracker rather than by
-        raising: the caller wants the stream to continue, and the fact that a gap
-        occurred is what the continuity flag is for. Only the caller's own
-        cancellation ends this loop.
+        A dropped connection is logged and retried rather than raised: the caller
+        wants the stream to continue, and a reconnect is a normal event on a 24/7 run.
+        Only the caller's own cancellation ends this loop.
         """
         attempt = 0
         while True:
@@ -284,7 +240,6 @@ class RtdsFeed:
                 raise
             except (ConnectionLostError, FeedError, OSError, websockets.WebSocketException) as exc:
                 self.connected = False
-                self.boundary.mark_disconnected()
                 attempt += 1
                 delay = self._backoff.delay_for(attempt)
                 log_event(

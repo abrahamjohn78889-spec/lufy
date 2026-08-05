@@ -14,17 +14,31 @@ exact text the venue sent, and a positivity check.
 Two sources, in order:
 
     L1  the market metadata's own PTB field — the official value
-    L2  the previous market's official close reference, and ONLY when the feed was
-        continuous across the boundary
+    L2  the venue's PUBLISHED `finalPrice` for the previous market, cached when it
+        became available
 
-L2 is not a calculation. Markets are contiguous (A5), so market N+1's opening
-reference is the same instant as market N's close, and if this process observed
-that instant on an unbroken connection then the value it recorded IS the official
-one — not an estimate of it. The continuity gate is what makes that true: across a
-reconnect the process did not observe the boundary, so whatever it holds is a value
-from before the gap, and using it would be exactly the estimation A1 forbids.
+L2 is not a calculation and not an observation. Live measurement on 2026-08-05
+established, on six consecutive settled markets with zero mismatches, that
 
-When both are unavailable the market is marked DEAD, `⛔ PTB Unavailable — no
+    priceToBeat(M) == finalPrice(M-1)
+
+exactly. Markets are contiguous (A5), so market M-1's close instant IS market M's
+window_ts, and the venue publishes its own number for that instant. The venue writes
+`eventMetadata` — both `priceToBeat` and `finalPrice` — roughly 25 seconds after a
+market closes, which is roughly 25 seconds INTO the next market's life: 260 seconds
+before that market's earliest execution window at close-15s. So M's official opening
+reference is readable from the venue long before M needs it.
+
+Reading it is a lookup of an official venue value. It is NOT:
+
+  * ARC's own boundary observation. That was measured against the venue's published
+    number and differed by 6E-12 — genuinely, not as a decoding artifact. Close is
+    not official, and substituting it would be the estimation A1 forbids. The
+    boundary path is therefore gone from this module entirely.
+  * arithmetic. Nothing is averaged, interpolated, carried forward from a spot price,
+    or derived. The cached text is the venue's characters, converted once.
+
+When both sources are unavailable the market is marked DEAD, `⛔ PTB Unavailable — no
 trading this market` is logged, and the process keeps running. It keeps collecting
 observations for that market's slug for the record; it never trades it.
 """
@@ -39,6 +53,7 @@ from typing import Final
 from arc.domain.enums import MarketPhase
 from arc.domain.models import MarketInstance
 from arc.domain.money import to_decimal
+from arc.domain.timing import MARKET_DURATION_SECONDS
 from arc.errors import PriceToBeatUnavailableError
 from arc.logging_setup import log_event
 from arc.market.discovery import MarketMetadata
@@ -47,7 +62,8 @@ __all__ = [
     "DEAD_REASON_PTB_UNAVAILABLE",
     "SOURCE_METADATA",
     "SOURCE_PREVIOUS_CLOSE",
-    "BoundaryReference",
+    "PreviousClosePtb",
+    "PreviousClosePtbCache",
     "PtbResolution",
     "freeze_ptb_for",
     "resolve_ptb",
@@ -60,45 +76,102 @@ DEAD_REASON_PTB_UNAVAILABLE: Final[str] = "PTB_UNAVAILABLE"
 
 _ZERO: Final[Decimal] = Decimal(0)
 
-# The boundary reference is only usable if it was observed within this many
-# milliseconds of the boundary instant. A value recorded seconds away from the
-# boundary is a nearby price, not the boundary price, and substituting it would be
-# an estimate.
-_BOUNDARY_TOLERANCE_MS: Final[float] = 1_500.0
-
 
 @dataclass(frozen=True, slots=True)
-class BoundaryReference:
-    """The official price observed AT a market boundary on an unbroken connection.
+class PreviousClosePtb:
+    """A settled market's venue-published final price, and the window it opens.
 
-    `continuous` is set by the feed, not inferred here: only the connection itself
-    knows whether it stayed up across the boundary instant. A reference carrying
-    continuous=False is refused, which is the whole point of recording the flag.
+    `opens_window_ts` is stored rather than recomputed at every read so that the
+    identity being asserted — this value belongs to exactly one window — is fixed at
+    the moment of capture. A cache that recomputed it could be asked about the wrong
+    window and answer.
     """
 
-    boundary_ts: int
+    settled_window_ts: int
+    opens_window_ts: int
     price: Decimal
-    observed_ts: float
-    continuous: bool
+    raw: str
 
     def __post_init__(self) -> None:
-        price = to_decimal(self.price)
-        if price <= _ZERO:
-            raise ValueError(f"boundary reference price must be positive, got {price}")
-        object.__setattr__(self, "price", price)
+        if self.opens_window_ts != self.settled_window_ts + MARKET_DURATION_SECONDS:
+            raise ValueError(
+                f"{self.settled_window_ts} does not close at {self.opens_window_ts}"
+            )
+        if not self.price.is_finite() or self.price <= _ZERO:
+            raise ValueError(f"published final price must be positive, got {self.price}")
 
     def usable_for(self, window_ts: int) -> bool:
-        """Whether this reference is the official opening value for `window_ts`.
+        """Whether this is the official opening reference for `window_ts`.
 
-        Three conditions, all required: it is the right boundary, the connection did
-        not break across it, and it was actually observed at that instant rather
-        than merely near it.
+        One condition only, and it is exact. There is no tolerance to apply: the
+        value was published by the venue for a specific market, not observed near a
+        moment in time.
         """
-        if not self.continuous:
-            return False
-        if self.boundary_ts != window_ts:
-            return False
-        return abs(self.observed_ts - window_ts) * 1000.0 <= _BOUNDARY_TOLERANCE_MS
+        return self.opens_window_ts == window_ts
+
+
+class PreviousClosePtbCache:
+    """Holds the most recent settled market's published final price.
+
+    Only the latest entry is kept. A market's PTB is frozen once, at its own opening,
+    and every earlier entry belongs to a market that has already been frozen or has
+    already died — retaining them would grow without bound across a 24/7 run for
+    values that can never be read again.
+
+    Instance state, not module state (A11): two runs in one process must not share a
+    cached price.
+    """
+
+    __slots__ = ("_latest",)
+
+    def __init__(self) -> None:
+        self._latest: PreviousClosePtb | None = None
+
+    @property
+    def latest(self) -> PreviousClosePtb | None:
+        return self._latest
+
+    def offer(self, metadata: MarketMetadata, *, settled_window_ts: int) -> PreviousClosePtb | None:
+        """Cache a settled market's published final price. Returns the entry, or None.
+
+        None when the venue has not published `finalPrice` yet — which is the case for
+        a market's entire life — or when the text is not a positive price. Returning
+        None rather than raising because a not-yet-published field is the normal
+        state, not an error, and the caller polls.
+
+        An older entry never replaces a newer one, and re-offering the current entry
+        is idempotent. Metadata fetches are not ordered: a slow response for market
+        M-2 can land after M-1's, and letting it win would hand the next market the
+        wrong window's reference.
+        """
+        if metadata.final_price_raw is None:
+            return None
+        try:
+            price = _official_text_to_decimal(metadata.final_price_raw)
+        except PriceToBeatUnavailableError:
+            return None
+
+        held = self._latest
+        if held is not None:
+            if held.settled_window_ts > settled_window_ts:
+                return None
+            if held.settled_window_ts == settled_window_ts:
+                return held
+
+        entry = PreviousClosePtb(
+            settled_window_ts=settled_window_ts,
+            opens_window_ts=settled_window_ts + MARKET_DURATION_SECONDS,
+            price=price,
+            raw=metadata.final_price_raw,
+        )
+        self._latest = entry
+        return entry
+
+    def for_window(self, window_ts: int) -> PreviousClosePtb | None:
+        """The cached entry that opens `window_ts`, or None."""
+        if self._latest is not None and self._latest.usable_for(window_ts):
+            return self._latest
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,7 +209,7 @@ def resolve_ptb(
     metadata: MarketMetadata,
     *,
     window_ts: int,
-    boundary: BoundaryReference | None = None,
+    previous_close: PreviousClosePtb | None = None,
 ) -> PtbResolution:
     """Resolve the official PTB for `window_ts`. Never computes one.
 
@@ -149,9 +222,9 @@ def resolve_ptb(
         try:
             official = _official_text_to_decimal(metadata.ptb_raw)
         except PriceToBeatUnavailableError as exc:
-            # Fall through to L2 rather than dying here: a malformed metadata field
-            # is a venue-side defect, and an observed boundary price is still
-            # official if the connection held.
+            # Fall through to L2 rather than dying here: a malformed metadata field is
+            # a venue-side defect, and the previous market's published final price is
+            # a different, independently published official value.
             metadata_detail = str(exc)
         else:
             return PtbResolution(
@@ -160,21 +233,22 @@ def resolve_ptb(
                 detail=f"metadata {metadata.ptb_raw}",
             )
 
-    if boundary is not None and boundary.usable_for(window_ts):
+    if previous_close is not None and previous_close.usable_for(window_ts):
         return PtbResolution(
-            value=boundary.price,
+            value=previous_close.price,
             source=SOURCE_PREVIOUS_CLOSE,
-            detail=f"boundary {boundary.boundary_ts} observed on an unbroken connection",
+            detail=(
+                f"published finalPrice {previous_close.raw} "
+                f"of market {previous_close.settled_window_ts}"
+            ),
         )
 
-    if boundary is None:
-        gate = "no boundary reference held"
-    elif not boundary.continuous:
-        gate = "feed was not continuous across the market boundary"
-    elif boundary.boundary_ts != window_ts:
-        gate = f"boundary reference is for {boundary.boundary_ts}, not {window_ts}"
+    if previous_close is None:
+        gate = "previous market's finalPrice not published yet"
     else:
-        gate = "boundary reference was not observed at the boundary instant"
+        gate = (
+            f"cached finalPrice opens {previous_close.opens_window_ts}, not {window_ts}"
+        )
 
     return PtbResolution(value=None, source="", detail=f"{metadata_detail}; {gate}")
 

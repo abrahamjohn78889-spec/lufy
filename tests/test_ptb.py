@@ -25,22 +25,43 @@ from arc.market.ptb import (
     DEAD_REASON_PTB_UNAVAILABLE,
     SOURCE_METADATA,
     SOURCE_PREVIOUS_CLOSE,
-    BoundaryReference,
+    PreviousClosePtb,
+    PreviousClosePtbCache,
     freeze_ptb_for,
     resolve_ptb,
 )
 
+# The settled market whose published finalPrice opens WINDOW_TS. Markets are
+# contiguous, so its close IS WINDOW_TS.
+PREVIOUS_WINDOW_TS = WINDOW_TS - 300
 
-def _metadata(ptb_raw: str | None) -> MarketMetadata:
+
+def _metadata(
+    ptb_raw: str | None,
+    *,
+    final_price_raw: str | None = None,
+    window_ts: int = WINDOW_TS,
+) -> MarketMetadata:
     return MarketMetadata(
-        slug=f"btc-updown-5m-{WINDOW_TS}",
+        slug=f"btc-updown-5m-{window_ts}",
         condition_id="0xcondition",
         token_ids=("up", "down"),
         venue_close_ts=CLOSE_TS,
         ptb_raw=ptb_raw,
+        final_price_raw=final_price_raw,
         active=True,
         closed=False,
         raw={},
+    )
+
+
+def _previous_close(price: str, *, settled_window_ts: int = PREVIOUS_WINDOW_TS) -> PreviousClosePtb:
+    """The venue's published finalPrice for a settled market, as the cache holds it."""
+    return PreviousClosePtb(
+        settled_window_ts=settled_window_ts,
+        opens_window_ts=settled_window_ts + 300,
+        price=Decimal(price),
+        raw=price,
     )
 
 
@@ -60,27 +81,24 @@ class TestMetadataSource:
         resolution = resolve_ptb(_metadata("120000.123456789"), window_ts=WINDOW_TS)
         assert resolution.value == Decimal("120000.123456789")
 
-    def test_metadata_wins_over_an_available_boundary_reference(self) -> None:
-        """L1 before L2, always. The metadata value is the official one."""
-        boundary = BoundaryReference(
-            boundary_ts=WINDOW_TS,
-            price=Decimal("999.99"),
-            observed_ts=float(WINDOW_TS),
-            continuous=True,
+    def test_metadata_wins_over_an_available_previous_close(self) -> None:
+        """L1 before L2, always. The market's own metadata field is the official one."""
+        resolution = resolve_ptb(
+            _metadata("120000.50"),
+            window_ts=WINDOW_TS,
+            previous_close=_previous_close("999.99"),
         )
-        resolution = resolve_ptb(_metadata("120000.50"), window_ts=WINDOW_TS, boundary=boundary)
         assert resolution.value == Decimal("120000.50")
         assert resolution.source == SOURCE_METADATA
 
     def test_an_unparseable_official_value_falls_through_to_l2(self) -> None:
-        """A venue-side defect in the field does not invalidate an observed boundary."""
-        boundary = BoundaryReference(
-            boundary_ts=WINDOW_TS,
-            price=Decimal("120000.25"),
-            observed_ts=float(WINDOW_TS),
-            continuous=True,
+        """A venue-side defect in one field does not invalidate a different published
+        official value."""
+        resolution = resolve_ptb(
+            _metadata("not-a-price"),
+            window_ts=WINDOW_TS,
+            previous_close=_previous_close("120000.25"),
         )
-        resolution = resolve_ptb(_metadata("not-a-price"), window_ts=WINDOW_TS, boundary=boundary)
         assert resolution.source == SOURCE_PREVIOUS_CLOSE
         assert resolution.value == Decimal("120000.25")
 
@@ -90,81 +108,253 @@ class TestMetadataSource:
         assert "not a positive price" in resolution.detail
 
 
-class TestBoundarySource:
-    def test_the_boundary_reference_is_official_when_the_connection_held(self) -> None:
-        """Markets are contiguous, so N's close instant IS N+1's opening reference."""
-        boundary = BoundaryReference(
-            boundary_ts=WINDOW_TS,
-            price=Decimal("120000.25"),
-            observed_ts=float(WINDOW_TS),
-            continuous=True,
+class TestPreviousClosePtb:
+    """The L2 source: the venue's PUBLISHED finalPrice for the previous market.
+
+    Established live on 2026-08-05 across six consecutive settled markets with zero
+    mismatches: priceToBeat(M) == finalPrice(M-1), exactly. This is a lookup of an
+    official venue value, not an observation of a price and not arithmetic.
+
+    ARC's own boundary observation is deliberately NOT a source. Measured against the
+    venue's published number it differed by 6E-12 — genuinely, not as a decoding
+    artifact — and close is not official.
+    """
+
+    def test_the_published_previous_close_is_the_official_opening_reference(self) -> None:
+        resolution = resolve_ptb(
+            _metadata(None),
+            window_ts=WINDOW_TS,
+            previous_close=_previous_close("120000.25"),
         )
-        resolution = resolve_ptb(_metadata(None), window_ts=WINDOW_TS, boundary=boundary)
         assert resolution.source == SOURCE_PREVIOUS_CLOSE
         assert resolution.value == Decimal("120000.25")
 
-    def test_a_discontinuous_boundary_is_refused(self) -> None:
-        """Across a reconnect the process did not observe the boundary — using what it
-        holds would be exactly the estimation A1 forbids."""
-        boundary = BoundaryReference(
-            boundary_ts=WINDOW_TS,
-            price=Decimal("120000.25"),
-            observed_ts=float(WINDOW_TS),
-            continuous=False,
+    def test_the_detail_names_the_settled_market_the_value_came_from(self) -> None:
+        """An operator reconciling a trade has to be able to find the source market."""
+        resolution = resolve_ptb(
+            _metadata(None),
+            window_ts=WINDOW_TS,
+            previous_close=_previous_close("120000.25"),
         )
-        resolution = resolve_ptb(_metadata(None), window_ts=WINDOW_TS, boundary=boundary)
+        assert "120000.25" in resolution.detail
+        assert str(PREVIOUS_WINDOW_TS) in resolution.detail
+
+    def test_a_value_for_a_different_window_is_refused(self) -> None:
+        """The cached price belongs to exactly one window. Reusing it for a later
+        market would carry a two-market-old reference forward, which is the estimation
+        A1 forbids."""
+        stale = _previous_close("120000.25", settled_window_ts=PREVIOUS_WINDOW_TS - 300)
+        resolution = resolve_ptb(_metadata(None), window_ts=WINDOW_TS, previous_close=stale)
         assert resolution.available is False
-        assert "not continuous" in resolution.detail
+        assert str(WINDOW_TS) in resolution.detail
 
-    def test_a_reference_for_a_different_boundary_is_refused(self) -> None:
-        boundary = BoundaryReference(
-            boundary_ts=WINDOW_TS - 300,
-            price=Decimal("120000.25"),
-            observed_ts=float(WINDOW_TS - 300),
-            continuous=True,
-        )
-        resolution = resolve_ptb(_metadata(None), window_ts=WINDOW_TS, boundary=boundary)
-        assert resolution.available is False
-        assert f"not {WINDOW_TS}" in resolution.detail
+    def test_usable_for_is_exact_with_no_tolerance(self) -> None:
+        """No tolerance to apply: the venue published this for a specific market."""
+        entry = _previous_close("120000.25")
+        assert entry.usable_for(WINDOW_TS) is True
+        assert entry.usable_for(WINDOW_TS + 1) is False
+        assert entry.usable_for(WINDOW_TS - 1) is False
 
-    def test_a_reference_observed_near_but_not_at_the_boundary_is_refused(self) -> None:
-        """A nearby price is not the boundary price; substituting it is an estimate."""
-        boundary = BoundaryReference(
-            boundary_ts=WINDOW_TS,
-            price=Decimal("120000.25"),
-            observed_ts=float(WINDOW_TS) + 4.0,
-            continuous=True,
-        )
-        assert boundary.usable_for(WINDOW_TS) is False
-        resolution = resolve_ptb(_metadata(None), window_ts=WINDOW_TS, boundary=boundary)
-        assert resolution.available is False
-        assert "not observed at the boundary instant" in resolution.detail
+    def test_a_non_contiguous_pairing_is_refused_at_construction(self) -> None:
+        """Markets are contiguous (A5). A settled market whose close is not the stated
+        opening window means the pairing was computed wrongly, and a wrong pairing
+        assigns one market's close price to a different market's opening."""
+        with pytest.raises(ValueError, match="does not close at"):
+            PreviousClosePtb(
+                settled_window_ts=PREVIOUS_WINDOW_TS,
+                opens_window_ts=WINDOW_TS + 300,
+                price=Decimal("120000.25"),
+                raw="120000.25",
+            )
 
-    def test_a_reference_inside_the_tolerance_is_accepted(self) -> None:
-        boundary = BoundaryReference(
-            boundary_ts=WINDOW_TS,
-            price=Decimal("120000.25"),
-            observed_ts=float(WINDOW_TS) + 1.0,
-            continuous=True,
-        )
-        assert boundary.usable_for(WINDOW_TS) is True
-
-    def test_a_non_positive_boundary_price_is_refused_at_construction(self) -> None:
+    def test_a_non_positive_published_price_is_refused_at_construction(self) -> None:
         with pytest.raises(ValueError, match="must be positive"):
-            BoundaryReference(
-                boundary_ts=WINDOW_TS,
+            PreviousClosePtb(
+                settled_window_ts=PREVIOUS_WINDOW_TS,
+                opens_window_ts=WINDOW_TS,
                 price=Decimal("0"),
-                observed_ts=float(WINDOW_TS),
-                continuous=True,
+                raw="0",
             )
 
 
+class TestPreviousClosePtbCache:
+    """The cache across consecutive markets — the property the whole design rests on."""
+
+    def test_an_unpublished_final_price_caches_nothing(self) -> None:
+        """finalPrice is null for a market's ENTIRE life. That is the normal state, so
+        it must not raise and must not populate the cache with anything."""
+        cache = PreviousClosePtbCache()
+        assert cache.offer(_metadata(None), settled_window_ts=PREVIOUS_WINDOW_TS) is None
+        assert cache.latest is None
+        assert cache.for_window(WINDOW_TS) is None
+
+    def test_a_published_final_price_is_cached_for_the_next_window(self) -> None:
+        cache = PreviousClosePtbCache()
+        entry = cache.offer(
+            _metadata(None, final_price_raw="64063.6718254685"),
+            settled_window_ts=PREVIOUS_WINDOW_TS,
+        )
+        assert entry is not None
+        assert entry.opens_window_ts == WINDOW_TS
+        held = cache.for_window(WINDOW_TS)
+        assert held is not None
+        assert held.price == Decimal("64063.6718254685")
+
+    def test_the_cached_value_resolves_the_next_market_ptb(self) -> None:
+        """End to end: cache M-1's published close, then resolve M's PTB from it with
+        no PTB field of M's own."""
+        cache = PreviousClosePtbCache()
+        cache.offer(
+            _metadata(None, final_price_raw="64063.6718254685"),
+            settled_window_ts=PREVIOUS_WINDOW_TS,
+        )
+        resolution = resolve_ptb(
+            _metadata(None),
+            window_ts=WINDOW_TS,
+            previous_close=cache.for_window(WINDOW_TS),
+        )
+        assert resolution.source == SOURCE_PREVIOUS_CLOSE
+        assert resolution.value == Decimal("64063.6718254685")
+
+    def test_the_cache_advances_across_consecutive_markets(self) -> None:
+        """Six consecutive markets, each resolving from the previous one's published
+        close. These are the exact values measured live on 2026-08-05, replayed."""
+        observed = [
+            (1785914100, "64063.6718254685"),
+            (1785914400, "64000.675713625"),
+            (1785914700, "64017.96609754"),
+            (1785915000, "64014.4764719921"),
+            (1785915300, "63992.604802785"),
+            (1785915600, "63945.155662425"),
+        ]
+        cache = PreviousClosePtbCache()
+        resolved: list[tuple[int, Decimal]] = []
+        for settled_ts, final_price in observed:
+            cache.offer(
+                _metadata(None, final_price_raw=final_price, window_ts=settled_ts),
+                settled_window_ts=settled_ts,
+            )
+            opens = settled_ts + 300
+            resolution = resolve_ptb(
+                _metadata(None, window_ts=opens),
+                window_ts=opens,
+                previous_close=cache.for_window(opens),
+            )
+            assert resolution.source == SOURCE_PREVIOUS_CLOSE, opens
+            assert resolution.value is not None
+            resolved.append((opens, resolution.value))
+
+        assert [ts for ts, _ in resolved] == [ts + 300 for ts, _ in observed]
+        assert [str(v) for _, v in resolved] == [price for _, price in observed]
+
+    def test_a_stale_cache_leaves_the_next_market_unresolved(self) -> None:
+        """The cache does not carry a value forward. If M-1 never published, M's PTB is
+        unavailable and M is not traded — it is not given M-2's close price."""
+        cache = PreviousClosePtbCache()
+        cache.offer(
+            _metadata(None, final_price_raw="2.0"),
+            settled_window_ts=PREVIOUS_WINDOW_TS - 300,
+        )
+        assert cache.for_window(WINDOW_TS) is None
+        resolution = resolve_ptb(
+            _metadata(None), window_ts=WINDOW_TS, previous_close=cache.for_window(WINDOW_TS)
+        )
+        assert resolution.available is False
+
+    def test_a_newer_entry_replaces_an_older_one(self) -> None:
+        cache = PreviousClosePtbCache()
+        cache.offer(
+            _metadata(None, final_price_raw="1.0"),
+            settled_window_ts=PREVIOUS_WINDOW_TS - 300,
+        )
+        cache.offer(_metadata(None, final_price_raw="2.0"), settled_window_ts=PREVIOUS_WINDOW_TS)
+        latest = cache.latest
+        assert latest is not None
+        assert latest.settled_window_ts == PREVIOUS_WINDOW_TS
+        assert latest.price == Decimal("2.0")
+
+    def test_a_late_arriving_older_entry_never_replaces_a_newer_one(self) -> None:
+        """Metadata fetches are not ordered. A slow response for M-2 landing after
+        M-1's would otherwise hand the next market a two-market-old reference."""
+        cache = PreviousClosePtbCache()
+        cache.offer(_metadata(None, final_price_raw="2.0"), settled_window_ts=PREVIOUS_WINDOW_TS)
+        assert (
+            cache.offer(
+                _metadata(None, final_price_raw="1.0"),
+                settled_window_ts=PREVIOUS_WINDOW_TS - 300,
+            )
+            is None
+        )
+        latest = cache.latest
+        assert latest is not None
+        assert latest.price == Decimal("2.0")
+
+    def test_re_offering_the_same_market_is_idempotent(self) -> None:
+        """The runtime polls until the value appears, so the same market is offered
+        repeatedly once it has settled."""
+        cache = PreviousClosePtbCache()
+        metadata = _metadata(None, final_price_raw="2.0")
+        first = cache.offer(metadata, settled_window_ts=PREVIOUS_WINDOW_TS)
+        second = cache.offer(metadata, settled_window_ts=PREVIOUS_WINDOW_TS)
+        assert first == second
+        assert cache.latest == first
+
+    def test_only_the_latest_entry_is_retained(self) -> None:
+        """Unbounded retention across a 24/7 run would hold values that can never be
+        read again: each superseded entry belongs to a market already frozen or dead."""
+        cache = PreviousClosePtbCache()
+        for k in range(20):
+            cache.offer(
+                _metadata(None, final_price_raw=f"{60000 + k}.5"),
+                settled_window_ts=PREVIOUS_WINDOW_TS + 300 * k,
+            )
+        latest = cache.latest
+        assert latest is not None
+        assert latest.settled_window_ts == PREVIOUS_WINDOW_TS + 300 * 19
+        assert PreviousClosePtbCache.__slots__ == ("_latest",)
+
+    def test_a_malformed_published_price_caches_nothing(self) -> None:
+        cache = PreviousClosePtbCache()
+        assert (
+            cache.offer(
+                _metadata(None, final_price_raw="n/a"), settled_window_ts=PREVIOUS_WINDOW_TS
+            )
+            is None
+        )
+        assert (
+            cache.offer(
+                _metadata(None, final_price_raw="0"), settled_window_ts=PREVIOUS_WINDOW_TS
+            )
+            is None
+        )
+        assert cache.latest is None
+
+    def test_the_exact_published_digits_survive(self) -> None:
+        """The venue sends 13 significant decimals. A float would round them, and the
+        rounded value would compare unequal to the venue's own settlement number."""
+        cache = PreviousClosePtbCache()
+        entry = cache.offer(
+            _metadata(None, final_price_raw="64104.560649297964"),
+            settled_window_ts=PREVIOUS_WINDOW_TS,
+        )
+        assert entry is not None
+        assert entry.price == Decimal("64104.560649297964")
+        assert str(entry.price) == "64104.560649297964"
+
+    def test_two_caches_share_no_state(self) -> None:
+        """Instance state, never module state (A11)."""
+        first = PreviousClosePtbCache()
+        second = PreviousClosePtbCache()
+        first.offer(_metadata(None, final_price_raw="2.0"), settled_window_ts=PREVIOUS_WINDOW_TS)
+        assert second.latest is None
+
+
 class TestUnavailable:
-    def test_no_metadata_and_no_boundary_yields_no_value(self) -> None:
+    def test_no_metadata_and_no_cached_close_yields_no_value(self) -> None:
         resolution = resolve_ptb(_metadata(None), window_ts=WINDOW_TS)
         assert resolution.value is None
         assert resolution.available is False
-        assert "no boundary reference held" in resolution.detail
+        assert "finalPrice not published yet" in resolution.detail
 
     def test_the_detail_names_which_condition_failed(self) -> None:
         """The operator has to be able to tell a missing field from a broken feed."""

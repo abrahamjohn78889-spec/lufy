@@ -31,12 +31,19 @@ from typing import Any, Final, TextIO
 from arc.clock import Clock
 from arc.config import Settings
 from arc.domain.enums import MarketPhase
-from arc.domain.models import Observation
+from arc.domain.models import MarketInstance
+from arc.domain.timing import MARKET_DURATION_SECONDS, slug_for
 from arc.errors import FeedError, ObservationRejectedError
 from arc.logging_setup import log_event
 from arc.market.discovery import MarketDiscovery, open_discovery
 from arc.market.feed import RtdsFeed
-from arc.market.ptb import BoundaryReference, freeze_ptb_for, resolve_ptb
+from arc.market.ptb import (
+    DEAD_REASON_PTB_UNAVAILABLE,
+    PreviousClosePtbCache,
+    PtbResolution,
+    freeze_ptb_for,
+    resolve_ptb,
+)
 from arc.market.rotation import MarketRotator
 from arc.market.settlement_feed import SettlementTwapCollector
 from arc.market.spec_check import SpecChecker
@@ -54,6 +61,14 @@ EXPECTED_SYMBOL: Final[str] = "BTC/USD"
 # noticed within a fraction of a second, coarse enough to cost nothing. Not a
 # schedule: the check compares the clock against the boundary every time (A12).
 _TICK_SECONDS: Final[float] = 0.2
+
+# How often an unresolved PTB is retried. The venue publishes a market's
+# `eventMetadata` roughly 25 seconds after it closes — which is roughly 25 seconds
+# into the NEXT market's life — so a market that opens without a PTB is not yet a
+# dead market, it is a market whose official opening reference has not been written
+# yet. Polling every 5 seconds finds it within one interval of publication and costs
+# a handful of requests per market.
+_PTB_RETRY_SECONDS: Final[float] = 5.0
 
 
 @dataclass(slots=True)
@@ -91,12 +106,13 @@ class ObservationRun:
     """
 
     __slots__ = (
-        "_boundary",
         "_clock",
         "_discovery",
         "_feed",
         "_logger",
+        "_next_ptb_attempt",
         "_out",
+        "_previous_close",
         "_runtime",
         "_settings",
         "_settlement",
@@ -137,9 +153,11 @@ class ObservationRun:
         )
         self._spec = SpecChecker(logger=logger)
         self._settlement: dict[str, SettlementTwapCollector] = {}
-        # The boundary reference gates the L2 PTB source. None until a boundary has
-        # been observed on an unbroken connection (see ptb.py).
-        self._boundary: BoundaryReference | None = None
+        # The L2 PTB source: the venue's published finalPrice for the previous market,
+        # cached the moment it appears (see ptb.py). Instance state, never module
+        # state — two runs in one process must not share a cached price (A11).
+        self._previous_close = PreviousClosePtbCache()
+        self._next_ptb_attempt: float = 0.0
         self.rotator = MarketRotator(
             store,
             clock,
@@ -150,42 +168,110 @@ class ObservationRun:
 
     # ── PTB ──────────────────────────────────────────────────────────────────
 
-    async def _freeze_ptb(self, slug: str) -> None:
-        """Resolve and freeze the official PTB for the market that just opened.
+    async def _attempt_ptb(self, now: float) -> None:
+        """Try to obtain the official PTB for the live market. Retries until too late.
 
-        A metadata failure is not fatal to the run: the market is marked DEAD, the
-        line is logged, and the process continues with the next market (A1 Rule 1).
+        A market that opens without a PTB is NOT yet a dead market. The venue writes a
+        market's `eventMetadata` roughly 25 seconds after it closes, so the live
+        market's official opening reference — which is the previous market's published
+        `finalPrice` — does not exist at the instant the market opens and appears a few
+        seconds later. Marking the market DEAD on the first miss would kill every
+        single market for a value that was about to be published.
+
+        The retry is bounded by the market's own earliest execution window. Past that
+        instant a PTB would arrive too late to be of any use, so the market is marked
+        DEAD and the reason recorded, exactly as A1 Rule 1 requires. Nothing is
+        estimated at any point; the market simply is not traded.
         """
         market = self.rotator.current
-        if market is None or market.slug != slug or market.ptb is not None:
+        if market is None or market.ptb is not None or market.phase is MarketPhase.DEAD:
             return
+        if now < self._next_ptb_attempt:
+            return
+        self._next_ptb_attempt = now + _PTB_RETRY_SECONDS
+
+        # L2 first, and unconditionally: the previous market's finalPrice is fetched
+        # even when L1 is about to succeed, because caching it is how the NEXT market
+        # gets its reference. Doing it only on an L1 miss would leave the cache empty
+        # in exactly the runs where it is needed.
+        await self._cache_previous_close(market.window_ts)
+
         try:
-            discovered = await self._discovery.fetch_metadata(slug)
+            metadata = await self._discovery.fetch_metadata(market.slug)
         except FeedError as exc:
-            market.phase = MarketPhase.DEAD
-            market.dead_reason = "PTB_UNAVAILABLE"
-            self._store.save_phase(slug, MarketPhase.DEAD, self._clock.now(), "PTB_UNAVAILABLE")
-            log_event(
-                logging.ERROR,
-                "PTB Unavailable",
-                f"{slug} — no trading this market ({exc})",
-                logger=self._logger,
-            )
-            self.stats.ptb_unavailable += 1
+            self._maybe_dead(market, now, f"metadata request failed: {exc}")
             return
 
         resolution = resolve_ptb(
-            discovered, window_ts=market.window_ts, boundary=self._boundary
+            metadata,
+            window_ts=market.window_ts,
+            previous_close=self._previous_close.for_window(market.window_ts),
         )
+        if not resolution.available:
+            self._maybe_dead(market, now, resolution.detail)
+            return
+
         if freeze_ptb_for(market, resolution, logger=self._logger):
             assert resolution.value is not None
-            self._store.save_ptb(slug, resolution.value, self._clock.now())
+            self._store.save_ptb(market.slug, resolution.value, now)
             self.stats.ptb_frozen += 1
-        else:
-            self._store.save_phase(
-                slug, MarketPhase.DEAD, self._clock.now(), market.dead_reason
+            self._print_ptb_line(market.slug, resolution)
+
+    async def _cache_previous_close(self, window_ts: int) -> None:
+        """Fetch the market that closed at `window_ts` and cache its final price.
+
+        Silent on failure. The field is null for a market's entire life, so a fetch
+        that finds nothing is the ordinary case and not worth a log line; the caller
+        discovers the absence by the PTB staying unresolved.
+        """
+        settled_window_ts = window_ts - MARKET_DURATION_SECONDS
+        if self._previous_close.for_window(window_ts) is not None:
+            return
+        try:
+            metadata = await self._discovery.fetch_metadata(slug_for(settled_window_ts))
+        except FeedError:
+            return
+        entry = self._previous_close.offer(metadata, settled_window_ts=settled_window_ts)
+        if entry is not None:
+            log_event(
+                logging.INFO,
+                "PTB Cached",
+                f"{entry.raw}  from settled market {entry.settled_window_ts}  "
+                f"opens {entry.opens_window_ts}",
+                logger=self._logger,
             )
-            self.stats.ptb_unavailable += 1
+
+    def _maybe_dead(self, market: MarketInstance, now: float, detail: str) -> None:
+        """Mark the market DEAD only once its earliest execution window has passed.
+
+        Before that instant an unresolved PTB is a value that has not been published
+        yet, and the correct response is to try again. After it, no PTB can arrive in
+        time to be used, and leaving the market PENDING forever would hide a
+        permanently unusable market behind a hopeful state.
+        """
+        if now < self._ptb_deadline(market):
+            return
+        market.phase = MarketPhase.DEAD
+        market.dead_reason = DEAD_REASON_PTB_UNAVAILABLE
+        self._store.save_phase(
+            market.slug, MarketPhase.DEAD, now, DEAD_REASON_PTB_UNAVAILABLE
+        )
+        log_event(
+            logging.ERROR,
+            "PTB Unavailable",
+            f"{market.slug} — no trading this market ({detail})",
+            logger=self._logger,
+        )
+        self.stats.ptb_unavailable += 1
+
+    def _ptb_deadline(self, market: MarketInstance) -> float:
+        """The last instant a PTB could still be used: the first window's activation.
+
+        Derived from the configured offsets rather than a constant, so a change to the
+        window set moves the deadline with it instead of silently disagreeing.
+        """
+        offsets = self._settings.trading.windows_by_priority
+        return float(market.close_ts - max(offsets)) if offsets else float(market.close_ts)
 
     # ── observations ─────────────────────────────────────────────────────────
 
@@ -213,7 +299,6 @@ class ObservationRun:
 
         self.stats.observations_accepted += 1
         self._watchdog.tick()
-        self._record_boundary(observation)
 
         for market in self.rotator.route(observation):
             self._store.save_observation(market.slug, observation, received_at)
@@ -224,25 +309,6 @@ class ObservationRun:
             if collector is not None and collector.offer(observation):
                 self.stats.settlement_samples += 1
                 self.stats.settlement_stream_found = True
-
-    def _record_boundary(self, observation: Observation) -> None:
-        """Keep the observation that lands on a 300s boundary, with its continuity.
-
-        The continuity flag comes from the feed's own BoundaryTracker, not from
-        anything inferred here: only the connection knows whether it stayed up across
-        the boundary, and that is what makes the recorded price official rather than
-        an estimate (ptb.py L2).
-        """
-        boundary_ts = int(observation.ts) - int(observation.ts) % 300
-        if abs(observation.ts - boundary_ts) > 1.0:
-            return
-        continuous = self._feed.boundary.observe_boundary()
-        self._boundary = BoundaryReference(
-            boundary_ts=boundary_ts,
-            price=observation.price,
-            observed_ts=observation.ts,
-            continuous=continuous,
-        )
 
     # ── loops ────────────────────────────────────────────────────────────────
 
@@ -258,8 +324,11 @@ class ObservationRun:
                     self._settlement[market.slug] = SettlementTwapCollector(
                         market_slug=market.slug, close_ts=market.close_ts
                     )
-                await self._freeze_ptb(event.opened)
+                # Retry immediately on the new market rather than waiting out the
+                # interval left over from the previous one.
+                self._next_ptb_attempt = 0.0
                 self._print_market_line(event.opened, event.closed)
+            await self._attempt_ptb(now)
             self._watchdog.evaluate()
             self._gate_on_health()
             await asyncio.sleep(_TICK_SECONDS)
@@ -317,13 +386,20 @@ class ObservationRun:
         )
 
     def _print_market_line(self, opened: str, closed: str) -> None:
-        market = self.rotator.current
-        ptb = market.ptb if market is not None else None
+        """Report the rotation. The PTB is deliberately NOT printed here.
+
+        At the instant a market opens its official opening reference has not been
+        published yet — the venue writes it a few seconds later — so printing it here
+        would print UNAVAILABLE on every healthy market. The PTB gets its own line
+        when it actually arrives.
+        """
         ticks = self.stats.per_market_ticks.get(closed, 0) if closed else 0
-        detail = f"  ptb {ptb}" if ptb is not None else "  ptb UNAVAILABLE — market DEAD"
         if closed:
             self._out.write(f"  rotated  {closed} closed after {ticks} ticks\n")
-        self._out.write(f"  opened   {opened}{detail}\n")
+        self._out.write(f"  opened   {opened}\n")
+
+    def _print_ptb_line(self, slug: str, resolution: PtbResolution) -> None:
+        self._out.write(f"  ptb      {resolution.value}  {slug}  via {resolution.source}\n")
 
     def _print_summary(self, elapsed: float) -> None:
         stats = self.stats

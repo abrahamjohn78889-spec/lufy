@@ -62,6 +62,7 @@ _CLOSE_TS_KEYS: Final[tuple[str, ...]] = ("closeTime", "close_ts", "endDateTs", 
 _CONDITION_KEYS: Final[tuple[str, ...]] = ("conditionId", "condition_id")
 _TOKEN_KEYS: Final[tuple[str, ...]] = ("clobTokenIds", "clob_token_ids", "tokens")
 _PTB_KEYS: Final[tuple[str, ...]] = ("priceToBeat", "price_to_beat", "strikePrice", "openingPrice")
+_FINAL_PRICE_KEYS: Final[tuple[str, ...]] = ("finalPrice", "final_price")
 _ACTIVE_KEYS: Final[tuple[str, ...]] = ("active",)
 _CLOSED_KEYS: Final[tuple[str, ...]] = ("closed",)
 
@@ -128,7 +129,19 @@ class MarketMetadata:
 
     `ptb_raw` is TEXT. The metadata value is carried as the exact characters the
     venue sent, so that converting it to Decimal happens once, at the point of use,
-    with no float in between.
+    with no float in between. `final_price_raw` is carried the same way.
+
+    `final_price_raw` is this market's published settlement price. It is null for the
+    market's entire life and appears roughly 25 seconds after its close, alongside
+    `priceToBeat` — both are written when the market settles. It is carried because
+    live observation established that
+
+        priceToBeat(M) == finalPrice(M-1)
+
+    exactly, on every market observed. Since M-1's close IS M's window_ts, the
+    settled market's published final price is the official opening reference of the
+    market that follows it, and reading it is a lookup of a venue value rather than
+    an estimate of one.
     """
 
     slug: str
@@ -136,6 +149,7 @@ class MarketMetadata:
     token_ids: tuple[str, ...]
     venue_close_ts: int | None
     ptb_raw: str | None
+    final_price_raw: str | None
     active: bool
     closed: bool
     raw: dict[str, Any]
@@ -276,6 +290,19 @@ def _official_ptb(payload: dict[str, Any]) -> str | None:
     return _as_ptb_text(_first_key(_event_metadata(payload), _PTB_KEYS))
 
 
+def _official_final_price(payload: dict[str, Any]) -> str | None:
+    """The market's published settlement price as exact text, or None.
+
+    Same two-level lookup and the same refuse-a-float discipline as the PTB. Null for
+    the whole of a market's life; written when it settles, roughly 25 seconds after
+    its close.
+    """
+    direct = _as_ptb_text(_first_key(payload, _FINAL_PRICE_KEYS))
+    if direct is not None:
+        return direct
+    return _as_ptb_text(_first_key(_event_metadata(payload), _FINAL_PRICE_KEYS))
+
+
 def parse_market_metadata(payload: object, *, slug: str) -> MarketMetadata:
     """Turn one Gamma market object into MarketMetadata. Raises FeedError if unusable.
 
@@ -295,6 +322,7 @@ def parse_market_metadata(payload: object, *, slug: str) -> MarketMetadata:
         token_ids=_as_token_ids(_first_key(payload, _TOKEN_KEYS)),
         venue_close_ts=_as_epoch_seconds(_first_key(payload, _CLOSE_TS_KEYS)),
         ptb_raw=_official_ptb(payload),
+        final_price_raw=_official_final_price(payload),
         active=_as_bool(_first_key(payload, _ACTIVE_KEYS), default=True),
         closed=_as_bool(_first_key(payload, _CLOSED_KEYS), default=False),
         raw=payload,
