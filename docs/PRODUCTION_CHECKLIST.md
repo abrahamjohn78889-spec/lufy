@@ -42,7 +42,36 @@ for the operator watching the first live window.
 - [ ] Stop V1. Confirm status returns to STOPPED and no orphan tasks or sockets
       remain (the Provider and WebSocket rows go to Waiting).
 
-## 4. First live start
+## 4. The V1 validation run
+
+V1 is the production validation environment: the same live feed, the same
+official CLOB book, the same PTB and TWAPs as V2, with only the execution adapter
+simulated. A long V1 run is therefore evidence about the production runtime.
+
+- [ ] Run V1 continuously for **at least 100 consecutive markets** (~8.5 hours).
+      Restarting mid-run is fine and is itself worth testing; a market the
+      runtime never saw is not, and shows as a market gap.
+- [ ] Read the report:
+
+      curl -s 'localhost:8080/history?format=report&markets=200'
+
+- [ ] **Recorder: complete, zero market gaps.** An incomplete market names the
+      field it is missing. Nothing is reconstructed — a missing PTB is a fault to
+      investigate, not a value to fill in.
+- [ ] **Fill statistics** are present for every configured window, and the late
+      windows are not silently empty.
+- [ ] **No FAILED criteria.** A FAIL is a real defect found in the stored rows:
+      duplicate intents, two live orders on one window, duplicate fill ids, an
+      order with no intent, an unresolved order left behind.
+- [ ] The UNVERIFIED list is the operator's work, not the suite's. Each entry
+      prints a `how:` line saying what would demonstrate it. Work through them
+      against the running deck before treating the run as validated.
+- [ ] Host metrics are **not** in the report by design. Read them yourself on the
+      VPS: `top`, `free -m`, `df -h`, `ss -s`.
+- [ ] The verdict reads READY FOR LIVE (V2) only when nothing is failed and
+      nothing is unverified. Anything else is NOT READY, and that is the answer.
+
+## 5. First live start
 
 - [ ] Wallet funded, and the balance shown on the deck matches the wallet.
 - [ ] Select V2. Press START V2 RUNTIME. Preflight must pass; a FAIL refuses the
@@ -52,7 +81,7 @@ for the operator watching the first live window.
 - [ ] Press START TRADING only when the deck agrees with reality.
 - [ ] Watch the first submitted order all the way to settlement in the Ledger.
 
-## 5. Operating
+## 6. Operating
 
 - [ ] PAUSE, not STOP RUNTIME, to hold new orders. STOP RUNTIME tears down the
       feeds; PAUSE keeps managing resting orders.
@@ -61,7 +90,7 @@ for the operator watching the first live window.
 - [ ] Back up `data/arc.db` on a schedule. It is the only state that survives a
       restart, and it is the record of every order.
 
-## 6. Known limits
+## 7. Known limits
 
 - Chainlink Data Streams is configuration-complete but has not been validated
   against live Chainlink credentials. Treat the first Chainlink run as

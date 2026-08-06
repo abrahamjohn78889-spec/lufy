@@ -86,8 +86,19 @@ class PaperExecutor:
     # ── simulation controls ──────────────────────────────────────────────────
 
     def quote(self, market_slug: str, direction: Direction, price: Decimal) -> None:
-        """Set the best resting price on one side of the book."""
+        """Set the best resting price on one side of the book.
+
+        Written by the runtime from the official CLOB book, once per pass, for
+        both adapters. Not fetched here: a paper adapter that opened its own venue
+        connection would be a second market-data pipeline, and V1 would be sizing
+        against a book V2 never saw.
+        """
         self._books[(market_slug, direction)] = price
+
+    def forget(self, market_slug: str) -> None:
+        """Drop a settled market's book. Called when the runtime archives it."""
+        for direction in Direction:
+            self._books.pop((market_slug, direction), None)
 
     def trade(self, market_slug: str, price: Decimal, size: Decimal) -> tuple[Fill, ...]:
         """A counterparty trades `size` at `price`. Fills whoever it crosses.

@@ -9,8 +9,9 @@ There is no /health: PM2 restarts the process and nothing external polls it, so 
 health route would be an endpoint whose only reader is a scanner. There are no
 debug, admin, backup, export or diagnostics routes either — everything an operator
 needs is a query parameter on one of these twelve, which is why `/history` takes
-`?q=` and `?format=csv` and `/settings` takes `?snapshot=`. A route that exists but
-is not in this list is a route no test guards.
+`?q=`, `?format=csv`, `?format=report` and `?validate=1`, and `/settings` takes
+`?snapshot=`. A route that exists but is not in this list is a route no test
+guards.
 
 Two paths accept a write as well as a read. That is one path, one resource, two
 verbs — not a thirteenth route.
@@ -43,6 +44,8 @@ from arc.domain.timing import MARKET_DURATION_SECONDS, window_ts_for
 from arc.errors import ArcError, ArcFatalError
 from arc.notify.telegram import CATEGORIES, notification_values
 from arc.runtime.ledger import ledger_records, search_records
+from arc.runtime.report import render_report
+from arc.runtime.validation import validate_run
 from arc.strategy.registry import default_registry
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
@@ -314,13 +317,17 @@ async def history(
     since: float | None = Query(None),
     until: float | None = Query(None),
     markets: int = Query(50, ge=1, le=1000),
-    fmt: str = Query("json", alias="format", description="json | csv"),
+    fmt: str = Query("json", alias="format", description="json | csv | report"),
+    validate: bool = Query(False, description="attach the production validation summary"),
 ) -> Response | dict[str, Any]:
     """The Unified Ledger. The only history there is.
 
-    There is no Orders page and no Trade History page, so every filter and the CSV
-    export are parameters here. A second history endpoint would be a second answer
-    to "did that order fill".
+    There is no Orders page and no Trade History page, so every filter, the CSV
+    export and the production validation summary are parameters here. A second
+    history endpoint would be a second answer to "did that order fill", and a
+    thirteenth route for validation would be exactly the diagnostics endpoint the
+    contract forbids — the validation report reads the same rows this route
+    already serves.
     """
     run = _runtime(request)
     records = search_records(
@@ -335,6 +342,26 @@ async def history(
     rows = [r.as_json() for r in records]
     if fmt == "csv":
         return _csv(rows)
+    if fmt == "report" or validate:
+        report = validate_run(
+            run.store,
+            offsets=tuple(run.settings.trading.windows_by_priority),
+            cadence_seconds=MARKET_DURATION_SECONDS,
+            market_limit=markets,
+        )
+        if fmt == "report":
+            return Response(
+                render_report(
+                    report,
+                    mode=run.mode.value,
+                    provider=run.settings.env.twap_provider,
+                ),
+                media_type="text/plain; charset=utf-8",
+            )
+        payload = ledger_payload(run, market_limit=markets)
+        payload["records"] = rows
+        payload["validation"] = report.as_json()
+        return payload
     payload = ledger_payload(run, market_limit=markets)
     payload["records"] = rows
     return payload

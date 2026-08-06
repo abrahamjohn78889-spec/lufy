@@ -55,6 +55,7 @@ from arc.runtime.engine import (
     ArcRuntime,
     RuntimeStatus,
     TokenCache,
+    build_book_client,
     build_executor,
 )
 from arc.runtime.state import RuntimeState
@@ -79,6 +80,7 @@ class RuntimeSupervisor:
     """
 
     __slots__ = (
+        "_book_client",
         "_client",
         "_clock",
         "_discovery",
@@ -109,6 +111,9 @@ class RuntimeSupervisor:
         self._task: asyncio.Task[Any] | None = None
         self._discovery: MarketDiscovery | None = None
         self._client: polymarket.AsyncSecureClient | None = None
+        # Public market data, shared by both modes. Tracked like the secure client
+        # so teardown closes it; an untracked one leaks a connection pool per stop.
+        self._book_client: polymarket.AsyncPublicClient | None = None
         # Serialises start/stop/switch. Two operators on two browser tabs pressing
         # START and STOP within the same tick would otherwise interleave a teardown
         # with a construction and leave a half-built runtime attached.
@@ -266,6 +271,10 @@ class RuntimeSupervisor:
             settings, self._store, tokens, logger=self._logger
         )
         self._client = client
+        # One book client per run, both modes. V1 must size against the same
+        # official CLOB book V2 does, or the paper run is not evidence about the
+        # live one; only the execution adapter differs.
+        self._book_client = build_book_client(settings)
         run = ArcRuntime(
             settings=settings,
             store=self._store,
@@ -276,6 +285,7 @@ class RuntimeSupervisor:
             executor=executor,
             out=self._out,
             venue_client=client,
+            book_client=self._book_client,
             logger=self._logger,
         )
         # The runtime's own cache, so the resolver the executor holds is the one the
@@ -338,10 +348,12 @@ class RuntimeSupervisor:
     async def _teardown_resources(self) -> None:
         """Close the venue client and the discovery's HTTP client. Idempotent."""
         client, self._client = self._client, None
+        book, self._book_client = self._book_client, None
         discovery, self._discovery = self._discovery, None
-        if client is not None:
-            with contextlib.suppress(Exception):
-                await client.close()
+        for closable in (client, book):
+            if closable is not None:
+                with contextlib.suppress(Exception):
+                    await closable.close()
         if discovery is not None:
             with contextlib.suppress(Exception):
                 await discovery.aclose()

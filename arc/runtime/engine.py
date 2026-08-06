@@ -44,9 +44,10 @@ import asyncio
 import contextlib
 import json
 import logging
+from collections.abc import Awaitable
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
-from typing import Any, Final, TextIO
+from typing import Any, Final, Protocol, TextIO
 
 import polymarket
 
@@ -98,9 +99,11 @@ from arc.windows.engine import WindowEngine
 __all__ = [
     "EXPECTED_SYMBOL",
     "ArcRuntime",
+    "BookClient",
     "RuntimeStats",
     "RuntimeStatus",
     "TokenCache",
+    "build_book_client",
     "run_arc",
 ]
 
@@ -124,6 +127,17 @@ _PTB_RETRY_SECONDS: Final[float] = 5.0
 # One day, for the daily-loss gate's window.
 _DAY_SECONDS: Final[float] = 86400.0
 
+# How often the official CLOB book is re-read, and how long a read stays usable.
+#
+# The decision pass is synchronous and runs every tick, so it cannot itself await a
+# venue call; the book is refreshed by the loop and read from the cache. The age
+# limit is what keeps that safe — past it the quote is reported as absent and the
+# window skips with NO_QUOTE, because sizing against a price that has already moved
+# is the exact failure the quote gate exists to prevent. Two refresh intervals of
+# slack, so one dropped request does not skip a window.
+_BOOK_REFRESH_SECONDS: Final[float] = 0.5
+_BOOK_MAX_AGE_SECONDS: Final[float] = 2.0
+
 _ZERO: Final[Decimal] = Decimal("0")
 
 # Outcome labels the venue uses for these markets, lowercased. Matched rather than
@@ -132,6 +146,29 @@ _ZERO: Final[Decimal] = Decimal("0")
 # healthy. An unmatched label resolves to nothing and refuses the submission.
 _UP_LABELS: Final[frozenset[str]] = frozenset({"up", "yes"})
 _DOWN_LABELS: Final[frozenset[str]] = frozenset({"down", "no"})
+
+
+class BookClient(Protocol):
+    """Official public market data: the CLOB book and market metadata.
+
+    Both modes get one. The book is public data and needs no credential, so V1
+    reads exactly what V2 reads and the two adapters differ only in what they do
+    with the price. Declared as a Protocol so the tests can supply a recorded book
+    without a network, and so nothing here depends on the secure client.
+    """
+
+    def get_order_book(self, *, token_id: str) -> Awaitable[Any]: ...
+
+    def get_market(self, *, slug: str) -> Awaitable[Any]: ...
+
+
+def build_book_client(settings: Settings) -> polymarket.AsyncPublicClient:
+    """The official public client, on the configured environment.
+
+    Unauthenticated by construction: an idle or paper runtime must never hold a
+    signing key, and the book does not require one.
+    """
+    return polymarket.AsyncPublicClient(environment=_environment(settings.env))
 
 
 class RuntimeStatus:
@@ -219,6 +256,8 @@ class ArcRuntime:
     """
 
     __slots__ = (
+        "_book",
+        "_book_client",
         "_bucket",
         "_clock",
         "_decisions",
@@ -229,6 +268,7 @@ class ArcRuntime:
         "_fills",
         "_hub",
         "_logger",
+        "_next_book_read",
         "_next_ptb_attempt",
         "_notifier",
         "_out",
@@ -271,6 +311,7 @@ class ArcRuntime:
         executor: Executor,
         out: TextIO,
         venue_client: polymarket.AsyncSecureClient | None = None,
+        book_client: BookClient | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         trading = settings.trading
@@ -282,6 +323,13 @@ class ArcRuntime:
         self._feed = feed
         self._executor = executor
         self._venue_client = venue_client
+        # The official CLOB book, read once per pass by the runtime and handed to
+        # whichever adapter is running. One pipeline, not one per adapter: V1 must
+        # size against the same book V2 would, or the paper run stops being
+        # evidence about the live one.
+        self._book_client = book_client
+        self._book: dict[tuple[str, Direction], tuple[Decimal, float]] = {}
+        self._next_book_read: float = 0.0
         self._out = out
         self._logger = logger
         # Pause is the operator's "hold new submissions" and is deliberately
@@ -578,11 +626,71 @@ class ArcRuntime:
     def _quote(self, market_slug: str, direction: Direction) -> Decimal | None:
         """The book price the strategy sizes against.
 
-        Synchronous because the decision pass is synchronous. The executor's own
-        `best_price` is a coroutine, so the value is taken from the cached book the
-        feed loop maintains — asked for here, resolved by the caller's event loop.
+        Synchronous because the decision pass is synchronous, and answered from the
+        cache `_refresh_books` fills from the official CLOB. A quote older than
+        `_BOOK_MAX_AGE_SECONDS` is reported as absent rather than returned: the
+        window then skips with NO_QUOTE, which is the correct outcome for a book
+        nobody could read, whereas a stale price would be sized against as if it
+        were current.
         """
-        return _await_now(self._executor.best_price(market_slug, direction))
+        cached = self._book.get((market_slug, direction))
+        if cached is None:
+            return None
+        price, read_at = cached
+        if self._clock.now() - read_at > _BOOK_MAX_AGE_SECONDS:
+            return None
+        return price
+
+    async def _refresh_books(self, now: float) -> None:
+        """Re-read the official CLOB book for every live market and both sides.
+
+        The ONE market-data path for quotes. The executor is handed the result
+        rather than fetching it, so V1 and V2 differ only in what they do with the
+        price — which is the whole point of the two-adapter design.
+
+        A read that fails leaves the previous value in place to age out on its own.
+        Clearing it here would turn one dropped request into a skipped window, and
+        the age limit already covers the case where the failures persist.
+        """
+        if self._book_client is None or now < self._next_book_read:
+            return
+        self._next_book_read = now + _BOOK_REFRESH_SECONDS
+        for market in self._live_markets():
+            for direction in (Direction.UP, Direction.DOWN):
+                try:
+                    token_id = self.tokens(market.slug, direction)
+                except ArcError:
+                    # Token ids arrive from official metadata when the market
+                    # opens. Not yet cached is normal for the first passes.
+                    continue
+                try:
+                    book = await self._book_client.get_order_book(token_id=token_id)
+                except Exception as exc:
+                    log_event(
+                        logging.WARNING,
+                        "Book Unavailable",
+                        f"{market.slug} {direction.value}  {exc}",
+                        logger=self._logger,
+                    )
+                    continue
+                if not book.bids:
+                    continue
+                # By max, not by index: a change in the venue's ordering must not
+                # silently make ARC join the worst price on the book. Same rule as
+                # `LiveExecutor.best_price`, for the same reason.
+                best = max(level.price for level in book.bids)
+                self._book[(market.slug, direction)] = (best, now)
+                if isinstance(self._executor, PaperExecutor):
+                    # The paper adapter's own book, so `best_price` — which the
+                    # repricer and /orderbook read — answers with the live price.
+                    # V2 reads the venue directly and needs nothing handed to it.
+                    self._executor.quote(market.slug, direction, best)
+
+    def _forget_book(self, slug: str) -> None:
+        for direction in Direction:
+            self._book.pop((slug, direction), None)
+        if isinstance(self._executor, PaperExecutor):
+            self._executor.forget(slug)
 
     # ── PTB ──────────────────────────────────────────────────────────────────
 
@@ -794,11 +902,16 @@ class ArcRuntime:
         no side information attached; taking index 0 as Up would place real orders
         on the opposite outcome on any market where the venue ordered them the other
         way, and nothing about the resulting order would look wrong.
+
+        Read through the book client, which both modes have: V1 needs the same ids
+        to read the same official book, and `get_market` is public data requiring
+        no credential.
         """
-        if self._venue_client is None or self.tokens.known(slug):
+        client = self._book_client or self._venue_client
+        if client is None or self.tokens.known(slug):
             return
         try:
-            market = await self._venue_client.get_market(slug=slug)
+            market = await client.get_market(slug=slug)
         except Exception as exc:
             log_event(
                 logging.WARNING,
@@ -846,8 +959,10 @@ class ArcRuntime:
             if event.archived:
                 self._settlement.pop(event.archived, None)
                 self.tokens.drop(event.archived)
+                self._forget_book(event.archived)
 
             await self._attempt_ptb(now)
+            await self._refresh_books(now)
             self._watchdog.evaluate()
             self._gate_on_health()
             await self._drive_execution(now)
@@ -1022,22 +1137,23 @@ def _messages_in(payload: object) -> tuple[Any, ...]:
     return ()
 
 
-def _await_now[T](awaitable: Any) -> T | None:
-    """Resolve an already-complete coroutine from synchronous code.
+def _environment(env: Any) -> Any:
+    """The SDK's production environment, with only the configured URLs overridden.
 
-    Both executors answer `best_price` from an in-memory book, so the coroutine
-    never suspends and completing it by hand is exact. If one ever did suspend,
-    this returns None — a missing quote, which skips the window — rather than a
-    stale price, because sizing against a price that has moved is the failure the
-    quote gate exists to prevent.
+    Applied to the SDK's own environment rather than to a hand-built one, so the
+    thirty-odd contract addresses ARC never configures keep coming from the SDK and
+    cannot drift.
     """
-    coro = awaitable
-    try:
-        coro.send(None)
-    except StopIteration as done:
-        return done.value  # type: ignore[no-any-return]
-    coro.close()
-    return None
+    if (env.clob_http_url, env.clob_ws_url) == (
+        polymarket.PRODUCTION.clob_url,
+        polymarket.PRODUCTION.clob_user_ws_url,
+    ):
+        return polymarket.PRODUCTION
+    return replace(
+        polymarket.PRODUCTION,
+        clob_url=env.clob_http_url,
+        clob_user_ws_url=env.clob_ws_url,
+    )
 
 
 async def build_executor(
@@ -1076,16 +1192,7 @@ async def build_executor(
     # Endpoint overrides are applied to the SDK's own production environment rather
     # than to a hand-built one, so the thirty-odd contract addresses ARC never
     # configures keep coming from the SDK and cannot drift.
-    environment = polymarket.PRODUCTION
-    if (env.clob_http_url, env.clob_ws_url) != (
-        polymarket.PRODUCTION.clob_url,
-        polymarket.PRODUCTION.clob_user_ws_url,
-    ):
-        environment = replace(
-            environment,
-            clob_url=env.clob_http_url,
-            clob_user_ws_url=env.clob_ws_url,
-        )
+    environment = _environment(env)
 
     client = await polymarket.AsyncSecureClient.create(
         private_key=env.polymarket_private_key.get_secret_value(),

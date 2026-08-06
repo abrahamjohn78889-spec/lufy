@@ -167,6 +167,40 @@ WS   /ws
 writable there: one strategy is pinned, and buffers and windows are edited on the
 Settings page.
 
+## Production validation
+
+V1 is the production validation environment, not a simulator: it consumes the
+same live RTDS/Chainlink feed, the same official CLOB order book, the same market
+discovery, the same official PTB and the same TWAPs as V2. The only difference is
+the execution adapter — V1 places simulated orders, V2 places real ones. The
+runtime owns market data once and hands it to whichever adapter is loaded.
+
+The validation report reads the rows a run already wrote. It is not a thirteenth
+route; it is two parameters on `/history`:
+
+```
+GET /history?format=report      the Production Validation Report, plain text
+GET /history?validate=1         the same summary as JSON, alongside the ledger
+GET /history?validate=1&markets=100    bound the audit to the last 100 markets
+```
+
+The report prints the verdict first and its evidence under it:
+
+- **Recorder** — did every market record PTB, both TWAPs, every window, every
+  intent, submission, fill, reconciliation and settlement, with no market gaps.
+  It audits; it never reconstructs a missing value.
+- **Fill statistics by window** — fired, submissions, acknowledged, filled,
+  partial, cancelled, rejected, indeterminate, fill rate and fill latency,
+  bucketed per execution window.
+- **Criteria** — each is PASS, FAIL or UNVERIFIED. UNVERIFIED means the run did
+  not demonstrate it, which is not the same as passing; the verdict stays
+  NOT READY while any criterion is unverified.
+
+Five criteria cannot be satisfied by data at all — they need the operator
+watching a live run — and no length of run flips them. CPU, memory, disk and
+network are the host's to report; ARC does not sample them and prints that fact
+rather than a number.
+
 ## Transparency
 
 Nothing happens silently. Every significant runtime event appears in the OPS
