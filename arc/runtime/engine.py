@@ -197,6 +197,12 @@ class RuntimeStats:
     settlement_samples: int = 0
     settlement_stream_found: bool = False
     reconnects: int = 0
+    # Sockets that were up and went down, and recovery sequences that completed.
+    # Both are separate from `reconnects`: a reconnect ladder can attempt many
+    # times against one drop, and the operator asking "how often did the feed
+    # actually go away" is not asking how many times it retried.
+    disconnects: int = 0
+    recoveries: int = 0
     orders_submitted: int = 0
     orders_repriced: int = 0
     fills_recorded: int = 0
@@ -515,14 +521,18 @@ class ArcRuntime:
         snapshot = await self._wallet.snapshot(now, run_start=self.started_at)
         if snapshot.status != self._wallet_status:
             previous, self._wallet_status = self._wallet_status, snapshot.status
-            if previous:
-                connected = snapshot.status != "DISCONNECTED"
-                log_event(
-                    logging.INFO if connected else logging.WARNING,
-                    "Wallet Reconnected" if connected else "Wallet Disconnected",
-                    f"{snapshot.provider}  {snapshot.status}",
-                    logger=self._logger,
-                )
+            connected = snapshot.status != "DISCONNECTED"
+            log_event(
+                logging.INFO if connected else logging.WARNING,
+                # The first reading is "Connected", every later one "Reconnected".
+                # An operator who never saw a disconnect must not be told the
+                # wallet reconnected, because that reads as an outage they missed.
+                ("Wallet Connected" if not previous else "Wallet Reconnected")
+                if connected
+                else "Wallet Disconnected",
+                f"{snapshot.provider}  {snapshot.status}",
+                logger=self._logger,
+            )
         return snapshot
 
     @property
@@ -996,6 +1006,7 @@ class ArcRuntime:
             if self._feed.connect_attempts > attempts:
                 self.stats.reconnects += self._feed.connect_attempts - attempts
                 attempts = self._feed.connect_attempts
+            self.stats.disconnects = self._feed.disconnects
             self._handle_frame(frame)
 
     async def recover(self, now: float) -> None:
@@ -1006,7 +1017,14 @@ class ArcRuntime:
         position while both orders look entirely genuine (A14).
         """
         runner = RecoveryRunner(self._store, self._reconciler, self._fills, logger=self._logger)
+        log_event(
+            logging.INFO,
+            "Recovery Started",
+            f"{len(self._store.unsettled_markets())} unsettled markets to reconcile",
+            logger=self._logger,
+        )
         report = await runner.run(now)
+        self.stats.recoveries += 1
         self._recovery = report
         if not report.safe_to_trade and self._runtime.trading_enabled:
             self._runtime.disable_trading("RECOVERY_UNRESOLVED")
@@ -1047,6 +1065,15 @@ class ArcRuntime:
         # in the trading path.
         notify_task = asyncio.create_task(self._notifier.run(self._hub))
         self.status = RuntimeStatus.running_for(self.mode)
+        # Distinct from "Runtime Started": that one is logged before recovery, and
+        # recovery is the part that can take a while and can disable trading. READY
+        # is the moment the loop is actually turning.
+        log_event(
+            logging.INFO,
+            "Runtime Ready",
+            f"{self.status}  feed {self._feed.url}",
+            logger=self._logger,
+        )
         try:
             await self._main_loop(market_target)
         finally:

@@ -92,6 +92,40 @@ turns each call into an OPS Deck line, a Signal Tank event, a Telegram message
 and a log-file record together. There is no second publish path, because two
 taps eventually disagree about what happened.
 
+Telegram subscribes to that stream rather than being called from the emitting
+sites, so a log line added later still reaches the operator. Twenty-six
+independently toggleable categories map from the event label, with a fallback
+on severity for anything unmapped — a new event surfaces as a Warning or a Fatal
+Error rather than vanishing because nobody extended a table. Outbound only: no
+polling, no webhook, no command handling, because a chat message that could move
+money would make the Telegram account a second set of trading credentials.
+
+## One clock, three renderings
+
+UTC is the canonical timestamp and the only one stored. `arc/timefmt.py` derives
+IST (`Asia/Kolkata`) and ET (`America/New_York`) from it at render time, by named
+zone rather than fixed offset, so DST cannot desynchronise them and a replay
+shows the wall clock the live run showed. All three appear together on the OPS
+Deck, Limit Order Engine, Ledger, Trade History, Runtime Events, Signal Tank,
+Telegram and the Production Validation Report; UTC is kept in the display because
+it is the value the database is keyed on.
+
+No derived value re-enters the trading path. A test fails if `decision`, `risk`,
+`windows`, `strategy`, `execution` or `domain` so much as imports the formatter.
+
+## What is measured, and what is not
+
+Latency is reported only where a timestamp pair actually exists: submission
+(`order.created_at` → `order.updated_at`) and fill (`order.created_at` → the
+first fill row). Websocket frames, CLOB calls and provider responses are not
+individually timestamped, so those figures print
+`UNAVAILABLE (not instrumented)`. Host CPU, memory, disk and network are not
+sampled at all. A number invented beside measured ones is read as measured.
+
+Reconnects, dropped sockets and recoveries are counted separately: a drop is a
+socket that was up and went down, a reconnect is one attempt by the ladder, and
+one outage can produce many attempts.
+
 ## Three quantities that are never conflated
 
 - `signal_twap` — 300 s cumulative mean from the provider. Drives decisions.

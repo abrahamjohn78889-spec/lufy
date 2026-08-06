@@ -212,6 +212,8 @@ def validate_run(
     uptime_seconds: float = 0.0,
     restarts: int = 0,
     reconnects: int = 0,
+    disconnects: int = 0,
+    recoveries: int = 0,
     chainlink_enabled: bool = False,
     clock: Clock | None = None,
 ) -> ValidationReport:
@@ -332,6 +334,8 @@ def validate_run(
         uptime_seconds=uptime_seconds,
         restarts=restarts,
         reconnects=reconnects,
+        disconnects=disconnects,
+        recoveries=recoveries,
         observations=sum(store.observation_count(s) for s in slugs),
         duration_seconds=clock.monotonic() - started,
         chainlink_enabled=chainlink_enabled,

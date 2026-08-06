@@ -356,6 +356,8 @@ async def history(
             uptime_seconds=max(now - run.started_at, 0.0) if run.started_at else 0.0,
             restarts=run.restart_count,
             reconnects=run.stats.reconnects,
+            disconnects=run.stats.disconnects,
+            recoveries=run.stats.recoveries,
             chainlink_enabled=run.settings.env.twap_provider.upper() == "CHAINLINK",
             clock=run.clock,
         )
@@ -365,6 +367,7 @@ async def history(
                     report,
                     mode=run.mode.value,
                     provider=run.settings.env.twap_provider,
+                    generated_at=now,
                 ),
                 media_type="text/plain; charset=utf-8",
             )

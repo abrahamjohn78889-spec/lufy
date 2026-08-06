@@ -147,7 +147,7 @@ class ReconnectingStream:
     provider and never in the retry logic.
     """
 
-    __slots__ = ("_backoff", "_logger", "_name", "_open", "_url", "connected")
+    __slots__ = ("_backoff", "_logger", "_name", "_open", "_url", "connected", "disconnects")
 
     def __init__(
         self,
@@ -164,6 +164,7 @@ class ReconnectingStream:
         self._backoff = backoff if backoff is not None else BackoffPolicy()
         self._logger = logger
         self.connected = False
+        self.disconnects = 0
 
     async def frames(self) -> AsyncIterator[str | bytes]:
         attempt = 0
@@ -180,6 +181,10 @@ class ReconnectingStream:
             except asyncio.CancelledError:
                 raise
             except (ConnectionLostError, FeedError, OSError, websockets.WebSocketException) as exc:
+                # A drop is a socket that WAS up and went down. A failed connect
+                # attempt is not a drop; counting both would make one outage read
+                # as a dozen dropped sockets and hide the ladder that caused them.
+                self.disconnects += 1 if self.connected else 0
                 self.connected = False
                 attempt += 1
                 delay = self._backoff.delay_for(attempt)
@@ -216,6 +221,7 @@ class RtdsFeed:
         "_url",
         "connect_attempts",
         "connected",
+        "disconnects",
         "keepalives_sent",
         "messages_received",
     )
@@ -238,9 +244,9 @@ class RtdsFeed:
         self._logger = logger
         self.connected = False
         self.connect_attempts = 0
+        self.disconnects = 0
         self.messages_received = 0
         self.keepalives_sent = 0
-
     @property
     def url(self) -> str:
         return self._url
@@ -302,6 +308,8 @@ class RtdsFeed:
             except asyncio.CancelledError:
                 raise
             except (ConnectionLostError, FeedError, OSError, websockets.WebSocketException) as exc:
+                # See ReconnectingStream: only a socket that was up counts as dropped.
+                self.disconnects += 1 if self.connected else 0
                 self.connected = False
                 attempt += 1
                 delay = self._backoff.delay_for(attempt)

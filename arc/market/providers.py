@@ -50,6 +50,9 @@ class TwapProvider(Protocol):
     @property
     def connect_attempts(self) -> int: ...
 
+    @property
+    def disconnects(self) -> int: ...
+
     def messages(self) -> AsyncIterator[str | bytes]: ...
 
 

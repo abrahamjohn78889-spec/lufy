@@ -1,4 +1,4 @@
-"""Telegram notifications. Twenty-five categories, each independently toggleable.
+"""Telegram notifications. Twenty-six categories, each independently toggleable.
 
 NOTIFICATION ONLY. Nothing here can start, stop, arm, disarm, submit, cancel or
 configure anything, and there is no inbound path at all — no polling, no webhook, no
@@ -38,7 +38,7 @@ __all__ = [
     "notification_values",
 ]
 
-# The twenty-five categories, in the order the Settings page lists them.
+# The twenty-six categories, in the order the Settings page lists them.
 CATEGORY_LABELS: Final[dict[str, str]] = {
     "startup": "Startup",
     "shutdown": "Shutdown",
@@ -49,8 +49,9 @@ CATEGORY_LABELS: Final[dict[str, str]] = {
     "feed_disconnect": "Feed Disconnect",
     "feed_reconnect": "Feed Reconnect",
     "wallet_disconnect": "Wallet Disconnect",
-    "wallet_reconnect": "Wallet Reconnect",
+    "wallet_reconnect": "Wallet Connected / Reconnected",
     "provider_reconnect": "Provider Reconnect",
+    "recovery": "Recovery Started / Completed",
     "ptb_frozen": "PTB Frozen",
     "window_open": "Window Open",
     "direction_frozen": "Direction Frozen",
@@ -75,6 +76,7 @@ CATEGORIES: Final[tuple[str, ...]] = tuple(CATEGORY_LABELS)
 # than vanishing because nobody remembered to extend this table.
 EVENT_CATEGORY: Final[dict[str, str]] = {
     "Runtime Started": "startup",
+    "Runtime Ready": "startup",
     "Runtime Stopped": "shutdown",
     "Runtime Switched": "runtime_switched",
     # The four operator gate changes. One category rather than four, because they
@@ -87,8 +89,14 @@ EVENT_CATEGORY: Final[dict[str, str]] = {
     "Feed Disconnected": "feed_disconnect",
     "Feed Connected": "feed_reconnect",
     "Wallet Disconnected": "wallet_disconnect",
+    "Wallet Connected": "wallet_reconnect",
     "Wallet Reconnected": "wallet_reconnect",
     "Reconnecting": "provider_reconnect",
+    # Both ends of the recovery sequence, in one category. An operator told a
+    # recovery started and never told it finished has to go and look, which is
+    # exactly the state this notification exists to spare them.
+    "Recovery Started": "recovery",
+    "Recovery Complete": "recovery",
     "PTB Frozen": "ptb_frozen",
     "Window Open": "window_open",
     # Freezing IS the instant direction is determined, and the log line carries the
@@ -173,7 +181,7 @@ def category_for(event: str, severity: str) -> str | None:
 
 
 class TelegramNotifier:
-    """One worker task, one chat, twenty-five toggles.
+    """One worker task, one chat, twenty-six toggles.
 
     Constructed even when unconfigured: `configured` is then False and `run` returns
     immediately, so the runtime needs no branch around it and an operator who fills
@@ -206,7 +214,7 @@ class TelegramNotifier:
         self._chat_id = chat_id
         # The master switch, separate from the per-category toggles. An operator
         # silencing ARC for a maintenance window must not have to remember which of
-        # twenty-five categories they turned off before turning them back on.
+        # twenty-six categories they turned off before turning them back on.
         self._enabled = enabled
         self._thread_id = thread_id.strip()
         # Held by reference, not copied: the Settings page edits this dict in place so
@@ -293,12 +301,16 @@ class TelegramNotifier:
         if category is None or not self.wants(category):
             return None
         detail = str(data.get("detail", ""))
-        # Both zones on every notification. A phone alert whose only timestamp is
-        # the phone's own arrival time is useless for correlating against the venue
-        # afterwards, and the operator's zone is not the exchange's.
+        # All three zones on every notification. A phone alert whose only timestamp
+        # is the phone's own arrival time is useless for correlating against the
+        # venue afterwards; the operator's zone is not the exchange's, and UTC is
+        # what every log line and every stored row is actually keyed on.
         when = ""
         if data.get("ist") and data.get("et"):
-            when = f"\nIST: {data['ist']}\nET : {data['et']}"
+            when = (
+                f"\nUTC: {data.get('utc_display', '')}"
+                f"\nIST: {data['ist']}\nET : {data['et']}"
+            )
         body = f"[ARC] {CATEGORY_LABELS[category]}{when}\n{data.get('event', '')}"
         return f"{body}\n{detail}" if detail else body
 

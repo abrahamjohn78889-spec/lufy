@@ -1,4 +1,4 @@
-"""Telegram: twenty-five toggles, notification only, and no inbound path at all.
+"""Telegram: twenty-six toggles, notification only, and no inbound path at all.
 
 The failures pinned here are the ones that would be discovered at the wrong time: a
 category mapped to an event name that no engine actually logs (so the operator is
@@ -40,8 +40,9 @@ _EXPECTED = (
     "Feed Disconnect",
     "Feed Reconnect",
     "Wallet Disconnect",
-    "Wallet Reconnect",
+    "Wallet Connected / Reconnected",
     "Provider Reconnect",
+    "Recovery Started / Completed",
     "PTB Frozen",
     "Window Open",
     "Direction Frozen",
@@ -75,7 +76,7 @@ def _signal(event: str, severity: str = "INFO", engine: str = "Runtime") -> dict
 class TestTheCategories:
     def test_exactly_the_categories_the_spec_names(self) -> None:
         assert tuple(CATEGORY_LABELS.values()) == _EXPECTED
-        assert len(CATEGORIES) == 25
+        assert len(CATEGORIES) == 26
 
     def test_each_is_independently_toggleable(self) -> None:
         notifier = _notifier(warnings=False)

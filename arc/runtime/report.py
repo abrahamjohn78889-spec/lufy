@@ -22,6 +22,7 @@ from arc.runtime.validation import (
     UNVERIFIED,
     ValidationReport,
 )
+from arc.timefmt import stamps
 
 __all__ = ["render_report"]
 
@@ -34,10 +35,14 @@ _METRIC_ROWS: tuple[tuple[str, str], ...] = (
     ("runtime uptime (s)", "runtime_uptime_seconds"),
     ("runtime restarts", "runtime_restarts"),
     ("runtime reconnects", "runtime_reconnects"),
+    ("runtime dropped sockets", "runtime_disconnects"),
+    ("runtime recoveries", "runtime_recoveries"),
     ("avg websocket latency ms", "avg_websocket_latency_ms"),
     ("avg CLOB latency ms", "avg_clob_latency_ms"),
     ("avg RTDS latency ms", "avg_rtds_latency_ms"),
     ("avg Chainlink latency ms", "avg_chainlink_latency_ms"),
+    ("avg submission latency ms", "avg_submission_latency_ms"),
+    ("avg fill latency ms", "avg_fill_latency_ms"),
     ("avg order latency ms", "avg_order_latency_ms"),
     ("recorder markets", "recorder_markets"),
     ("recorder observations", "recorder_observations"),
@@ -56,13 +61,31 @@ def _row(label: str, value: Any, width: int = 30) -> str:
     return f"  {label:<{width}} {value}\n"
 
 
-def render_report(report: ValidationReport, *, mode: str, provider: str) -> str:
+def _when(ts: float | int | None) -> str:
+    """One instant, all three zones, on one line.
+
+    UTC as well as IST and ET: UTC is what every stored row and every log line is
+    keyed on, so a report an operator pastes into an incident thread has to carry
+    the value the database will be queried with, not only the two a human reads.
+    """
+    parts = stamps(ts)
+    return f"{parts['utc_display']} UTC · {parts['ist']} IST · {parts['et']} ET"
+
+
+def render_report(
+    report: ValidationReport,
+    *,
+    mode: str,
+    provider: str,
+    generated_at: float | None = None,
+) -> str:
     """One text block. Verdict first, then the evidence."""
     lines = [
         _RULE,
         "\nARC — PRODUCTION VALIDATION REPORT\n",
         _RULE,
         "\n",
+        _row("generated", _when(generated_at)),
         _row("runtime mode", mode),
         _row("provider", provider),
         _row("criteria passed", sum(1 for c in report.criteria if c.result == PASS)),
@@ -95,6 +118,8 @@ def render_report(report: ValidationReport, *, mode: str, provider: str) -> str:
         lines.append(_row("complete", "yes" if recorder.complete else "no"))
         lines.append(_row("incomplete markets", len(recorder.incomplete)))
         lines.append(_row("market gaps", len(recorder.gaps) or "none"))
+        lines.append(_row("first window", _when(recorder.first_window_ts or None)))
+        lines.append(_row("last window", _when(recorder.last_window_ts or None)))
         for market in recorder.incomplete[:10]:
             lines.append(f"      {market.slug}: {', '.join(market.missing)}\n")
         for gap in recorder.gaps[:10]:

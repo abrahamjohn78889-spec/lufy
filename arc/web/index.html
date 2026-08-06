@@ -59,8 +59,10 @@
       <div class="sub clocks">
         opens IST <span data-f="market.opens_display.ist">—</span>
         · ET <span data-f="market.opens_display.et">—</span>
+        · UTC <span data-f="market.opens_display.utc_display">—</span>
         &nbsp;|&nbsp; closes IST <span data-f="market.closes_display.ist">—</span>
         · ET <span data-f="market.closes_display.et">—</span>
+        · UTC <span data-f="market.closes_display.utc_display">—</span>
       </div>
     </div>
   </section>
@@ -199,6 +201,7 @@
         <dt>Feed Age</dt><dd data-f="runtime.feed_age_ms" data-ms>—</dd>
         <dt>Clock Drift</dt><dd data-f="runtime.clock_drift_ms" data-ms>—</dd>
         <dt>Reconnects</dt><dd data-f="stats.reconnects">—</dd>
+        <dt>Dropped Sockets</dt><dd data-f="stats.disconnects">—</dd>
         <dt>Observations Accepted</dt><dd data-f="stats.observations_accepted">—</dd>
         <dt>Observations Rejected</dt><dd data-f="stats.observations_rejected">—</dd>
         <dt>Settlement Samples</dt><dd data-f="stats.settlement_samples">—</dd>
@@ -226,6 +229,7 @@
       <h2>Recovery</h2>
       <dl class="kv">
         <dt>Recovery Running</dt><dd data-f="recovery.running" data-flag>—</dd>
+        <dt>Recoveries Run</dt><dd data-f="stats.recoveries">—</dd>
         <dt>Stage</dt><dd data-f="recovery.stage">—</dd>
         <dt>Markets Recovered</dt><dd data-f="recovery.markets_recovered">—</dd>
         <dt>Unresolved Orders</dt><dd data-f="recovery.unresolved_orders" data-list>—</dd>
@@ -310,6 +314,7 @@
       <div class="sub clocks">
         IST <span data-f="clocks.ist">—</span>
         · ET <span data-f="clocks.et">—</span>
+        · UTC <span data-f="clocks.utc_display">—</span>
       </div>
     </div>
   </section>
@@ -322,8 +327,8 @@
     <label><input id="tank-follow" type="checkbox" checked> follow</label>
   </div>
   <table class="stream">
-    <thead><tr><th>#</th><th>IST</th><th>ET</th><th>Engine</th><th>Severity</th>
-      <th>Message</th></tr></thead>
+    <thead><tr><th>#</th><th>UTC</th><th>IST</th><th>ET</th><th>Engine</th>
+      <th>Severity</th><th>Message</th></tr></thead>
     <tbody id="tank"></tbody>
   </table>
 </main>
@@ -347,9 +352,9 @@
         <th>Market</th><th>Window</th><th>PTB</th><th>Signal TWAP</th><th>Settlement TWAP</th>
         <th>Direction</th><th>Locked Trigger</th><th>Buffer</th><th>Intent</th>
         <th>Local Order</th><th>Venue Order</th>
-        <th>Submitted<br><small>IST / ET</small></th>
-        <th>Filled<br><small>IST / ET</small></th>
-        <th>Settled<br><small>IST / ET</small></th>
+        <th>Submitted<br><small>UTC / IST / ET</small></th>
+        <th>Filled<br><small>UTC / IST / ET</small></th>
+        <th>Settled<br><small>UTC / IST / ET</small></th>
         <th>Order Price</th><th>Fill Price</th><th>Qty</th><th>Filled Qty</th><th>Remaining</th>
         <th>State</th><th>Rejection</th><th>Buffer Status</th><th>Result</th><th>PnL</th><th>Notes</th>
       </tr></thead>

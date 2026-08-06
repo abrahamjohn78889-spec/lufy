@@ -195,13 +195,17 @@ The report prints the verdict first and its evidence under it:
 - **Criteria** — each is PASS, FAIL or UNVERIFIED. UNVERIFIED means the run did
   not demonstrate it, which is not the same as passing; the verdict stays
   NOT READY while any criterion is unverified.
-- **Runtime metrics** — uptime, restarts, reconnects, the latencies, recorder
-  size, database growth and validation duration. The figures ARC does not
-  instrument (websocket, CLOB and RTDS round trips) print
-  `UNAVAILABLE (not instrumented)`; only order latency is measured, from the
-  order row's own `created_at`/`updated_at`. A latency nobody measured, printed
-  beside ones that were, is read as measured. These describe the run; they can
-  never move the verdict.
+- **Runtime metrics** — uptime, restarts, reconnects, dropped sockets,
+  recoveries, the latencies, recorder size, database growth and validation
+  duration. Two latencies are measured, both from the order row's own
+  timestamps: **submission** (`created_at` → `updated_at`) and **fill**
+  (`created_at` → the first fill). The round trips ARC does not instrument
+  (websocket, CLOB, RTDS, Chainlink) print `UNAVAILABLE (not instrumented)`,
+  because a latency nobody measured, printed beside ones that were, is read as
+  measured. Reconnects, dropped sockets and recoveries are three separate
+  counts: one outage can drive a dozen reconnect attempts, and "how often did
+  the feed go away" is not "how often did it retry". These describe the run;
+  they can never move the verdict.
 
 The verdict is exactly one of `READY FOR V2 LIVE TRADING` or
 `NOT READY FOR V2 LIVE TRADING`, and every failed or unverified criterion is
@@ -219,15 +223,18 @@ Deck, the Signal Tank, the Ledger, Telegram and the logs.
 
 ### Dual time
 
-Every displayed instant carries both **IST** (`Asia/Kolkata`, the operator) and
-**ET** (`America/New_York`, the venue), on the OPS Deck clocks, every window's
-open and close, every Ledger record, every Signal Tank line and every Telegram
-message. Both are *derived* at render time by `arc/timefmt.py` from the one
+Every displayed instant carries all three of **UTC** (canonical), **IST**
+(`Asia/Kolkata`, the operator) and **ET** (`America/New_York`, the venue), on
+the OPS Deck clocks, every window's open and close, every Ledger record, every
+Signal Tank line, every Telegram message and the Production Validation Report.
+IST and ET are *derived* at render time by `arc/timefmt.py` from the one
 canonical UTC epoch each record already stored — nothing is persisted twice, so
-the two zones cannot drift apart across a DST transition, and a replayed run
-shows the same wall clock it showed live. Named zones, not fixed offsets: New
-York observes DST, and a hardcoded `-05:00` would be an hour wrong for eight
-months of the year.
+the zones cannot drift apart across a DST transition, and a replayed run
+shows the same wall clock it showed live. UTC is printed alongside them because
+it is the value every stored row and every log line is keyed on, and therefore
+the one an operator pastes back into a query. Named zones, not fixed offsets:
+New York observes DST, and a hardcoded `-05:00` would be an hour wrong for
+eight months of the year.
 
 Nothing in the trading path reads a derived value. Windows, buffers, freezes,
 PTB, TWAPs and countdowns are computed from the epoch, exactly as before, and a

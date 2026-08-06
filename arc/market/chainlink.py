@@ -231,6 +231,11 @@ class ChainlinkFeed:
     def url(self) -> str:
         return self._url
 
+    @property
+    def disconnects(self) -> int:
+        """Sockets that were up and went down. Owned by the shared reconnect ladder."""
+        return self._stream.disconnects
+
     async def _open(self) -> Any:
         self.connect_attempts += 1
         # Signed at connect time, not at construction: the timestamp must be

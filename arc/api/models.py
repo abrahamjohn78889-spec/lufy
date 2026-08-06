@@ -666,6 +666,8 @@ async def status_payload(run: ArcRuntime, now: float) -> dict[str, Any]:
             "settlement_samples": run.stats.settlement_samples,
             "settlement_stream_found": run.stats.settlement_stream_found,
             "reconnects": run.stats.reconnects,
+            "disconnects": run.stats.disconnects,
+            "recoveries": run.stats.recoveries,
             "orders_submitted": run.stats.orders_submitted,
             "orders_repriced": run.stats.orders_repriced,
             "fills_recorded": run.stats.fills_recorded,

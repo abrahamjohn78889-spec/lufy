@@ -225,6 +225,8 @@ function paintAnalytics() {
     'PTB Frozen': state.stats.ptb_frozen,
     'PTB Unavailable': state.stats.ptb_unavailable,
     'Reconnects': state.stats.reconnects,
+    'Dropped Sockets': state.stats.disconnects,
+    'Recoveries': state.stats.recoveries,
     'Runtime Uptime': duration(state.runtime.uptime_seconds),
   };
   const host = $('#analytics');
@@ -311,7 +313,8 @@ function paintTank() {
     const tr = document.createElement('tr');
     tr.className = e.severity.toLowerCase();
     tr.id = `ev-${e.seq}`;
-    for (const cell of [e.seq, e.ist || '—', e.et || '—', e.engine, e.severity,
+    for (const cell of [e.seq, e.utc_display || '—', e.ist || '—', e.et || '—',
+                        e.engine, e.severity,
                         e.detail ? `${e.event} — ${e.detail}` : e.event]) {
       const td = document.createElement('td');
       td.textContent = String(cell);
@@ -515,14 +518,16 @@ const LEDGER_COLUMNS = [
   'quantity', 'filled_quantity', 'remaining_quantity', 'state_display',
   'rejection_display', 'buffer_status', 'settlement_result', 'pnl', 'notes',
 ];
-// Rendered as IST / ET from the backend's `<key>_display` block rather than
+// Rendered as UTC / IST / ET from the backend's `<key>_display` block rather than
 // reformatted here: one conversion utility server-side, no zone maths in the browser.
 const TIME_COLUMNS = new Set(['submission_time', 'fill_time', 'settlement_time']);
 
 function dualTime(row, key) {
   const d = row[`${key}_display`];
   if (!d || !d.utc) return '—';
-  return `${d.ist} / ${d.et}`;
+  // UTC first: it is the value every stored row is keyed on, and the one an
+  // operator pastes back into a query. The two human zones follow it.
+  return `${d.utc_display} / ${d.ist} / ${d.et}`;
 }
 
 function ledgerQuery() {

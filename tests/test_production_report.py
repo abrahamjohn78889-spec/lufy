@@ -54,6 +54,9 @@ SIZE = Decimal("35")
 # renderings of the same rows differ in those figures by design. Everything else
 # must match exactly — the comparisons below blank the clocks and nothing more.
 _VOLATILE: tuple[str, ...] = (
+    # The report stamps the moment it was rendered. Two renderings of the same run
+    # differ on that line and on nothing else, which is the point of the line.
+    "generated  ",
     "runtime_uptime_seconds",
     "validation_duration_seconds",
     "runtime uptime (s)",
