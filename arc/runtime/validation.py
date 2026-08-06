@@ -322,7 +322,7 @@ def validate_run(
                   OPERATOR_VERIFIED["CPU / memory / network"]))
     add(_c(13, "Database health", store.integrity_check() == "ok",
            store.integrity_check(),
-           f"schema v{store.schema_version}, {store.market_count()} markets"))
+           f"schema v{store.schema_version()}, {store.market_count()} markets"))
 
     # The runtime figures. Attached last so the elapsed time covers every check
     # above it — the duration the operator reads is the duration they waited.

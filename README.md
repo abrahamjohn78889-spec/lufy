@@ -195,6 +195,17 @@ The report prints the verdict first and its evidence under it:
 - **Criteria** — each is PASS, FAIL or UNVERIFIED. UNVERIFIED means the run did
   not demonstrate it, which is not the same as passing; the verdict stays
   NOT READY while any criterion is unverified.
+- **Runtime metrics** — uptime, restarts, reconnects, the latencies, recorder
+  size, database growth and validation duration. The figures ARC does not
+  instrument (websocket, CLOB and RTDS round trips) print
+  `UNAVAILABLE (not instrumented)`; only order latency is measured, from the
+  order row's own `created_at`/`updated_at`. A latency nobody measured, printed
+  beside ones that were, is read as measured. These describe the run; they can
+  never move the verdict.
+
+The verdict is exactly one of `READY FOR V2 LIVE TRADING` or
+`NOT READY FOR V2 LIVE TRADING`, and every failed or unverified criterion is
+listed in full under it.
 
 Five criteria cannot be satisfied by data at all — they need the operator
 watching a live run — and no length of run flips them. CPU, memory, disk and

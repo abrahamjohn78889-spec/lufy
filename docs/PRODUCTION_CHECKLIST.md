@@ -68,8 +68,14 @@ simulated. A long V1 run is therefore evidence about the production runtime.
       against the running deck before treating the run as validated.
 - [ ] Host metrics are **not** in the report by design. Read them yourself on the
       VPS: `top`, `free -m`, `df -h`, `ss -s`.
-- [ ] The verdict reads READY FOR LIVE (V2) only when nothing is failed and
-      nothing is unverified. Anything else is NOT READY, and that is the answer.
+- [ ] **Runtime metrics** (uptime, restarts, reconnects, latencies, recorder size,
+      database growth, validation duration) are printed in their own block. The
+      four latencies ARC does not instrument read `UNAVAILABLE (not instrumented)`
+      rather than a plausible figure derived from something adjacent; only order
+      latency is measured, from the order row's own timestamps.
+- [ ] The verdict reads `READY FOR V2 LIVE TRADING` only when nothing is failed
+      and nothing is unverified. Anything else is `NOT READY FOR V2 LIVE TRADING`,
+      and that is the answer.
 
 ## 5. First live start
 
