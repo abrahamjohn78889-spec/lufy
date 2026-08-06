@@ -48,6 +48,20 @@
     <div class="timer-meta">
       <div class="slug" data-f="market.slug">—</div>
       <div class="sub">next <span data-f="market.next_market">—</span></div>
+      <!-- The wall clocks. Rendered by the backend from the same instant every
+           other value on the deck was built from, so they cannot drift from the
+           data beside them. Never used for any calculation. -->
+      <div class="sub clocks">
+        IST <span data-f="clocks.ist">—</span>
+        · ET <span data-f="clocks.et">—</span>
+        · UTC <span data-f="clocks.utc_display">—</span>
+      </div>
+      <div class="sub clocks">
+        opens IST <span data-f="market.opens_display.ist">—</span>
+        · ET <span data-f="market.opens_display.et">—</span>
+        &nbsp;|&nbsp; closes IST <span data-f="market.closes_display.ist">—</span>
+        · ET <span data-f="market.closes_display.et">—</span>
+      </div>
     </div>
   </section>
 
@@ -293,6 +307,10 @@
       <div class="sub">Signal TWAP <span data-f="market.signal_twap">—</span>
         · PTB <span data-f="market.ptb">—</span>
         · Settlement TWAP <span data-f="market.settlement_twap">—</span></div>
+      <div class="sub clocks">
+        IST <span data-f="clocks.ist">—</span>
+        · ET <span data-f="clocks.et">—</span>
+      </div>
     </div>
   </section>
   <div class="toolbar">
@@ -304,7 +322,8 @@
     <label><input id="tank-follow" type="checkbox" checked> follow</label>
   </div>
   <table class="stream">
-    <thead><tr><th>#</th><th>Timestamp</th><th>Engine</th><th>Severity</th><th>Message</th></tr></thead>
+    <thead><tr><th>#</th><th>IST</th><th>ET</th><th>Engine</th><th>Severity</th>
+      <th>Message</th></tr></thead>
     <tbody id="tank"></tbody>
   </table>
 </main>
@@ -327,7 +346,10 @@
       <thead><tr>
         <th>Market</th><th>Window</th><th>PTB</th><th>Signal TWAP</th><th>Settlement TWAP</th>
         <th>Direction</th><th>Locked Trigger</th><th>Buffer</th><th>Intent</th>
-        <th>Local Order</th><th>Venue Order</th><th>Submitted</th><th>Filled</th><th>Settled</th>
+        <th>Local Order</th><th>Venue Order</th>
+        <th>Submitted<br><small>IST / ET</small></th>
+        <th>Filled<br><small>IST / ET</small></th>
+        <th>Settled<br><small>IST / ET</small></th>
         <th>Order Price</th><th>Fill Price</th><th>Qty</th><th>Filled Qty</th><th>Remaining</th>
         <th>State</th><th>Rejection</th><th>Buffer Status</th><th>Result</th><th>PnL</th><th>Notes</th>
       </tr></thead>

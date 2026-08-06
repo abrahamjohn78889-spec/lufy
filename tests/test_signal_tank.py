@@ -46,6 +46,23 @@ class TestEveryLogLineBecomesAnEvent:
         assert [e.seq for e in hub.recent()] == [1, 2, 3, 4, 5]
 
 
+class TestEveryEventCarriesBothZones:
+    """Dual time on the wire, derived from the event's own canonical ts."""
+
+    def test_ist_and_et_ship_with_every_event(self) -> None:
+        hub = EventHub()
+        log_event(logging.INFO, "Window Open", logger=_logger(hub))
+        payload = hub.recent()[0].as_json()
+        assert payload["ist"] and payload["et"] and payload["utc_display"]
+
+    def test_the_canonical_ts_is_still_the_epoch(self) -> None:
+        hub = EventHub()
+        log_event(logging.INFO, "Window Open", logger=_logger(hub))
+        event = hub.recent()[0]
+        assert event.as_json()["ts"] == event.ts
+        assert isinstance(event.as_json()["ts"], float)
+
+
 class TestNoUnboundedGrowth:
     def test_buffer_is_capped(self) -> None:
         """A 24x7 process must not accumulate events for days."""

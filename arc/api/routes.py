@@ -47,6 +47,7 @@ from arc.runtime.ledger import ledger_records, search_records
 from arc.runtime.report import render_report
 from arc.runtime.validation import validate_run
 from arc.strategy.registry import default_registry
+from arc.timefmt import parse_at
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from arc.runtime.engine import ArcRuntime
@@ -314,8 +315,9 @@ async def history(
     direction: str = Query(""),
     state: str = Query(""),
     result: str = Query(""),
-    since: float | None = Query(None),
-    until: float | None = Query(None),
+    since: str = Query("", description="epoch, or a wall clock read in ?tz="),
+    until: str = Query("", description="epoch, or a wall clock read in ?tz="),
+    tz: str = Query("utc", description="utc | ist | et — the zone since/until are written in"),
     markets: int = Query(50, ge=1, le=1000),
     fmt: str = Query("json", alias="format", description="json | csv | report"),
     validate: bool = Query(False, description="attach the production validation summary"),
@@ -336,8 +338,8 @@ async def history(
         direction=direction,
         state=state,
         result=result,
-        since=since,
-        until=until,
+        since=parse_at(since, tz),
+        until=parse_at(until, tz),
     )
     rows = [r.as_json() for r in records]
     if fmt == "csv":
@@ -546,17 +548,35 @@ async def websocket(socket: WebSocket) -> None:
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
+def _flatten(row: dict[str, Any]) -> dict[str, Any]:
+    """One level of nesting into `parent_child` columns.
+
+    The dual-time fields ship as `{"utc": ..., "ist": ..., "et": ...}` so the
+    dashboard gets them as one object. A spreadsheet cannot read that — written
+    verbatim it becomes the repr of a dict — so each zone becomes its own column
+    rather than the export quietly carrying unusable cells.
+    """
+    out: dict[str, Any] = {}
+    for key, value in row.items():
+        if isinstance(value, dict):
+            out.update({f"{key}_{inner}": v for inner, v in value.items()})
+        else:
+            out[key] = value
+    return out
+
+
 def _csv(rows: list[dict[str, Any]]) -> Response:
     """CSV only, and every cell already a string.
 
     The ledger's Decimals arrive here as strings, so writing them verbatim is what
     keeps a spreadsheet from reading 0.740000 as 0.74 and back as a float.
     """
+    flat = [_flatten(row) for row in rows]
     buffer = io.StringIO()
-    fields = list(rows[0]) if rows else ["market"]
+    fields = list(flat[0]) if flat else ["market"]
     writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
     writer.writeheader()
-    writer.writerows(rows)
+    writer.writerows(flat)
     return Response(content=buffer.getvalue(), media_type="text/csv")
 
 

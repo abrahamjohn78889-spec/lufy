@@ -206,6 +206,26 @@ rather than a number.
 Nothing happens silently. Every significant runtime event appears in the OPS
 Deck, the Signal Tank, the Ledger, Telegram and the logs.
 
+### Dual time
+
+Every displayed instant carries both **IST** (`Asia/Kolkata`, the operator) and
+**ET** (`America/New_York`, the venue), on the OPS Deck clocks, every window's
+open and close, every Ledger record, every Signal Tank line and every Telegram
+message. Both are *derived* at render time by `arc/timefmt.py` from the one
+canonical UTC epoch each record already stored — nothing is persisted twice, so
+the two zones cannot drift apart across a DST transition, and a replayed run
+shows the same wall clock it showed live. Named zones, not fixed offsets: New
+York observes DST, and a hardcoded `-05:00` would be an hour wrong for eight
+months of the year.
+
+Nothing in the trading path reads a derived value. Windows, buffers, freezes,
+PTB, TWAPs and countdowns are computed from the epoch, exactly as before, and a
+test fails if the decision, risk, window, strategy, execution or domain package
+so much as imports the formatter.
+
+Ledger filters accept either zone: `/history?since=2026-08-06 09:00:00&tz=ist`.
+The bound is converted once, on the way in; what is filtered is still the epoch.
+
 ## Development
 
 ```bash

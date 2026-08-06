@@ -185,6 +185,22 @@ class TestRendering:
         """The hub carries status frames at 5Hz. Forwarding them would be a flood."""
         assert _notifier().render({"type": "status", "data": {"event": "x"}}) is None
 
+    def test_both_zones_appear_when_the_event_carries_them(self) -> None:
+        """A phone alert whose only timestamp is its arrival time cannot be
+        correlated against the venue afterwards."""
+        signal = _signal("Order Filled")
+        assert isinstance(signal["data"], dict)
+        signal["data"].update({"ist": "2026-08-06 21:34:12", "et": "2026-08-06 12:04:12"})
+        text = _notifier().render(signal)
+        assert text is not None
+        assert "IST: 2026-08-06 21:34:12" in text
+        assert "ET : 2026-08-06 12:04:12" in text
+
+    def test_an_event_without_stamps_renders_without_a_blank_clock(self) -> None:
+        text = _notifier().render(_signal("Order Filled"))
+        assert text is not None
+        assert "IST" not in text
+
     def test_own_events_are_never_forwarded(self) -> None:
         """A send failure logs a warning; forwarding it would notify about itself.
 

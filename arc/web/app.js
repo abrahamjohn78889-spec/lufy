@@ -311,7 +311,7 @@ function paintTank() {
     const tr = document.createElement('tr');
     tr.className = e.severity.toLowerCase();
     tr.id = `ev-${e.seq}`;
-    for (const cell of [e.seq, hhmmss(e.ts), e.engine, e.severity,
+    for (const cell of [e.seq, e.ist || '—', e.et || '—', e.engine, e.severity,
                         e.detail ? `${e.event} — ${e.detail}` : e.event]) {
       const td = document.createElement('td');
       td.textContent = String(cell);
@@ -515,7 +515,15 @@ const LEDGER_COLUMNS = [
   'quantity', 'filled_quantity', 'remaining_quantity', 'state_display',
   'rejection_display', 'buffer_status', 'settlement_result', 'pnl', 'notes',
 ];
+// Rendered as IST / ET from the backend's `<key>_display` block rather than
+// reformatted here: one conversion utility server-side, no zone maths in the browser.
 const TIME_COLUMNS = new Set(['submission_time', 'fill_time', 'settlement_time']);
+
+function dualTime(row, key) {
+  const d = row[`${key}_display`];
+  if (!d || !d.utc) return '—';
+  return `${d.ist} / ${d.et}`;
+}
 
 function ledgerQuery() {
   const p = new URLSearchParams();
@@ -540,7 +548,7 @@ async function loadLedger() {
     tr.className = (r.state_display || '').toLowerCase().replace(/\s+/g, '-');
     for (const key of LEDGER_COLUMNS) {
       const td = document.createElement('td');
-      td.textContent = TIME_COLUMNS.has(key) ? hhmmss(r[key]) : text(r[key]);
+      td.textContent = TIME_COLUMNS.has(key) ? dualTime(r, key) : text(r[key]);
       tr.append(td);
     }
     return tr;

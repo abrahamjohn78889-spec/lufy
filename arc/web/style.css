@@ -138,6 +138,8 @@ header {
 }
 .timer-meta .slug { font-size: 16px; }
 .timer-meta .sub { color: var(--dim); font-size: 11px; }
+/* Tabular figures so the two wall clocks do not jitter sideways every second. */
+.timer-meta .clocks span { font-variant-numeric: tabular-nums; color: var(--text); }
 
 /* ── key/value ────────────────────────────────────────────────────────────── */
 

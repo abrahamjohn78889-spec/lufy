@@ -188,6 +188,37 @@ class TestSerialization:
             assert payload[key] is None or isinstance(payload[key], str), key
 
 
+class TestDualTime:
+    """Every record carries IST and ET beside the canonical UTC epoch, and the
+    epoch is untouched by their presence."""
+
+    def test_every_time_field_ships_both_zones(self, store: Store) -> None:
+        slug = _market(store)
+        _frozen(store, slug, 5)
+        _order(store, slug, 5, "o1")
+        payload = ledger_records(store)[0].as_json()
+        for key in (
+            "submission_time", "fill_time", "settlement_time", "window_open", "window_close",
+        ):
+            display = payload[f"{key}_display"]
+            assert set(display) == {"utc", "utc_display", "ist", "et"}, key
+
+    def test_the_canonical_epoch_is_unchanged(self, store: Store) -> None:
+        slug = _market(store)
+        _frozen(store, slug, 5)
+        _order(store, slug, 5, "o1")
+        payload = ledger_records(store)[0].as_json()
+        assert payload["submission_time_display"]["utc"] == payload["submission_time"]
+        assert payload["window_open_display"]["utc"] == float(payload["window_ts"])
+
+    def test_an_unfilled_order_has_no_fill_clock(self, store: Store) -> None:
+        slug = _market(store)
+        _frozen(store, slug, 5)
+        _order(store, slug, 5, "o1")
+        payload = ledger_records(store)[0].as_json()
+        assert payload["fill_time_display"]["ist"] == "—"
+
+
 class TestSearchAndTotals:
     def test_search_matches_venue_order_id(self, store: Store) -> None:
         slug = _market(store)

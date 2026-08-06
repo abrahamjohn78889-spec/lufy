@@ -300,6 +300,21 @@ class TestHistoryIsTheOnlyHistory:
     def test_search_is_a_query_parameter(self, client: TestClient) -> None:
         assert client.get("/history", params={"q": "nothing-like-this"}).json()["records"] == []
 
+    def test_a_wall_clock_filter_is_read_in_the_zone_it_names(self, client: TestClient) -> None:
+        """Analytics filtering by IST or ET. The bound is converted once, on the way
+        in; what the store filters on is still the canonical epoch."""
+        far_future = {"since": "2099-01-01 00:00:00", "tz": "ist"}
+        assert client.get("/history", params=far_future).json()["records"] == []
+        assert client.get("/history", params={"since": "2000-01-01", "tz": "et"}).status_code == 200
+
+    def test_a_mistyped_filter_is_unfiltered_not_a_five_hundred(self, client: TestClient) -> None:
+        assert client.get("/history", params={"since": "last tuesday"}).status_code == 200
+
+    def test_the_csv_export_flattens_the_display_blocks(self, client: TestClient) -> None:
+        """A nested dict written verbatim would land in the file as a Python repr."""
+        body = client.get("/history", params={"format": "csv"}).text
+        assert "{" not in body
+
 
 class TestBackupIsAQueryParameter:
     def test_backup_writes_a_timestamped_local_copy(

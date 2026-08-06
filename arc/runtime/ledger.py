@@ -34,6 +34,7 @@ from arc.domain.enums import (
 from arc.domain.models import Fill, Order
 from arc.domain.money import dec_str
 from arc.storage.store import Store
+from arc.timefmt import stamps
 
 __all__ = [
     "BUFFER_NOT_SATISFIED",
@@ -127,6 +128,16 @@ class LedgerRecord:
             "submission_time": self.submission_time,
             "fill_time": self.fill_time,
             "settlement_time": self.settlement_time,
+            # The canonical epochs above are what replay, search and every
+            # calculation read. These are the same three instants rendered for a
+            # human, through the one conversion in arc.timefmt — the operator
+            # correlating a fill against the Polymarket page needs ET, and the
+            # operator watching the clock on the wall needs IST.
+            "submission_time_display": stamps(self.submission_time),
+            "fill_time_display": stamps(self.fill_time),
+            "settlement_time_display": stamps(self.settlement_time),
+            "window_open_display": stamps(self.window_ts),
+            "window_close_display": stamps(self.close_ts),
             "order_price": _s(self.order_price),
             "fill_price": _s(self.fill_price),
             "quantity": _s(self.quantity),

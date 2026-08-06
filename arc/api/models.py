@@ -40,6 +40,7 @@ from arc.execution.wallet import WalletSnapshot
 from arc.notify.telegram import CATEGORIES, CATEGORY_LABELS
 from arc.runtime.ledger import ledger_records, ledger_totals
 from arc.strategy.registry import DEFAULT_STRATEGY_ID
+from arc.timefmt import clocks, stamps
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from arc.runtime.engine import ArcRuntime
@@ -205,6 +206,11 @@ def _window_payload(run: ArcRuntime, market: MarketInstance, offset: int) -> dic
         "frozen_at": window.frozen_at,
         "fired_at": window.fired_at,
         "opens_at": activation_ts(market.close_ts, offset),
+        # Every execution window's own moments in both zones. The epochs above stay
+        # canonical; these are what the LOE panel prints beside them.
+        "opens_at_display": stamps(activation_ts(market.close_ts, offset)),
+        "frozen_at_display": stamps(window.frozen_at),
+        "fired_at_display": stamps(window.fired_at),
         "configured_buffer": _s(run.settings.trading.buffer_for(offset)),
         "implied_btc_move": _s(run.settings.trading.implied_btc_move(offset)),
     }
@@ -227,6 +233,7 @@ def market_payload(run: ArcRuntime, now: float) -> dict[str, Any]:
             "ptb": None, "signal_twap": None, "settlement_twap": None,
             "settlement_window_seconds": SETTLEMENT_WINDOW_SECONDS,
             "observation_count": 0, "windows": [], "closing": None,
+            "opens_display": stamps(None), "closes_display": stamps(None),
         }
     closing = run.rotator.closing
     return {
@@ -235,6 +242,12 @@ def market_payload(run: ArcRuntime, now: float) -> dict[str, Any]:
         "window_ts": market.window_ts,
         "close_ts": market.close_ts,
         "countdown": format_countdown(now, market.close_ts),
+        # The market's own five minutes, in both zones. The countdown above is the
+        # canonical timer; these are the wall clock either side of it, so an
+        # operator can line the market up against the Polymarket page without
+        # doing timezone arithmetic during the last ten seconds of a window.
+        "opens_display": stamps(market.window_ts),
+        "closes_display": stamps(market.close_ts),
         "next_market": slug_for(next_window_ts(market.window_ts)),
         "ptb": _s(market.ptb),
         "signal_twap": _s(market.signal_twap),
@@ -598,6 +611,11 @@ async def status_payload(run: ArcRuntime, now: float) -> dict[str, Any]:
     report = run.recovery_report
     return {
         "ts": now,
+        # The OPS Deck's wall clocks. Rendered on the backend from the same `now`
+        # every other field on this document was built from, so the clocks and the
+        # values beside them describe one instant. A browser converting its own
+        # Date() would drift from the runtime it is reporting on.
+        "clocks": clocks(now),
         "runtime": {
             "status": run.status,
             "mode": run.mode.value,

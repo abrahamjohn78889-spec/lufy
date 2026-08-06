@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from arc.logging_setup import LOGGER_NAME
+from arc.timefmt import stamps
 
 __all__ = ["MAX_EVENTS", "EventHub", "SignalEvent", "SignalTankHandler", "attach"]
 
@@ -60,6 +61,11 @@ class SignalEvent:
         return {
             "seq": self.seq,
             "ts": self.ts,
+            # Both zones travel with the event rather than being derived in the
+            # browser. One conversion, in one place (arc.timefmt), so an event in
+            # the Signal Tank, the same event in the Ledger and the same event in
+            # Telegram cannot render three different wall clocks.
+            **{k: v for k, v in stamps(self.ts).items() if k != "utc"},
             "engine": self.engine,
             "severity": self.severity,
             "event": self.event,

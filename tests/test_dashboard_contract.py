@@ -45,7 +45,7 @@ _NOW = 1_754_400_000.0
 # Keys that are genuinely counts, timestamps or flags, not money. A count rendered
 # as a string would be the opposite error: "12" sorting before "9" in the ledger.
 _NOT_MONEY = re.compile(
-    r"(^ts$|_count|_seconds|_ms|_ts|_at|_samples|_processed|_submitted|_repriced"
+    r"(^ts$|^utc$|_count|_seconds|_ms|_ts|_at|_samples|_processed|_submitted|_repriced"
     r"|_recorded|_accepted|_rejected|_frozen|_unavailable|_tables|_gb|reconnects"
     r"|seq|version)$"
 )

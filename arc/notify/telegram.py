@@ -293,7 +293,13 @@ class TelegramNotifier:
         if category is None or not self.wants(category):
             return None
         detail = str(data.get("detail", ""))
-        body = f"[ARC] {CATEGORY_LABELS[category]}\n{data.get('event', '')}"
+        # Both zones on every notification. A phone alert whose only timestamp is
+        # the phone's own arrival time is useless for correlating against the venue
+        # afterwards, and the operator's zone is not the exchange's.
+        when = ""
+        if data.get("ist") and data.get("et"):
+            when = f"\nIST: {data['ist']}\nET : {data['et']}"
+        body = f"[ARC] {CATEGORY_LABELS[category]}{when}\n{data.get('event', '')}"
         return f"{body}\n{detail}" if detail else body
 
     # ── daily summary ────────────────────────────────────────────────────────
