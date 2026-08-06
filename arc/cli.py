@@ -23,7 +23,7 @@ from decimal import Decimal
 from typing import TextIO
 
 from arc.clock import Clock, SystemClock
-from arc.config import ArcSettings, Settings, load_settings
+from arc.config import LOG_LEVELS, ArcSettings, Settings, load_settings
 from arc.domain.enums import Mode
 from arc.domain.money import dec_str
 from arc.domain.timing import (
@@ -238,6 +238,8 @@ def run(out: TextIO, clock: Clock, *, mode: Mode, market_target: int | None) -> 
     logger = setup_logging(
         settings.log_dir,
         secrets=settings.env.secret_values(),
+        level=LOG_LEVELS[settings.env.log_level],
+        timezone=settings.env.timezone,
         retention_days=settings.trading.observation_retention_days,
     )
 

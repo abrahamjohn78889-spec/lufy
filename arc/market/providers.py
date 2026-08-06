@@ -27,7 +27,7 @@ from typing import Protocol, runtime_checkable
 
 from arc.clock import Clock
 from arc.errors import ConfigInvariantError
-from arc.market.feed import RtdsFeed
+from arc.market.feed import RTDS_URL, BackoffPolicy, RtdsFeed
 
 __all__ = ["ProviderName", "TwapProvider", "build_provider"]
 
@@ -61,6 +61,8 @@ def build_provider(
     name: str,
     clock: Clock,
     *,
+    url: str = RTDS_URL,
+    backoff: BackoffPolicy | None = None,
     logger: logging.Logger | None = None,
 ) -> TwapProvider:
     """The configured provider, or a fatal configuration error.
@@ -68,6 +70,11 @@ def build_provider(
     Refuses rather than silently falling back to RTDS. An operator who configured
     Chainlink and got RTDS anyway would be trading a different price source than the
     one they believe is live, and nothing on the dashboard would say so.
+
+    `url` and `backoff` come from configuration rather than from the module
+    constants so that no endpoint or retry cadence is reachable only by editing
+    source: a hardcoded relay address is an address the operator cannot move when
+    Polymarket moves it.
     """
     try:
         provider = ProviderName(name.strip().upper())
@@ -85,4 +92,4 @@ def build_provider(
             "prices indistinguishable from real ones. Use TWAP_PROVIDER=RTDS."
         )
 
-    return RtdsFeed(clock, logger=logger)
+    return RtdsFeed(clock, url=url, backoff=backoff, logger=logger)

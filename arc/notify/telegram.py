@@ -161,7 +161,16 @@ class TelegramNotifier:
     that exists only when Telegram is set up.
     """
 
-    __slots__ = ("_chat_id", "_flags", "_last_summary", "_logger", "_sent", "_token")
+    __slots__ = (
+        "_chat_id",
+        "_enabled",
+        "_flags",
+        "_last_summary",
+        "_logger",
+        "_sent",
+        "_thread_id",
+        "_token",
+    )
 
     def __init__(
         self,
@@ -169,10 +178,17 @@ class TelegramNotifier:
         token: str,
         chat_id: str,
         flags: dict[str, bool],
+        enabled: bool = True,
+        thread_id: str = "",
         logger: logging.Logger | None = None,
     ) -> None:
         self._token = token
         self._chat_id = chat_id
+        # The master switch, separate from the per-category toggles. An operator
+        # silencing ARC for a maintenance window must not have to remember which of
+        # twenty-one categories they turned off before turning them back on.
+        self._enabled = enabled
+        self._thread_id = thread_id.strip()
         # Held by reference, not copied: the Settings page edits this dict in place so
         # a toggle takes effect immediately. A copy would keep sending until restart,
         # and the operator who muted a noisy category would not believe the switch.
@@ -183,7 +199,7 @@ class TelegramNotifier:
 
     @property
     def configured(self) -> bool:
-        return bool(self._token and self._chat_id)
+        return bool(self._enabled and self._token and self._chat_id)
 
     @property
     def flags(self) -> dict[str, bool]:
@@ -209,11 +225,15 @@ class TelegramNotifier:
         if not self.configured:
             return False
         url = f"https://api.telegram.org/bot{self._token}/sendMessage"
+        payload: dict[str, Any] = {"chat_id": self._chat_id, "text": text[:_MAX_LEN]}
+        # Only when set. Telegram rejects message_thread_id outright on a chat that
+        # is not a forum, so sending it unconditionally would make every
+        # notification fail on the ordinary chats most operators use.
+        if self._thread_id:
+            payload["message_thread_id"] = self._thread_id
         try:
             async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-                response = await client.post(
-                    url, json={"chat_id": self._chat_id, "text": text[:_MAX_LEN]}
-                )
+                response = await client.post(url, json=payload)
             response.raise_for_status()
         except Exception as exc:
             log_event(logging.WARNING, "Telegram Send Failed", str(exc), logger=self._logger)

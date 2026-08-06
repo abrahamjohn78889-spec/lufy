@@ -44,7 +44,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any, Final, TextIO
 
@@ -59,7 +59,7 @@ from arc.decision.quota import QuotaLedger
 from arc.domain.enums import Direction, MarketPhase, Mode
 from arc.domain.models import MarketInstance, Order
 from arc.domain.timing import MARKET_DURATION_SECONDS, slug_for
-from arc.errors import ArcError, FeedError, ObservationRejectedError
+from arc.errors import ArcError, ConfigInvariantError, FeedError, ObservationRejectedError
 from arc.execution.fill_engine import FillEngine
 from arc.execution.protocol import Executor
 from arc.execution.ratelimit import TokenBucket
@@ -72,6 +72,7 @@ from arc.execution.v2_live import LiveExecutor
 from arc.execution.wallet import WalletReader, WalletSnapshot, build_wallet
 from arc.logging_setup import log_event
 from arc.market.discovery import MarketDiscovery, open_discovery
+from arc.market.feed import BackoffPolicy
 from arc.market.providers import TwapProvider, build_provider
 from arc.market.ptb import (
     DEAD_REASON_PTB_UNAVAILABLE,
@@ -331,6 +332,8 @@ class ArcRuntime:
         self._notifier = TelegramNotifier(
             token=settings.env.telegram_bot_token.get_secret_value(),
             chat_id=settings.env.telegram_chat_id,
+            enabled=settings.env.telegram_enabled,
+            thread_id=settings.env.telegram_thread_id,
             flags=category_settings(store.load_settings()),
             logger=logger,
         )
@@ -1032,14 +1035,58 @@ async def build_executor(
         return PaperExecutor(), None
 
     env = settings.env
+
+    # The SDK signs and funds orders from ONE address (`wallet`; it becomes
+    # `funder_address` on every order draft). Two different addresses cannot both be
+    # honoured, so a config that names two is refused here rather than silently
+    # dropping one — an order funded from the wrong account is rejected by the venue
+    # for a reason that reads as a credential fault.
+    proxy = env.polymarket_proxy_address.strip()
+    funder = env.polymarket_funder.strip()
+    if proxy and funder and proxy.lower() != funder.lower():
+        raise ConfigInvariantError(
+            f"POLYMARKET_PROXY_ADDRESS ({proxy}) and POLYMARKET_FUNDER ({funder}) "
+            "differ. The official SDK signs and funds from a single address; set "
+            "them to the same value or leave one blank."
+        )
+    wallet = proxy or funder or None
+
+    # Endpoint overrides are applied to the SDK's own production environment rather
+    # than to a hand-built one, so the thirty-odd contract addresses ARC never
+    # configures keep coming from the SDK and cannot drift.
+    environment = polymarket.PRODUCTION
+    if (env.clob_http_url, env.clob_ws_url) != (
+        polymarket.PRODUCTION.clob_url,
+        polymarket.PRODUCTION.clob_user_ws_url,
+    ):
+        environment = replace(
+            environment,
+            clob_url=env.clob_http_url,
+            clob_user_ws_url=env.clob_ws_url,
+        )
+
     client = await polymarket.AsyncSecureClient.create(
         private_key=env.polymarket_private_key.get_secret_value(),
+        wallet=wallet,
+        environment=environment,
         credentials=polymarket.ApiKeyCreds(
             key=env.polymarket_api_key.get_secret_value(),
             secret=env.polymarket_api_secret.get_secret_value(),
             passphrase=env.polymarket_api_passphrase.get_secret_value(),
         ),
     )
+
+    # An address the operator wrote down that does not match the one the key
+    # actually controls is the single most expensive configuration error available:
+    # every balance on the dashboard would belong to an account ARC cannot trade.
+    expected = env.wallet_address.strip()
+    actual = str(client.wallet)
+    if expected and expected.lower() != actual.lower():
+        raise ConfigInvariantError(
+            f"WALLET_ADDRESS is {expected} but the configured private key controls "
+            f"{actual}. The dashboard would report balances for an account ARC "
+            "cannot trade from."
+        )
 
     def local_id(market_slug: str, venue_order_id: str) -> str:
         """Adapts the store's positional lookup to the resolver's keyword protocol."""
@@ -1074,7 +1121,18 @@ async def run_arc(
             clock=clock,
             runtime=runtime,
             discovery=discovery,
-            feed=build_provider(settings.env.twap_provider, clock, logger=logger),
+            feed=build_provider(
+                settings.env.twap_provider,
+                clock,
+                url=settings.env.rtds_url,
+                # Configured rather than constant so a deployment behind a slow link
+                # can widen the ladder without editing source.
+                backoff=BackoffPolicy(
+                    initial_seconds=settings.env.reconnect_backoff_ms / 1000,
+                    max_seconds=settings.env.reconnect_backoff_max_ms / 1000,
+                ),
+                logger=logger,
+            ),
             executor=executor,
             out=out,
             venue_client=client,

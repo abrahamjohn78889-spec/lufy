@@ -349,7 +349,10 @@
         <dt>ARC Version</dt><dd data-f="system.arc_version">—</dd>
         <dt>Git Commit</dt><dd data-f="system.git_commit">—</dd>
         <dt>PM2 Status</dt><dd data-f="system.pm2_status">—</dd>
+        <dt>PM2 Name</dt><dd data-f="system.pm2_name">—</dd>
         <dt>Restart Count</dt><dd data-f="system.restart_count">—</dd>
+        <dt>Log Level</dt><dd data-f="system.log_level">—</dd>
+        <dt>Timezone</dt><dd data-f="system.timezone">—</dd>
       </dl>
     </section>
     <section class="panel span2">
@@ -367,6 +370,19 @@
         <dt>Telegram</dt><dd data-f="settings.telegram_configured" data-flag>—</dd>
         <dt>Mode</dt><dd data-f="system.mode">—</dd>
         <dt>Runtime Uptime</dt><dd data-f="system.runtime_uptime_seconds" data-dur>—</dd>
+      </dl>
+    </section>
+    <section class="panel span2">
+      <h2>Venue</h2>
+      <!-- The endpoints ARC is actually dialling, not the ones .env was meant to
+           set. An operator debugging a dead connection needs to see the value in
+           force, not re-derive it from a file they cannot read over the tunnel. -->
+      <dl class="kv">
+        <dt>CLOB Host</dt><dd data-f="system.clob_host">—</dd>
+        <dt>CLOB HTTP</dt><dd data-f="system.clob_http_url">—</dd>
+        <dt>CLOB WS</dt><dd data-f="system.clob_ws_url">—</dd>
+        <dt>Network</dt><dd data-f="system.network_id">—</dd>
+        <dt>Chain ID</dt><dd data-f="system.chain_id">—</dd>
       </dl>
     </section>
     <section class="panel span2">

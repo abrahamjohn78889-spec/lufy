@@ -346,6 +346,10 @@ def settings_payload(run: ArcRuntime) -> dict[str, Any]:
         "strategy": DEFAULT_STRATEGY_ID,
         "strategy_editable": False,
         "provider": run.settings.env.twap_provider,
+        # Presentation, shipped rather than hardcoded in the markup so a theme or a
+        # repaint cadence set in .env is the one the browser actually uses.
+        "theme": run.settings.env.theme,
+        "refresh_rate_ms": run.settings.env.refresh_rate_ms,
         # Twenty-one independent toggles, carried on /settings rather than a route of
         # their own: the twelve-route surface is an acceptance criterion (A15).
         "notifications": {
@@ -440,6 +444,18 @@ def system_payload(run: ArcRuntime, now: float) -> dict[str, Any]:
         "rtds": run.watchdog.status,
         "websocket": run.feed.url,
         "rpc": run.venue_client is not None,
+        # The endpoints and chain this process is actually dialling, read from the
+        # live configuration rather than from constants in the markup. An operator
+        # who overrode a CLOB host in .env must be able to confirm the override took
+        # without SSHing in to read the file back.
+        "clob_host": run.settings.env.clob_host,
+        "clob_http_url": run.settings.env.clob_http_url,
+        "clob_ws_url": run.settings.env.clob_ws_url,
+        "network_id": run.settings.env.network_id,
+        "chain_id": run.settings.env.chain_id,
+        "pm2_name": run.settings.env.pm2_name,
+        "log_level": run.settings.env.log_level,
+        "timezone": run.settings.env.timezone,
         "restart_count": run.restart_count,
         "runtime_uptime_seconds": max(now - run.started_at, 0.0) if run.started_at else 0.0,
         "mode": run.mode.value,

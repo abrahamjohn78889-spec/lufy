@@ -23,8 +23,10 @@ import logging
 import logging.handlers
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Final
+from zoneinfo import ZoneInfo
 
 __all__ = [
     "LOGGER_NAME",
@@ -136,6 +138,13 @@ class RedactionFilter(logging.Filter):
 class ArcLineFormatter(logging.Formatter):
     """Formats a record as one plain line: HH:MM:SS, marker, event, detail."""
 
+    def __init__(self, timezone: str = "") -> None:
+        super().__init__()
+        # Blank means the host's own zone. A name pins it, which is what lets a VPS
+        # in one region write timestamps an operator in another can line up against
+        # the Polymarket page without doing arithmetic during an incident.
+        self._zone = ZoneInfo(timezone) if timezone else None
+
     # Local time, not UTC. The operator reads these beside the Polymarket page and
     # a UTC log next to a local-time countdown makes every incident harder to
     # reconstruct than it needs to be.
@@ -143,7 +152,9 @@ class ArcLineFormatter(logging.Formatter):
     def formatTime(
         self, record: logging.LogRecord, datefmt: str | None = None
     ) -> str:
-        return time.strftime("%H:%M:%S", time.localtime(record.created))
+        if self._zone is None:
+            return time.strftime("%H:%M:%S", time.localtime(record.created))
+        return datetime.fromtimestamp(record.created, self._zone).strftime("%H:%M:%S")
 
     def format(self, record: logging.LogRecord) -> str:
         marker = _LEVEL_MARKERS.get(record.levelno, " ")
@@ -167,6 +178,7 @@ def setup_logging(
     *,
     secrets: tuple[str, ...] = (),
     level: int = logging.INFO,
+    timezone: str = "",
     console: bool = True,
     retention_days: int = 30,
 ) -> logging.Logger:
@@ -189,7 +201,7 @@ def setup_logging(
         logger.removeHandler(handler)
         handler.close()
 
-    formatter = ArcLineFormatter()
+    formatter = ArcLineFormatter(timezone)
     redaction = RedactionFilter(secrets)
 
     file_handler = logging.handlers.TimedRotatingFileHandler(

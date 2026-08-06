@@ -26,6 +26,7 @@ import pytest
 from pydantic import ValidationError
 
 from arc.config import (
+    _SECRET_FIELDS,
     ArcSettings,
     TradingConfig,
     build_trading_config,
@@ -748,8 +749,11 @@ class TestSecretsNeverAppearInText:
             assert secret not in rendered
 
     def test_redacted_dump_reports_unset_for_empty_secrets(self) -> None:
+        """Driven off the secret list, not a name prefix. Wallet addresses are
+        public and share the polymarket_ prefix; reporting one as UNSET would
+        hide a misconfigured funder behind what reads as a missing credential."""
         dump = _env().redacted_dump()
-        assert all(dump[f] == "UNSET" for f in dump if f.startswith("polymarket_"))
+        assert all(dump[f] == "UNSET" for f in _SECRET_FIELDS)
 
     def test_redacted_dump_covers_every_field(self) -> None:
         """A field added later must not silently escape the dump."""

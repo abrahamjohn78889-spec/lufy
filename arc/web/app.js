@@ -99,6 +99,7 @@ function paint() {
   paintSettings();
   paintWarnings();
   paintErrorSummary();
+  applyPresentation();
   tickTimers();
 }
 
@@ -389,10 +390,32 @@ function connect() {
 
 // A frame that never arrives is a dead socket the browser has not noticed. Without
 // this the page would show the last frame indefinitely with LIVE still lit.
-setInterval(() => {
+// The cadence is re-armed from the configured refresh rate on the first frame:
+// a hardcoded interval would be configuration the operator cannot reach.
+let timerHandle = setInterval(tick, 250);
+let timerRate = 250;
+
+function tick() {
   if (lastFrame && performance.now() - lastFrame > 5000) setLive(false);
   tickTimers();
-}, 250);
+}
+
+// Theme and repaint cadence come from the backend, not from constants here. A
+// value the markup hardcodes is a value .env cannot change, which is exactly the
+// hidden configuration this dashboard is not allowed to have.
+function applyPresentation() {
+  if (!state || !state.settings) return;
+  const theme = state.settings.theme;
+  if (theme && document.documentElement.dataset.theme !== theme) {
+    document.documentElement.dataset.theme = theme;
+  }
+  const rate = state.settings.refresh_rate_ms;
+  if (rate && rate !== timerRate) {
+    timerRate = rate;
+    clearInterval(timerHandle);
+    timerHandle = setInterval(tick, rate);
+  }
+}
 
 // ── actions ──────────────────────────────────────────────────────────────────
 

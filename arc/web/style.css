@@ -23,6 +23,24 @@
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
 }
 
+/*
+  The second shipped theme. Only the palette variables are overridden — every
+  layout rule below is shared, so a panel added later cannot exist in one theme
+  and be missing from the other. Reds and greens keep their hue and are darkened
+  rather than re-picked: UP and DOWN must read the same way in both themes.
+*/
+:root[data-theme="light"] {
+  --bg: #f4f6fa;
+  --panel: #ffffff;
+  --line: #d5dbe5;
+  --text: #16202e;
+  --dim: #5c6879;
+  --green: #1a7f47;
+  --amber: #9a6800;
+  --red: #c0281f;
+  --accent: #1667c4;
+}
+
 * { box-sizing: border-box; }
 
 body {

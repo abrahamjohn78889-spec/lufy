@@ -1,11 +1,25 @@
 """Configuration.
 
-Two layers, and the order matters:
+PRECEDENCE, highest wins:
 
-  1. .env seeds the settings ONCE, on the very first startup.
-  2. From then on SQLite is the source of truth and the Settings page edits it.
-     Every later startup loads the saved configuration and ignores .env for
-     trading values.
+    1. CLI arguments          `arc run --mode=v2` beats ARC_MODE in .env
+    2. SQLite operator settings   the Settings page, for trading values
+    3. .env                   seeds SQLite once; sole source for infrastructure
+    4. Built-in defaults      infrastructure only — never a trading value
+
+The split at rung 2 is deliberate and is the whole reason this file has two
+layers. TRADING values (buffers, sizing, quota, entry band, cancel lead) are
+operator-owned: .env seeds them on the very first startup and SQLite is the
+source of truth from then on, so an operator who changed a buffer in the UI does
+not have it silently reverted by a stale .env on the next restart. INFRASTRUCTURE
+values (endpoints, credentials, bind address, log level, provider) are
+deployment-owned and read from .env on every startup, because a credential
+reachable from a web form is a credential that can be replaced from a web form.
+
+Rung 4 exists for infrastructure only. There are NO default values for trading
+parameters: a missing buffer is an error, never a substituted guess — an invented
+number that reaches the trading path is indistinguishable, afterwards, from one
+the operator chose.
 
 An invalid configuration is FATAL and exits non-zero. That is the one thing that
 DOES refuse to boot — documentation uncertainty never does (A8). The reason every
@@ -22,20 +36,49 @@ indistinguishable, afterwards, from one the operator chose.
 from __future__ import annotations
 
 import ipaddress
+import logging
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import AliasChoices, Field, SecretStr, field_validator
+import polymarket
+from pydantic import AliasChoices, Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from arc.domain.enums import Mode
 from arc.domain.money import dec_str, to_decimal
 from arc.domain.timing import MARKET_DURATION_SECONDS
 from arc.errors import BindAddressError, ConfigInvariantError
+from arc.market.providers import ProviderName
 
-__all__ = ["ArcSettings", "Settings", "TradingConfig", "load_settings"]
+__all__ = [
+    "LOG_LEVELS",
+    "THEMES",
+    "ArcSettings",
+    "Settings",
+    "TradingConfig",
+    "load_settings",
+]
+
+# Endpoint and chain defaults come from the official SDK's own production
+# environment rather than from string literals here. A hand-copied hostname is a
+# hostname that silently stops matching the SDK the day Polymarket moves one, and
+# the failure mode is a bot connecting confidently to an address nobody serves.
+_PRODUCTION: Final[polymarket.Environment] = polymarket.PRODUCTION
+
+LOG_LEVELS: Final[dict[str, int]] = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+}
+
+# Two stylesheets ship. Named rather than free text so a typo is a startup error
+# instead of a dashboard that renders unstyled and looks broken.
+THEMES: Final[tuple[str, ...]] = ("dark", "light")
+
 
 # Trading keys that live in SQLite after first run. .env supplies them once.
 TRADING_KEYS: Final[tuple[str, ...]] = (
@@ -104,7 +147,18 @@ class ArcSettings(BaseSettings):
 
     db_path: str = "data/arc.db"
     log_dir: str = "logs"
+    log_level: str = "INFO"
     observation_retention_days: int = 90
+
+    # Local time is what the operator reads beside the Polymarket page, so the log
+    # formatter and the countdown must agree on which "local" that is. Blank means
+    # the host's own zone; a name here (Europe/London) pins it, which is what makes
+    # a VPS in one region readable by an operator in another.
+    timezone: str = ""
+
+    # Purely descriptive: the name to look for in `pm2 list`. ARC never spawns or
+    # signals PM2 — it only reports whether PM2 spawned IT (see system_payload).
+    pm2_name: str = "arc"
 
     execution_windows: str = ""
     buffers: str = ""
@@ -149,6 +203,10 @@ class ArcSettings(BaseSettings):
     # it on the Settings page would let it be swapped mid-market.
     twap_provider: str = "RTDS"
 
+    # The RTDS relay. Defaulted from the official SDK's production environment, not
+    # from a literal, so the address ARC dials is the address the SDK ships.
+    rtds_url: str = _PRODUCTION.rtds_ws_url
+
     # Chainlink is configuration-ready and unimplemented (see market/providers.py).
     # No feed ID is defaulted: a guessed identifier would yield prices that look real.
     chainlink_api_key: SecretStr = SecretStr("")
@@ -176,12 +234,142 @@ class ArcSettings(BaseSettings):
     polymarket_api_passphrase: SecretStr = SecretStr("")
     polymarket_private_key: SecretStr = SecretStr("")
 
+    # The proxy wallet the orders are signed FOR, when it differs from the address
+    # the private key derives. Blank means "the SDK derives it", which is the
+    # documented default. Set wrongly it is not a small error: orders would be
+    # signed against an account holding none of the collateral, and every one of
+    # them would be refused by the venue for a reason that reads as a key problem.
+    polymarket_proxy_address: str = ""
+
+    # The account whose collateral funds the orders. Blank = the proxy address.
+    # Separate from the proxy because the two differ on relayer-funded setups.
+    polymarket_funder: str = ""
+
+    # CLOB endpoints. Defaulted from the official SDK production environment for the
+    # same reason as rtds_url: three hand-copied hostnames are three chances to be
+    # subtly out of date, in the one component that places real orders.
+    clob_host: str = _PRODUCTION.clob_url
+    clob_http_url: str = _PRODUCTION.clob_url
+    clob_ws_url: str = _PRODUCTION.clob_user_ws_url
+
+    # Wallet identity, for display and for the operator's own cross-check against
+    # Polymarket. ARC never derives the address from the key here — the SDK owns
+    # that derivation, and a second implementation of it would eventually disagree
+    # with the first while both looked correct.
+    wallet_address: str = ""
+    network_id: str = _PRODUCTION.name
+    chain_id: int = _PRODUCTION.chain_id
+
     # Telegram is notification only and can never control trading. Bootstrap-only,
     # like the provider: the per-category toggles live in the settings table and are
     # editable from the dashboard, but the credential is not, because a bot token
     # reachable from a web form is a bot token that can be replaced from a web form.
+    telegram_enabled: bool = True
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_chat_id: str = ""
+    # Forum topic id, for a chat organised into threads. Blank posts to the chat
+    # root, which is what a non-forum chat requires — sending a thread id to a
+    # non-forum chat is rejected outright and every notification silently fails.
+    telegram_thread_id: str = ""
+
+    # How long a dropped connection waits before its first retry, and how long the
+    # exponential ladder is allowed to grow to. The ceiling is what stops a long
+    # outage from stretching the retry interval past the length of a market, which
+    # would mean waking up already too late for the next one.
+    reconnect_backoff_ms: int = 500
+    reconnect_backoff_max_ms: int = 30_000
+
+    # How often the browser repaints from the state it already holds. It is NOT a
+    # poll interval — the dashboard never polls (the socket pushes), and this only
+    # sets how often the countdown re-renders between frames.
+    refresh_rate_ms: int = 250
+    theme: str = "dark"
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _validate_log_level(cls, v: Any) -> Any:
+        """Reject an unknown level rather than falling back to INFO.
+
+        A silent fallback is the worst outcome here: an operator who set DEBUG to
+        chase a fault would get INFO and conclude the fault produced no logging.
+        """
+        candidate = str(v).strip().upper()
+        if candidate not in LOG_LEVELS:
+            raise ValueError(
+                f"LOG_LEVEL must be one of {sorted(LOG_LEVELS)}, got {v!r}"
+            )
+        return candidate
+
+    @field_validator("theme", mode="before")
+    @classmethod
+    def _validate_theme(cls, v: Any) -> Any:
+        """A typo'd theme name would load no stylesheet; the dashboard renders
+        unstyled and reads as broken rather than as misconfigured."""
+        candidate = str(v).strip().lower()
+        if candidate not in THEMES:
+            raise ValueError(f"THEME must be one of {list(THEMES)}, got {v!r}")
+        return candidate
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, v: str) -> str:
+        """An unknown zone name must fail at startup, not at the first log line.
+
+        Blank keeps the host zone. A name is resolved here so a typo surfaces
+        immediately instead of raising inside the log formatter, where the
+        exception would be swallowed by logging's own error handling and the
+        timestamps would quietly stay in the wrong zone.
+        """
+        name = v.strip()
+        if not name:
+            return ""
+        try:
+            ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"TIMEZONE {name!r} is not a known IANA zone name") from exc
+        return name
+
+    @field_validator(
+        "api_port",
+        "reconnect_backoff_ms",
+        "reconnect_backoff_max_ms",
+        "refresh_rate_ms",
+    )
+    @classmethod
+    def _validate_positive(cls, v: int) -> int:
+        """Zero or negative here is not a slower setting, it is a busy loop: a
+        0 ms backoff reconnects without pause and a 0 ms refresh repaints every
+        frame, both of which peg a CPU on a box that has one."""
+        if v <= 0:
+            raise ValueError(f"must be positive, got {v}")
+        return v
+
+    @field_validator("reconnect_backoff_max_ms")
+    @classmethod
+    def _validate_backoff_ceiling(cls, v: int, info: ValidationInfo) -> int:
+        """A ceiling below the initial delay makes the ladder shrink instead of
+        grow, so a long outage retries fastest exactly when the venue is least
+        able to answer."""
+        initial = info.data.get("reconnect_backoff_ms")
+        if isinstance(initial, int) and v < initial:
+            raise ValueError(
+                f"RECONNECT_BACKOFF_MAX_MS ({v}) must be at least "
+                f"RECONNECT_BACKOFF_MS ({initial})"
+            )
+        return v
+
+    @field_validator("twap_provider", mode="before")
+    @classmethod
+    def _validate_provider(cls, v: Any) -> Any:
+        """Only the two names the runtime knows. An unrecognised provider must not
+        silently leave RTDS running — the operator would believe the switch took."""
+        candidate = str(v).strip().upper()
+        if candidate not in {p.value for p in ProviderName}:
+            raise ValueError(
+                f"TWAP_PROVIDER must be one of "
+                f"{sorted(p.value for p in ProviderName)}, got {v!r}"
+            )
+        return candidate
 
     @field_validator("mode", mode="before")
     @classmethod
