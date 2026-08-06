@@ -157,7 +157,19 @@ class RuntimeSupervisor:
                 )
             # A fresh object graph every time. See the module docstring.
             await self._teardown_resources()
-            self.mode = mode
+            previous, self.mode = self.mode, mode
+            if previous is not mode:
+                # Its own line, not left to be inferred from a stop followed by a
+                # start. V1 → V2 is the transition from simulated to real money,
+                # and it is the one event the operator must be able to find
+                # afterwards. Emitted whichever path got here — the dashboard's
+                # STOP-then-START and `switch()` are the same change.
+                log_event(
+                    logging.INFO,
+                    "Runtime Switched",
+                    f"{previous.value} → {mode.value}  (trading disarmed)",
+                    logger=self._logger,
+                )
             self.runtime = await self._build_live(mode)
             self._task = asyncio.create_task(
                 self.runtime.run(market_target=market_target), name=f"arc-runtime-{mode.value}"

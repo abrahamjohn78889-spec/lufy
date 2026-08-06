@@ -1,4 +1,4 @@
-"""Telegram: twenty-one toggles, notification only, and no inbound path at all.
+"""Telegram: twenty-five toggles, notification only, and no inbound path at all.
 
 The failures pinned here are the ones that would be discovered at the wrong time: a
 category mapped to an event name that no engine actually logs (so the operator is
@@ -33,6 +33,8 @@ _ARC = Path(__file__).resolve().parent.parent / "arc"
 _EXPECTED = (
     "Startup",
     "Shutdown",
+    "Runtime Switched",
+    "Trading Started / Paused / Resumed / Stopped",
     "Fatal Errors",
     "Warnings",
     "Feed Disconnect",
@@ -43,12 +45,14 @@ _EXPECTED = (
     "PTB Frozen",
     "Window Open",
     "Direction Frozen",
+    "Trigger Fired",
     "ExecutionIntent Created",
     "Order Submitted",
     "Partial Fill",
     "Order Filled",
     "Cancelled",
     "Rejected",
+    "Reconciled",
     "BUFFER_NOT_SATISFIED",
     "Settlement",
     "Daily Summary",
@@ -68,10 +72,10 @@ def _signal(event: str, severity: str = "INFO", engine: str = "Runtime") -> dict
     }
 
 
-class TestTwentyOneCategories:
+class TestTheCategories:
     def test_exactly_the_categories_the_spec_names(self) -> None:
         assert tuple(CATEGORY_LABELS.values()) == _EXPECTED
-        assert len(CATEGORIES) == 21
+        assert len(CATEGORIES) == 25
 
     def test_each_is_independently_toggleable(self) -> None:
         notifier = _notifier(warnings=False)
@@ -119,7 +123,23 @@ class TestEveryMappedEventActuallyExists:
                     and isinstance(node.func, ast.Name)
                     and node.func.id == "log_event"
                     and len(node.args) >= 2
+                ) or (
+                    # `_log_gate(title, detail)` is a one-line wrapper that forwards
+                    # its first argument straight to log_event as the label. The
+                    # literal lives at the call site, so without this the four
+                    # operator gate events read as invented names.
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "_log_gate"
+                    and len(node.args) >= 1
                 ):
+                    if isinstance(node.func, ast.Attribute):
+                        emitted.update(
+                            sub.value
+                            for sub in ast.walk(node.args[0])
+                            if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+                        )
+                        continue
                     # Every string literal in the label position, not just a bare
                     # Constant: several sites choose between two labels inline
                     # (`"Order Filled" if complete else "Partial Fill"`), and those
@@ -133,7 +153,7 @@ class TestEveryMappedEventActuallyExists:
         assert not missing, f"mapped but never logged anywhere in arc/: {missing}"
 
     def test_every_category_except_the_summary_has_a_source(self) -> None:
-        """Daily Summary is sent directly; the other twenty come from events."""
+        """Daily Summary is sent directly; the rest come from events."""
         reachable = set(EVENT_CATEGORY.values()) | {"fatal_errors", "warnings", "daily_summary"}
         assert set(CATEGORIES) - reachable == set()
 

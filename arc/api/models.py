@@ -179,7 +179,8 @@ def preflight(run: ArcRuntime) -> dict[str, Any]:
     worst = "FAIL" if any(c["result"] == "FAIL" for c in checks) else (
         "WARNING" if any(c["result"] == "WARNING" for c in checks) else "PASS"
     )
-    return {"result": worst, "checks": checks, "spec_status": spec.status.value,
+    return {"result": worst, "checks": checks, "ready": live and worst != "FAIL",
+            "spec_status": spec.status.value,
             "spec_reason": spec.reason, "spec_unresolved": list(spec.unresolved())}
 
 

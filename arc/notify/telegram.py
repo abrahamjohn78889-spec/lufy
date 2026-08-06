@@ -1,4 +1,4 @@
-"""Telegram notifications. Twenty-one categories, each independently toggleable.
+"""Telegram notifications. Twenty-five categories, each independently toggleable.
 
 NOTIFICATION ONLY. Nothing here can start, stop, arm, disarm, submit, cancel or
 configure anything, and there is no inbound path at all — no polling, no webhook, no
@@ -38,10 +38,12 @@ __all__ = [
     "notification_values",
 ]
 
-# The twenty-one categories, in the order the Settings page lists them.
+# The twenty-five categories, in the order the Settings page lists them.
 CATEGORY_LABELS: Final[dict[str, str]] = {
     "startup": "Startup",
     "shutdown": "Shutdown",
+    "runtime_switched": "Runtime Switched",
+    "trading_control": "Trading Started / Paused / Resumed / Stopped",
     "fatal_errors": "Fatal Errors",
     "warnings": "Warnings",
     "feed_disconnect": "Feed Disconnect",
@@ -52,12 +54,14 @@ CATEGORY_LABELS: Final[dict[str, str]] = {
     "ptb_frozen": "PTB Frozen",
     "window_open": "Window Open",
     "direction_frozen": "Direction Frozen",
+    "trigger_fired": "Trigger Fired",
     "intent_created": "ExecutionIntent Created",
     "order_submitted": "Order Submitted",
     "partial_fill": "Partial Fill",
     "order_filled": "Order Filled",
     "cancelled": "Cancelled",
     "rejected": "Rejected",
+    "reconciled": "Reconciled",
     "buffer_not_satisfied": "BUFFER_NOT_SATISFIED",
     "settlement": "Settlement",
     "daily_summary": "Daily Summary",
@@ -72,6 +76,14 @@ CATEGORIES: Final[tuple[str, ...]] = tuple(CATEGORY_LABELS)
 EVENT_CATEGORY: Final[dict[str, str]] = {
     "Runtime Started": "startup",
     "Runtime Stopped": "shutdown",
+    "Runtime Switched": "runtime_switched",
+    # The four operator gate changes. One category rather than four, because they
+    # are one decision the operator keeps revising and an operator who muted
+    # "Trading Paused" almost certainly meant to mute all four.
+    "Trading Started": "trading_control",
+    "Trading Paused": "trading_control",
+    "Trading Resumed": "trading_control",
+    "Trading Stopped": "trading_control",
     "Feed Disconnected": "feed_disconnect",
     "Feed Connected": "feed_reconnect",
     "Wallet Disconnected": "wallet_disconnect",
@@ -83,15 +95,23 @@ EVENT_CATEGORY: Final[dict[str, str]] = {
     # direction, the TWAP, the PTB, the buffer and the trigger.
     "Window Frozen": "direction_frozen",
     "Window No Direction": "direction_frozen",
+    # Firing is the instant the locked trigger is crossed, which is a different
+    # moment from the freeze and the one the operator is waiting on.
+    "Window Fired": "trigger_fired",
     "Intent Created": "intent_created",
     "Orders Submitted": "order_submitted",
     "Partial Fill": "partial_fill",
     "Order Filled": "order_filled",
     "Sweep Complete": "cancelled",
     "Cancel Unknown": "cancelled",
+    # An INDETERMINATE order resolved against the venue. Its own category because
+    # it is the answer to "did that order exist", and a reconciliation the operator
+    # never saw is a position they do not know they hold.
+    "Order Reconciled": "reconciled",
     "Post-Only Would Cross": "rejected",
     "Intent Denied": "rejected",
     "Submission Skipped": "rejected",
+    "Order Rejected": "rejected",
     "Order Unknown": "rejected",
     # A window whose trigger never crossed is BUFFER_NOT_SATISFIED. It is a strategy
     # outcome, not an error, which is why it is its own category rather than a warning.
@@ -153,7 +173,7 @@ def category_for(event: str, severity: str) -> str | None:
 
 
 class TelegramNotifier:
-    """One worker task, one chat, twenty-one toggles.
+    """One worker task, one chat, twenty-five toggles.
 
     Constructed even when unconfigured: `configured` is then False and `run` returns
     immediately, so the runtime needs no branch around it and an operator who fills
@@ -186,7 +206,7 @@ class TelegramNotifier:
         self._chat_id = chat_id
         # The master switch, separate from the per-category toggles. An operator
         # silencing ARC for a maintenance window must not have to remember which of
-        # twenty-one categories they turned off before turning them back on.
+        # twenty-five categories they turned off before turning them back on.
         self._enabled = enabled
         self._thread_id = thread_id.strip()
         # Held by reference, not copied: the Settings page edits this dict in place so

@@ -121,6 +121,10 @@
 
     <section class="panel span2">
       <h2>Preflight <span class="pill" data-f="preflight.result">—</span></h2>
+      <!-- READY is derived, never a runtime status: the status set is exactly the
+           five the contract names, and a sixth would be a second answer to "is it
+           running". This says the fifteen subsystems are up. -->
+      <div class="kv"><span>Runtime Verification</span><b data-f="preflight.ready" data-flag>—</b></div>
       <div id="preflight" class="checks"></div>
     </section>
 

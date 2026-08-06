@@ -180,3 +180,11 @@ python -m ruff check . && python -m mypy arc && python -m pytest -q -p no:random
 
 All three must pass. Work commits directly to `main`; there are no feature,
 development or long-lived branches, and the repository stays production-ready.
+
+## Further documentation
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layers, the two lifecycles,
+  the event stream.
+- [docs/PRODUCTION_CHECKLIST.md](docs/PRODUCTION_CHECKLIST.md) — what to verify
+  before the first live window.
+- `.env.example` — every configuration key, with its default.

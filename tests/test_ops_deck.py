@@ -295,6 +295,23 @@ class TestPreflight:
         failed = {c["check"] for c in report["checks"] if c["result"] == "FAIL"}
         assert failed <= {"Risk Engine"}, failed
 
+    def test_ready_is_derived_and_is_not_a_sixth_runtime_status(
+        self, run: ArcRuntime
+    ) -> None:
+        """Runtime Verification is a preflight conclusion, not a RuntimeStatus. The
+        status set is exactly the five the contract names; a sixth would be a second
+        answer to "is it running" that could disagree with the first."""
+        from arc.runtime.engine import RuntimeStatus
+
+        report = preflight(run)
+        # Idle: never ready, whatever the individual checks say.
+        assert report["ready"] is False
+        assert 'data-f="preflight.ready"' in _OPS
+        assert not hasattr(RuntimeStatus, "READY")
+        assert "READY" not in {
+            v for k, v in vars(RuntimeStatus).items() if isinstance(v, str) and k.isupper()
+        }
+
     def test_the_failing_names_the_start_route_reports_are_real_keys(
         self, run: ArcRuntime
     ) -> None:
