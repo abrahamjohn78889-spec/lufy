@@ -197,23 +197,36 @@ class TestDecimalContract:
 
 
 class TestBothGatesAreIndependent:
-    def test_start_refuses_while_the_system_gate_is_closed(
-        self, client: TestClient, run: ArcRuntime
-    ) -> None:
-        """State 4: the operator can never override the system flag (Q1)."""
-        run.state.disable_trading("SPEC_UNVERIFIED")
-        response = client.post("/start")
-        assert response.status_code == 409
-        assert "SPEC_UNVERIFIED" in response.json()["detail"]
-        assert run.state.execution_armed is False
+    """The operator gate lives on the Limit Order Engine's config route.
 
-    def test_stop_disarms_without_touching_the_system_gate(
+    Not on `/start`: that boots the runtime and deliberately arms nothing, so the
+    two gates are tested where the operator actually presses them.
+    """
+
+    ARM = "/strategies/arc_twap_locked_buffer/config?action=arm"
+    DISARM = "/strategies/arc_twap_locked_buffer/config?action=disarm"
+
+    def test_arming_cannot_open_a_closed_system_gate(
         self, client: TestClient, run: ArcRuntime
     ) -> None:
-        run.state.record_spec_status(run.state.spec_status)
+        """State 4: the operator can never override the system flag (Q1).
+
+        Arming is allowed to succeed; what must not happen is a submission. The
+        system gate is checked at decision time, so an armed operator over a
+        disabled system still trades nothing.
+        """
+        run.state.disable_trading("SPEC_UNVERIFIED")
+        client.post(self.ARM)
+        assert run.state.trading_enabled is False
+        assert run.state.gate.reason == "SPEC_UNVERIFIED"
+
+    def test_disarming_does_not_touch_the_system_gate(
+        self, client: TestClient, run: ArcRuntime
+    ) -> None:
         run.arm()
-        assert client.post("/stop").json()["execution_armed"] is False
-        assert run.state.trading_enabled is run.state.trading_enabled
+        body = client.post(self.DISARM).json()
+        assert body["execution_armed"] is False
+        assert body["trading_enabled"] is run.state.trading_enabled
 
     def test_pause_and_resume_do_not_clear_the_arm_state(
         self, client: TestClient, run: ArcRuntime
@@ -262,9 +275,16 @@ class TestStrategyIsReadOnly:
         assert entries[0]["pinned"] is True
         assert entries[0]["disableable"] is False
 
-    def test_config_is_not_writable(self, client: TestClient) -> None:
-        """A17: the strategy is pinned, so the write path must refuse rather than exist."""
-        assert client.post("/strategies/arc_twap_locked_buffer/config").status_code == 405
+    def test_the_parameters_are_not_writable(self, client: TestClient) -> None:
+        """A17: the strategy is pinned, so the parameter write path must refuse.
+
+        The route itself is not refused outright any more — it carries START and
+        STOP TRADING — but a POST that tries to edit the strategy still 405s and
+        the message says where buffers and windows are edited instead.
+        """
+        response = client.post("/strategies/arc_twap_locked_buffer/config")
+        assert response.status_code == 405
+        assert "Settings page" in response.json()["detail"]
 
     def test_an_unknown_strategy_is_a_404_not_a_default(self, client: TestClient) -> None:
         assert client.get("/strategies/nope").status_code == 404

@@ -75,26 +75,47 @@
       <div id="engines" class="engines"></div>
     </section>
 
-    <!-- Trading control. Two independent gates, displayed independently: a single
-         combined "can trade" light would hide the state where the system has
-         overridden the operator, which is the state they most need named. -->
+    <!-- Runtime and trading, displayed as the two separate acts they are. Starting
+         the runtime brings up feeds, CLOB, engines and recovery and arms nothing;
+         trading is the operator's own button afterwards. One combined control
+         would make looking at the system the same act as trading with it. -->
     <section class="panel span2">
-      <h2>Trading Control</h2>
+      <h2>Runtime Control</h2>
       <div class="mode-row">
-        <div class="mode" id="mode-v1">V1 · PAPER</div>
-        <div class="mode" id="mode-v2">V2 · LIVE</div>
+        <button class="mode" id="mode-v1" data-mode="V1">V1 · PAPER</button>
+        <button class="mode" id="mode-v2" data-mode="V2">V2 · LIVE</button>
       </div>
       <p class="note">
-        Mode is fixed at launch (<code>arc run --mode=v1|v2</code>) so the two can
-        never run at once. Runtime running is not trading running.
+        Select a runtime, then START RUNTIME. The two can never run at once — starting
+        one stops the other. Runtime running is not trading running.
       </p>
       <div class="controls">
-        <button class="big go" data-post="/start">START TRADING</button>
-        <button class="big stop" data-post="/stop">STOP TRADING</button>
+        <button class="big go" id="runtime-start">START RUNTIME</button>
+        <button class="big stop" data-post="/stop">STOP RUNTIME</button>
+      </div>
+      <div id="control-msg" class="msg"></div>
+    </section>
+
+    <section class="panel span2">
+      <h2>Trading Control</h2>
+      <p class="note">
+        The Limit Order Engine's own gate. Configure buffers, windows and submission
+        count on the Settings page first; START TRADING opens the operator gate and
+        nothing else. STOP TRADING holds new submissions and leaves every feed,
+        accumulator and recovery service running.
+      </p>
+      <div class="controls">
+        <button class="big go" data-post="/strategies/arc_twap_locked_buffer/config?action=arm">
+          START TRADING
+        </button>
+        <button class="big stop"
+                data-post="/strategies/arc_twap_locked_buffer/config?action=disarm">
+          STOP TRADING
+        </button>
         <button data-post="/pause">Pause</button>
         <button data-post="/resume">Resume</button>
       </div>
-      <div id="control-msg" class="msg"></div>
+      <div id="trading-msg" class="msg"></div>
     </section>
 
     <section class="panel span2">

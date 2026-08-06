@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final
@@ -937,6 +937,35 @@ class Settings:
 
     def redacted_dump(self) -> dict[str, str]:
         return self.env.redacted_dump()
+
+    def with_mode(self, mode: Mode) -> Settings:
+        """The same configuration, for the other runtime mode.
+
+        The operator selects V1 or V2 in the dashboard, so the mode that actually
+        runs is no longer fixed by `.env` at process start. Everything else — the
+        endpoints, the credentials, the whole validated TradingConfig — is carried
+        across unchanged; only the mode moves, because the mode is the ONE thing
+        that differs between the two runtimes (Q4).
+
+        Switching to V2 re-checks the venue credentials here rather than letting
+        `build_executor` discover the gap. The SDK's own failure for an empty
+        private key is a signing error raised deep inside a client constructor,
+        and an operator reading it would be debugging a key they never set.
+        """
+        if mode is self.env.mode:
+            return self
+        env = self.env.model_copy(update={"mode": mode})
+        if mode is Mode.V2 and not env.has_credentials():
+            missing = [
+                n.upper()
+                for n in _VENUE_SECRET_FIELDS
+                if not getattr(env, n).get_secret_value()
+            ]
+            raise ConfigInvariantError(
+                f"V2 (live) requires credentials; unset: {', '.join(missing)}. "
+                "Set them in .env and restart. V1 needs none of them."
+            )
+        return replace(self, env=env)
 
 
 def env_trading_values(env: ArcSettings) -> dict[str, str]:

@@ -71,9 +71,8 @@ from arc.execution.v1_paper import PaperExecutor
 from arc.execution.v2_live import LiveExecutor
 from arc.execution.wallet import WalletReader, WalletSnapshot, build_wallet
 from arc.logging_setup import log_event
-from arc.market.discovery import MarketDiscovery, open_discovery
-from arc.market.feed import BackoffPolicy
-from arc.market.providers import TwapProvider, build_provider
+from arc.market.discovery import MarketDiscovery
+from arc.market.providers import TwapProvider
 from arc.market.ptb import (
     DEAD_REASON_PTB_UNAVAILABLE,
     PreviousClosePtbCache,
@@ -1106,62 +1105,44 @@ async def run_arc(
 ) -> int:
     """Startup steps 2-5 and the runtime loop. Returns a process exit code.
 
+    THE DASHBOARD IS THE OUTER TASK. It is served first and outlives every
+    runtime, because STOP shuts the runtime down and the operator still has to be
+    able to see that it worked and start the other mode. The supervisor owns the
+    runtime underneath it and rebuilds it on every start.
+
+    `--mode` auto-starts that runtime here rather than leaving the process idle:
+    a restart under PM2 must come back to a running system without a human
+    pressing START. It comes back DISARMED, so coming back running is not coming
+    back trading.
+
     Returns 0 even when the spec could not be verified. A non-zero exit would tell
     PM2 to restart, and restarting changes nothing about an unverifiable spec while
     losing the in-memory market and the observations it had collected.
     """
-    async with open_discovery(logger=logger) as discovery:
-        runtime = RuntimeState(store, clock)
-        runtime.load()
-        tokens = TokenCache()
-        executor, client = await build_executor(settings, store, tokens, logger=logger)
-        run = ArcRuntime(
-            settings=settings,
-            store=store,
-            clock=clock,
-            runtime=runtime,
-            discovery=discovery,
-            feed=build_provider(
-                settings.env.twap_provider,
-                clock,
-                url=settings.env.rtds_url,
-                # Configured rather than constant so a deployment behind a slow link
-                # can widen the ladder without editing source.
-                backoff=BackoffPolicy(
-                    initial_seconds=settings.env.reconnect_backoff_ms / 1000,
-                    max_seconds=settings.env.reconnect_backoff_max_ms / 1000,
-                ),
-                chainlink_api_key=settings.env.chainlink_api_key.get_secret_value(),
-                chainlink_api_secret=settings.env.chainlink_api_secret.get_secret_value(),
-                chainlink_feed_id=settings.env.chainlink_feed_id,
-                chainlink_decimals=settings.env.chainlink_decimals,
-                chainlink_ws_url=settings.env.chainlink_ws_url,
-                symbol=EXPECTED_SYMBOL,
-                logger=logger,
-            ),
-            executor=executor,
-            out=out,
-            venue_client=client,
-            logger=logger,
+    from arc.runtime.supervisor import RuntimeSupervisor
+
+    # Bind is checked before anything starts: a non-loopback bind must fail the
+    # startup, not warn during it.
+    host = check_bind(settings.env.api_bind)
+    supervisor = RuntimeSupervisor(
+        settings=settings, store=store, clock=clock, out=out, logger=logger
+    )
+    dashboard = asyncio.create_task(
+        serve_dashboard(
+            supervisor.runtime, host=host, port=settings.env.api_port, supervisor=supervisor
         )
-        # The runtime's own cache, so the resolver the executor holds is the one the
-        # market loop fills. Two caches would let the executor resolve from an empty
-        # one and refuse every submission on a perfectly healthy market.
-        run.tokens = tokens
-        # The dashboard is a task of this process, not a second process. `arc run`
-        # starts runtime, engines, recovery, websocket and dashboard together, so
-        # there is exactly one runtime state and the UI reads the live object.
-        # Bind is checked before the loop starts: a non-loopback bind must fail the
-        # startup, not warn during it.
-        dashboard = asyncio.create_task(
-            serve_dashboard(run, host=check_bind(settings.env.api_bind), port=settings.env.api_port)
-        )
-        try:
-            await run.run(market_target=market_target)
-        finally:
-            dashboard.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await dashboard
-            if client is not None:
-                await client.close()
+    )
+    try:
+        await supervisor.start(settings.mode, market_target=market_target)
+        await supervisor.wait()
+        if market_target is None:
+            # Production: the loop only ends when the operator stops it, so hold the
+            # process open on the dashboard. A bounded run has finished its markets
+            # and returns.
+            await dashboard
+    finally:
+        await supervisor.aclose()
+        dashboard.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await dashboard
     return 0

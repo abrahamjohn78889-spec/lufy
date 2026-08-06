@@ -116,11 +116,34 @@ class TestSixteenPrimaryElements:
 class TestPanelsRequiredByTheSpec:
     def test_each_named_panel_exists(self) -> None:
         for heading in (
-            "Runtime", "Engines", "Trading Control", "Preflight", "Running TWAP",
-            "Limit Order Engine", "Market Information", "Provider", "Execution",
-            "Recovery", "Error Summary", "Runtime Counters", "Wallet",
+            "Runtime", "Engines", "Runtime Control", "Trading Control", "Preflight",
+            "Running TWAP", "Limit Order Engine", "Market Information", "Provider",
+            "Execution", "Recovery", "Error Summary", "Runtime Counters", "Wallet",
         ):
             assert f"<h2>{heading}" in _OPS, heading
+
+    def test_starting_the_runtime_is_a_different_button_from_trading(self) -> None:
+        """The one failure this prevents: an operator who pressed START to look at
+        the system and finds the next window submitted an order. The runtime panel
+        must not post to the arm route, and the trading panel must not post to
+        /start."""
+        runtime = _OPS.split("<h2>Runtime Control", 1)[1].split("</section>", 1)[0]
+        trading = _OPS.split("<h2>Trading Control", 1)[1].split("</section>", 1)[0]
+        assert "START RUNTIME" in runtime
+        assert "action=arm" not in runtime
+        assert "START TRADING" in trading
+        assert "action=arm" in trading
+        assert 'data-post="/start' not in trading
+
+    def test_the_mode_selector_selects_rather_than_starts(self) -> None:
+        """A mode button that booted a live venue session on one click is a live
+        session started by a misclick."""
+        runtime = _OPS.split("<h2>Runtime Control", 1)[1].split("</section>", 1)[0]
+        assert 'data-mode="V1"' in runtime
+        assert 'data-mode="V2"' in runtime
+        for line in runtime.splitlines():
+            if "data-mode=" in line:
+                assert "data-post=" not in line, line
 
     def test_both_gates_are_displayed_independently(self) -> None:
         """A single combined light would hide system-disabled-while-armed."""

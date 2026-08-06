@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -27,6 +28,11 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only
 
 __all__ = ["STATUS_INTERVAL", "serve"]
 
+# Answers "which runtime is current?" once per tick. A callable rather than a
+# reference because the supervisor swaps the object on every start and stop, and
+# a socket holding the old one would stream a dead run indefinitely.
+Resolver = Callable[[], "ArcRuntime"]
+
 # Faster than this pushes the whole document more often than a human can read it;
 # slower makes the countdown visibly step. The browser interpolates the countdown
 # from close_ts between frames, so this only sets how often values refresh.
@@ -35,11 +41,17 @@ STATUS_INTERVAL: float = 1.0
 _REPLAY = 200
 
 
-async def _push_status(socket: WebSocket, run: ArcRuntime) -> None:
+async def _push_status(socket: WebSocket, run: ArcRuntime, current: Resolver) -> None:
     while True:
         payload = await status_payload(run, run.clock.now())
         await socket.send_json({"type": "status", "data": payload})
         await asyncio.sleep(STATUS_INTERVAL)
+        if current() is not run:
+            # The supervisor replaced the runtime under us: a start, a stop or a
+            # switch. Returning ends the connection and the browser reconnects
+            # against the new object. Continuing would push the stopped run's
+            # markets and accumulators forever under a live-looking socket.
+            return
 
 
 async def _push_events(
@@ -57,12 +69,15 @@ async def _push_events(
         await socket.send_json(message)
 
 
-async def serve(socket: WebSocket, run: ArcRuntime) -> None:
+async def serve(socket: WebSocket, run: ArcRuntime, current: Resolver | None = None) -> None:
     """Accept one dashboard connection and stream until it goes away.
 
     The backlog is replayed on connect. A reconnecting operator with an empty
     console cannot tell a quiet runtime from a broken one, and the reconnect is
     exactly when they are trying to find out which it was.
+
+    `current` reports which runtime is live now. When it stops returning `run` the
+    connection ends so the browser reconnects against the new one.
     """
     await socket.accept()
     # Subscribe BEFORE reading the backlog: the other order drops any event published
@@ -74,7 +89,7 @@ async def serve(socket: WebSocket, run: ArcRuntime) -> None:
         await socket.send_json({"type": "signal", "data": event.as_json()})
 
     tasks = [
-        asyncio.create_task(_push_status(socket, run)),
+        asyncio.create_task(_push_status(socket, run, current or (lambda: run))),
         asyncio.create_task(_push_events(socket, queue, replayed_through)),
     ]
     try:

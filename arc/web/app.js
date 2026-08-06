@@ -196,10 +196,15 @@ function paintRecoverySteps() {
   }));
 }
 
+// The runtime the operator has SELECTED, which is not necessarily the one that is
+// running: between choosing V2 and pressing START RUNTIME the process is still on
+// V1. Cleared on the first frame so a reload shows what is actually running.
+let selectedMode = null;
+
 function paintModes() {
-  const v2 = state.runtime.mode === 'V2';
-  $('#mode-v1').classList.toggle('on', !v2);
-  $('#mode-v2').classList.toggle('on', v2);
+  const active = selectedMode || state.runtime.mode;
+  $('#mode-v1').classList.toggle('on', active === 'V1');
+  $('#mode-v2').classList.toggle('on', active === 'V2');
 }
 
 function paintAnalytics() {
@@ -439,8 +444,27 @@ $$('[data-post]').forEach((btn) => {
     const { ok, data } = await post(btn.dataset.post);
     // The refusal is shown verbatim. Paraphrasing a system refusal would put the
     // operator's belief about why trading is off out of step with the reason.
-    say($('#control-msg'), ok, ok ? JSON.stringify(data) : (data.detail || 'refused'));
+    const target = btn.closest('.panel').querySelector('.msg') || $('#control-msg');
+    say(target, ok, ok ? JSON.stringify(data) : (data.detail || 'refused'));
   });
+});
+
+$$('[data-mode]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    // Selection only. Pressing V2 must not start V2 — the operator picks a runtime
+    // and then decides to start it, because a mode button that booted a live venue
+    // session on one click is a live session started by a misclick.
+    selectedMode = btn.dataset.mode;
+    paintModes();
+    say($('#control-msg'), true, `${selectedMode} selected. Press START RUNTIME.`);
+  });
+});
+
+$('#runtime-start').addEventListener('click', async () => {
+  const mode = selectedMode || state.runtime.mode;
+  const { ok, data } = await post(`/start?mode=${encodeURIComponent(mode)}`);
+  say($('#control-msg'), ok, ok ? JSON.stringify(data) : (data.detail || 'refused'));
+  if (ok) selectedMode = null;
 });
 
 $('#save-settings').addEventListener('click', async () => {

@@ -14,6 +14,14 @@ is not in this list is a route no test guards.
 
 Two paths accept a write as well as a read. That is one path, one resource, two
 verbs — not a thirteenth route.
+
+START/STOP ARE THE RUNTIME, NOT TRADING. `/start` boots the entire selected
+runtime — providers, CLOB, websockets, discovery, recovery, engines, recorder —
+and arms NOTHING. `/stop` shuts all of it down. Arming trading is a separate
+operator act on `/strategies/{id}/config?action=arm`, which is the Limit Order
+Engine's own control surface and already exists. Trading therefore cannot begin
+as a side effect of starting the system, and the runtime can sit fully running
+with trading idle, which is the normal state between windows.
 """
 
 from __future__ import annotations
@@ -27,9 +35,9 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, HTTPException, Query, Request, Response, WebSocket
 
 from arc.api import ws as ws_module
-from arc.api.models import ledger_payload, status_payload, strategy_payload
+from arc.api.models import ledger_payload, preflight, status_payload, strategy_payload
 from arc.config import build_trading_config, load_settings
-from arc.domain.enums import Direction
+from arc.domain.enums import Direction, Mode
 from arc.domain.money import dec_str
 from arc.domain.timing import MARKET_DURATION_SECONDS, window_ts_for
 from arc.errors import ArcError, ArcFatalError
@@ -39,6 +47,7 @@ from arc.strategy.registry import default_registry
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from arc.runtime.engine import ArcRuntime
+    from arc.runtime.supervisor import RuntimeSupervisor
 
 __all__ = ["ROUTE_PATHS", "router"]
 
@@ -67,34 +76,103 @@ _EDITABLE = frozenset(
 
 
 def _runtime(request: Request) -> ArcRuntime:
+    """The live runtime object.
+
+    Read through the supervisor when there is one, because the supervisor swaps
+    the runtime on every start and a reference captured at mount time would keep
+    serving the stopped run's markets and accumulators to every panel.
+    """
+    sup: RuntimeSupervisor | None = getattr(request.app.state, "supervisor", None)
+    if sup is not None:
+        return sup.runtime
     run: ArcRuntime | None = getattr(request.app.state, "runtime", None)
     if run is None:  # pragma: no cover - the app is never mounted without a runtime
         raise HTTPException(status_code=503, detail="runtime not attached")
     return run
 
 
+def _supervisor(request: Request) -> RuntimeSupervisor:
+    """The runtime's owner. Present whenever the app was built by `arc run`.
+
+    The runtime is read through `supervisor.runtime` rather than cached on app
+    state, because the supervisor REPLACES the runtime object on every start and
+    a cached reference would keep rendering the stopped one.
+    """
+    sup: RuntimeSupervisor | None = getattr(request.app.state, "supervisor", None)
+    if sup is None:  # pragma: no cover - the app is never mounted without one
+        raise HTTPException(status_code=503, detail="supervisor not attached")
+    return sup
+
+
+def _mode(name: str) -> Mode:
+    """Parse the runtime selector. Rejects anything that is not V1 or V2.
+
+    A 400 rather than a fallback to V1: an operator who asked for a runtime the
+    system does not have must not be given a different one silently, and the one
+    they would be given is the one that does not trade.
+    """
+    try:
+        return Mode(name.strip().upper())
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail=f"unknown runtime {name!r}; expected V1 or V2"
+        ) from None
+
+
 # ── control ──────────────────────────────────────────────────────────────────
 
 
 @router.post("/start")
-async def start(request: Request) -> dict[str, Any]:
-    """START TRADING. Arms the operator gate; it does not start the runtime.
+async def start(
+    request: Request,
+    mode: str = Query("", description="V1 | V2; blank keeps the current selection"),
+) -> dict[str, Any]:
+    """START RUNTIME. Brings the entire selected system up. Arms nothing.
 
-    The runtime is already running — `arc run` started it. This flips the one flag
-    that lets an ExecutionIntent become an order, and it can never override the
-    system gate: if `trading_enabled` is FALSE this returns the refusal instead of
-    arming, because an operator who sees "armed" while the system has trading
-    disabled would believe orders are going out.
+    Providers, RTDS or Chainlink, market discovery, PTB, CLOB, the official
+    websockets, decision, risk and limit order engines, Signal Tank, ledger,
+    Telegram, recovery, recorder and health monitoring all start together. The
+    only difference between V1 and V2 is the executor.
+
+    V2 additionally requires preflight to PASS. The checks run against the
+    runtime that is about to be replaced, so they cover configuration, wallet,
+    credentials, provider, connectivity, database, runtime and recovery state
+    before any live adapter exists. A FAIL refuses the start and returns the
+    failing checks by name — "preflight failed" alone sends the operator to the
+    logs, which is the trip this dashboard exists to remove.
+
+    Trading does NOT begin here. `execution_armed` stays FALSE until the operator
+    arms the Limit Order Engine, so a start can never be a trade.
     """
-    run = _runtime(request)
-    if not run.state.trading_enabled:
+    sup = _supervisor(request)
+    selected = _mode(mode) if mode else sup.mode
+    if sup.running:
         raise HTTPException(
             status_code=409,
-            detail=f"Trading Disabled by System / Reason: {run.state.reason}",
+            detail=f"{sup.runtime.mode.value} is already running; stop it first",
         )
-    run.resume()
-    run.arm()
-    return {"execution_armed": run.state.execution_armed, "paused": run.paused}
+    if selected is Mode.V2:
+        report = preflight(sup.runtime)
+        if report["result"] == "FAIL":
+            failed = [c["name"] for c in report["checks"] if c["result"] == "FAIL"]
+            raise HTTPException(
+                status_code=409,
+                detail=f"V2 preflight failed: {', '.join(failed)}",
+            )
+    try:
+        run = await sup.start(selected)
+    except (ArcError, ArcFatalError) as exc:
+        # A refused start is not a dead process. The dashboard stays up and says
+        # why, because the operator's next act is to fix the thing named.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "status": run.status,
+        "mode": run.mode.value,
+        # Stated in the response rather than left to be inferred: the operator
+        # pressed START and must not believe orders are now going out.
+        "execution_armed": run.state.execution_armed,
+        "trading_enabled": run.state.trading_enabled,
+    }
 
 
 @router.post("/pause")
@@ -114,16 +192,21 @@ async def resume(request: Request) -> dict[str, Any]:
 
 @router.post("/stop")
 async def stop(request: Request) -> dict[str, Any]:
-    """STOP TRADING. Disarms only.
+    """STOP RUNTIME. The entire selected runtime shuts down cleanly.
 
-    It does not cancel filled positions, stop feeds, stop the websocket, stop the
-    TWAP, stop PTB observation or stop recovery. Stopping trading and stopping the
-    runtime are different acts, and conflating them would mean an operator pausing
-    trading also blinded the dashboard that tells them why.
+    No websocket, feed, background worker, polling task, execution task, recorder
+    or runtime service continues afterwards, and the venue client is closed. The
+    process returns to a clean idle state with the dashboard still serving — the
+    dashboard outlives the runtime by design, or an operator could never see that
+    the stop succeeded.
+
+    Resting orders are NOT cancelled here. Retracting live positions is the
+    sweeper's job at market close, and a stop that also flattened the book would
+    turn "let me look at this" into a position-closing act.
     """
-    run = _runtime(request)
-    run.disarm()
-    return {"execution_armed": run.state.execution_armed, "paused": run.paused}
+    sup = _supervisor(request)
+    await sup.stop()
+    return {"status": sup.status, "mode": sup.mode.value}
 
 
 # ── state ────────────────────────────────────────────────────────────────────
@@ -304,15 +387,45 @@ async def strategy_config(request: Request, strategy_id: str) -> dict[str, Any]:
 
 
 @router.post("/strategies/{strategy_id}/config")
-async def set_strategy_config(request: Request, strategy_id: str) -> dict[str, Any]:
-    """Refused, always. The strategy is pinned (A17) and its parameters live in Settings."""
-    raise HTTPException(
-        status_code=405,
-        detail=(
-            f"{strategy_id} is pinned and not configurable from the dashboard; "
-            "edit buffers and windows on the Settings page"
-        ),
-    )
+async def set_strategy_config(
+    request: Request,
+    strategy_id: str,
+    action: str = Query("", description="arm | disarm"),
+) -> dict[str, Any]:
+    """START TRADING / STOP TRADING. The Limit Order Engine's own control.
+
+    The strategy's PARAMETERS stay read-only here: it is pinned (A17) and buffers,
+    windows and submission count are edited on the Settings page. The one thing
+    this route does is the operator gate, because arming is the act of the engine
+    this route names — the runtime is already up and inert until someone presses
+    this.
+
+    `execution_armed` is in-memory and never persisted, so a restart comes back
+    disarmed. A gate that survived a crash would re-arm a system nobody was
+    watching.
+    """
+    run = _runtime(request)
+    if strategy_id not in default_registry().ids():
+        raise HTTPException(status_code=404, detail=f"no strategy {strategy_id}")
+    if action == "arm":
+        run.arm()
+    elif action == "disarm":
+        run.disarm()
+    else:
+        raise HTTPException(
+            status_code=405,
+            detail=(
+                f"{strategy_id} is pinned and not configurable from the dashboard; "
+                "edit buffers and windows on the Settings page. "
+                "Use ?action=arm or ?action=disarm to start or stop trading"
+            ),
+        )
+    return {
+        "id": strategy_id,
+        "execution_armed": run.state.execution_armed,
+        "trading_enabled": run.state.trading_enabled,
+        "paused": run.paused,
+    }
 
 
 # ── research ─────────────────────────────────────────────────────────────────
@@ -393,11 +506,14 @@ async def orderbook(
 
 @router.websocket("/ws")
 async def websocket(socket: WebSocket) -> None:
-    run: ArcRuntime | None = getattr(socket.app.state, "runtime", None)
+    sup: RuntimeSupervisor | None = getattr(socket.app.state, "supervisor", None)
+    run: ArcRuntime | None = sup.runtime if sup is not None else getattr(
+        socket.app.state, "runtime", None
+    )
     if run is None:  # pragma: no cover - the app is never mounted without a runtime
         await socket.close(code=1011)
         return
-    await ws_module.serve(socket, run)
+    await ws_module.serve(socket, run, (lambda: sup.runtime) if sup is not None else None)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

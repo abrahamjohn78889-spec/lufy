@@ -29,6 +29,7 @@ from arc.errors import ArcFatalError
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from arc.runtime.engine import ArcRuntime
+    from arc.runtime.supervisor import RuntimeSupervisor
 
 __all__ = ["WEB_ROOT", "build_app", "check_bind", "serve"]
 
@@ -54,15 +55,22 @@ def check_bind(host: str) -> str:
     return host
 
 
-def build_app(run: ArcRuntime) -> FastAPI:
+def build_app(run: ArcRuntime, supervisor: RuntimeSupervisor | None = None) -> FastAPI:
     """The app, with the runtime attached to state and the twelve routes mounted.
 
     The runtime is attached rather than injected per request so every route and the
     websocket read the same live object — a per-request copy would render a snapshot
     from whenever the request began.
+
+    When a supervisor is attached the routes read `supervisor.runtime` instead, and
+    `app.state.runtime` is only the fallback for tests that mount a runtime with no
+    lifecycle around it. Two sources sounds like one too many, but the supervisor
+    REPLACES its runtime on every start, so the attached reference is a stale object
+    the moment anyone presses START.
     """
     app = FastAPI(title="ARC Operations Center", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.runtime = run
+    app.state.supervisor = supervisor
     app.include_router(router)
 
     if WEB_ROOT.is_dir():
@@ -78,15 +86,18 @@ def build_app(run: ArcRuntime) -> FastAPI:
     return app
 
 
-async def serve(run: ArcRuntime, *, host: str, port: int) -> None:
+async def serve(
+    run: ArcRuntime, *, host: str, port: int, supervisor: RuntimeSupervisor | None = None
+) -> None:
     """Run the dashboard until cancelled. Never returns on its own.
 
-    Started as a task beside the runtime loop rather than as a separate process:
-    `arc run` is one production process, and a dashboard in its own process would
-    have to reach the engines' state across a boundary that does not exist.
+    The OUTER task of the process, not a child of the runtime: `arc run` serves this
+    and the supervisor starts and stops runtimes underneath it. A dashboard owned by
+    the runtime could not survive stopping the runtime, so STOP would take away the
+    only surface able to report that the stop worked.
     """
     config = uvicorn.Config(
-        build_app(run),
+        build_app(run, supervisor),
         host=check_bind(host),
         port=port,
         log_config=None,
