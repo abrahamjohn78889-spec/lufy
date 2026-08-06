@@ -44,7 +44,7 @@ from typing import Any, Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import polymarket
-from pydantic import AliasChoices, Field, SecretStr, ValidationInfo, field_validator
+from pydantic import SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from arc.domain.enums import Mode
@@ -211,20 +211,27 @@ class ArcSettings(BaseSettings):
     # No feed ID is defaulted: a guessed identifier would yield prices that look real.
     chainlink_api_key: SecretStr = SecretStr("")
     chainlink_api_secret: SecretStr = SecretStr("")
-    # Two accepted spellings. The specification writes the variable
-    # ARC_CHAINLINK_FEBS_ID and this codebase has always written
-    # ARC_CHAINLINK_FEED_ID; both are read so an operator who copies either one
-    # into .env gets the value they typed rather than a silent empty string, which
-    # is indistinguishable from "no feed configured" and would look like a
-    # configuration that had simply never been filled in.
-    chainlink_feed_id: str = Field(
-        default="",
-        validation_alias=AliasChoices(
-            "ARC_CHAINLINK_FEED_ID",
-            "ARC_CHAINLINK_FEBS_ID",
-            "chainlink_feed_id",
-        ),
-    )
+
+    # ONE spelling. The specification once wrote ARC_CHAINLINK_FEBS_ID; that alias
+    # was removed rather than carried, because two names for one value means a
+    # `grep` for the configured feed finds only half the truth, and no operator
+    # has ever been able to set it — Chainlink has never run.
+    chainlink_feed_id: str = ""
+
+    # The Data Streams websocket origin. Documented hosts are
+    # wss://ws.dataengine.chain.link (mainnet) and
+    # wss://ws.testnet-dataengine.chain.link. Mainnet is the default because ARC
+    # trades real markets; TESTNET is not a runtime mode here (A3), this is only
+    # the address of a price relay.
+    chainlink_ws_url: str = "wss://ws.dataengine.chain.link"
+
+    # Fixed-point scale of the report's price field. The official documentation
+    # states prices "use 8 or 18 decimals depending on the stream", so this CANNOT
+    # be defaulted: guessing 18 for an 8-decimal stream reports BTC at ten billion
+    # times its price, which passes every plausibility check ARC has because the
+    # first sample sets its own reference. 0 means unset and is fatal when
+    # CHAINLINK is selected.
+    chainlink_decimals: int = 0
 
     # SecretStr so the value never appears in repr(), str(), an f-string, a
     # pydantic validation error, or a traceback. Pydantic renders it as

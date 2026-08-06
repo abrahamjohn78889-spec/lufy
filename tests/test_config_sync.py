@@ -69,10 +69,15 @@ class TestEnvExampleIsComplete:
         """The reverse error: a key in the file that no field reads is a setting
         the operator sets, restarts for, and sees no effect from."""
         known = {_env_name(name) for name in ArcSettings.model_fields}
-        # The one deliberate alias. Both spellings are accepted by the field.
-        known.add("ARC_CHAINLINK_FEBS_ID")
         unread = sorted(k for k in _DOCUMENTED if k not in known)
         assert unread == [], unread
+
+    def test_no_alias_spellings_survive(self) -> None:
+        """One name per value. Two spellings means a grep for the configured feed
+        finds half the truth, and the operator debugging a silent stream reads the
+        half that was never set."""
+        assert "ARC_CHAINLINK_FEBS_ID" not in _DOCUMENTED
+        assert "ARC_CHAINLINK_FEBS_ID" not in _ENV_EXAMPLE
 
     def test_every_trading_key_is_documented(self) -> None:
         for key in TRADING_KEYS:
@@ -213,14 +218,49 @@ class TestProviderSelection:
         with pytest.raises(ValueError):
             ArcSettings(twap_provider="COINBASE")
 
-    def test_chainlink_is_nameable_and_refused_at_build(self) -> None:
-        """A named-but-unimplemented provider must read as "not built yet", not as
-        a typo. Selecting it is fatal until official documentation is verified —
-        a stub against a guessed feed ID would produce prices that look real."""
+    def test_chainlink_is_nameable_and_refused_without_its_configuration(self) -> None:
+        """Selecting Chainlink with nothing configured must name the MISSING ITEM.
+
+        "Chainlink is misconfigured" sends the operator to source. Each refusal
+        names one variable, because each of them fails silently if guessed.
+        """
         assert ArcSettings(twap_provider="CHAINLINK").twap_provider == "CHAINLINK"
         with pytest.raises(ConfigInvariantError) as exc:
             build_provider("CHAINLINK", _clock())
-        assert "not implemented" in str(exc.value)
+        assert "ARC_CHAINLINK_API_KEY" in str(exc.value)
+
+    def test_chainlink_builds_when_fully_configured(self) -> None:
+        from arc.market.chainlink import ChainlinkFeed
+
+        provider = build_provider(
+            "CHAINLINK",
+            _clock(),
+            chainlink_api_key="key",
+            chainlink_api_secret="secret",
+            chainlink_feed_id="0x0003abc",
+            chainlink_decimals=18,
+            chainlink_ws_url="wss://ws.dataengine.chain.link",
+            symbol="BTC/USD",
+        )
+        assert isinstance(provider, ChainlinkFeed)
+        # The stream IDs go in the query string; there is no subscribe frame.
+        assert provider.url.endswith("/api/v1/ws?feedIDs=0x0003abc")
+
+    def test_selecting_chainlink_returns_no_rtds_connection(self) -> None:
+        """No mixed-provider operation: the object returned when CHAINLINK is
+        selected is not an RtdsFeed and holds no second stream."""
+        provider = build_provider(
+            "CHAINLINK",
+            _clock(),
+            chainlink_api_key="key",
+            chainlink_api_secret="secret",
+            chainlink_feed_id="0x1",
+            chainlink_decimals=8,
+            chainlink_ws_url="wss://ws.dataengine.chain.link",
+            symbol="BTC/USD",
+        )
+        assert not isinstance(provider, RtdsFeed)
+        assert RTDS_URL not in provider.url
 
     def test_no_mixed_provider_operation(self) -> None:
         """build_provider returns exactly one feed. There is no path that returns

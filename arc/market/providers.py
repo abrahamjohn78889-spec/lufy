@@ -5,12 +5,12 @@ Engine, Risk Engine, Limit Order Engine and dashboard all receive observations t
 carry no trace of their origin, so swapping providers changes no strategy code and no
 strategy behaviour: only the source of the price data moves.
 
-RTDS is the only implemented provider. Chainlink is configuration-ready and nothing
-more — the credentials and feed identifier have places to live, and selecting it is a
-fatal configuration error until an official feed ID, official credentials and official
-documentation have all been verified. There is deliberately no Chainlink module, no
-placeholder feed ID and no speculative endpoint: a stub that connected to a guessed
-identifier would produce prices that look exactly like real ones.
+RTDS is the default. Chainlink is implemented against the official Data Streams
+documentation (see market/chainlink.py) and requires credentials, a stream ID and
+the stream's decimal scale; each missing item is refused by name at startup rather
+than defaulted, because every plausible default here produces prices that look
+real. Nothing about the choice reaches the strategy path: both providers yield the
+same frame shape, so A21's grep gate holds.
 
 The interface is stated as a Protocol rather than a base class so RtdsFeed does not
 have to inherit anything. The one thing every provider must do is yield raw frames and
@@ -27,18 +27,14 @@ from typing import Protocol, runtime_checkable
 
 from arc.clock import Clock
 from arc.errors import ConfigInvariantError
+from arc.market.chainlink import build_chainlink_feed
 from arc.market.feed import RTDS_URL, BackoffPolicy, RtdsFeed
 
 __all__ = ["ProviderName", "TwapProvider", "build_provider"]
 
 
 class ProviderName(StrEnum):
-    """The providers that exist as configuration values.
-
-    CHAINLINK is a member because the operator must be able to name it and get a
-    clear refusal. Omitting it would produce "unknown provider CHAINLINK", which
-    reads as a typo rather than as "implemented once the official details exist".
-    """
+    """The providers that exist as configuration values."""
 
     RTDS = "RTDS"
     CHAINLINK = "CHAINLINK"
@@ -64,17 +60,24 @@ def build_provider(
     url: str = RTDS_URL,
     backoff: BackoffPolicy | None = None,
     logger: logging.Logger | None = None,
+    chainlink_api_key: str = "",
+    chainlink_api_secret: str = "",
+    chainlink_feed_id: str = "",
+    chainlink_decimals: int = 0,
+    chainlink_ws_url: str = "",
+    symbol: str = "",
 ) -> TwapProvider:
-    """The configured provider, or a fatal configuration error.
+    """The configured provider. Exactly one, or a fatal configuration error.
 
-    Refuses rather than silently falling back to RTDS. An operator who configured
-    Chainlink and got RTDS anyway would be trading a different price source than the
-    one they believe is live, and nothing on the dashboard would say so.
+    Returns a single object and has no path that returns two, no path that holds a
+    second connection open, and no fallback. An operator who configured Chainlink
+    and silently got RTDS would be trading a different price source than the one
+    the dashboard names, and nothing anywhere would say so.
 
     `url` and `backoff` come from configuration rather than from the module
     constants so that no endpoint or retry cadence is reachable only by editing
     source: a hardcoded relay address is an address the operator cannot move when
-    Polymarket moves it.
+    the vendor moves it.
     """
     try:
         provider = ProviderName(name.strip().upper())
@@ -85,11 +88,16 @@ def build_provider(
         ) from exc
 
     if provider is ProviderName.CHAINLINK:
-        raise ConfigInvariantError(
-            "TWAP_PROVIDER=CHAINLINK is not implemented. It requires a verified feed "
-            "ID, verified credentials and official documentation, none of which are "
-            "available; implementing it against a guessed identifier would produce "
-            "prices indistinguishable from real ones. Use TWAP_PROVIDER=RTDS."
+        return build_chainlink_feed(
+            clock,
+            api_key=chainlink_api_key,
+            api_secret=chainlink_api_secret,
+            feed_id=chainlink_feed_id,
+            decimals=chainlink_decimals,
+            symbol=symbol,
+            base_url=chainlink_ws_url,
+            backoff=backoff,
+            logger=logger,
         )
 
     return RtdsFeed(clock, url=url, backoff=backoff, logger=logger)

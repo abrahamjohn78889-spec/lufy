@@ -1,10 +1,10 @@
-"""TWAP provider selection: RTDS ships, Chainlink refuses, nothing else knows.
+"""TWAP provider selection: two implementations, one live at a time, nothing else knows.
 
 The contract this file enforces is negative as much as positive. RTDS must work with
-no credentials and no extra configuration; Chainlink must be nameable and must fail
-loudly rather than quietly falling back; and no strategy module may import a provider,
-because the whole point of the interface is that changing the source of the price data
-cannot change what the strategy does.
+no credentials and no extra configuration; Chainlink must be selectable and must refuse
+BY NAME rather than quietly falling back or quietly guessing; and no strategy module may
+import a provider, because the whole point of the interface is that changing the source
+of the price data cannot change what the strategy does.
 """
 
 from __future__ import annotations
@@ -58,13 +58,15 @@ class TestRtdsIsTheDefault:
         assert isinstance(build_provider(name, _clock()), RtdsFeed)
 
 
-class TestChainlinkIsConfigurationOnly:
+class TestChainlinkIsSelectableAndRefusesByName:
     def test_it_is_a_nameable_provider(self) -> None:
-        """So the refusal says "not implemented", not "unknown provider"."""
+        """So a refusal names the missing item, not "unknown provider"."""
         assert ProviderName.CHAINLINK.value == "CHAINLINK"
 
-    def test_selecting_it_is_a_fatal_configuration_error(self) -> None:
-        with pytest.raises(ConfigInvariantError, match="not implemented"):
+    def test_selecting_it_unconfigured_names_the_missing_variable(self) -> None:
+        """"Chainlink is misconfigured" sends the operator to source; the name of
+        the one variable to set does not."""
+        with pytest.raises(ConfigInvariantError, match="ARC_CHAINLINK_API_KEY"):
             build_provider("CHAINLINK", _clock())
 
     def test_it_does_not_silently_fall_back_to_rtds(self) -> None:
@@ -72,12 +74,22 @@ class TestChainlinkIsConfigurationOnly:
         with pytest.raises(ConfigInvariantError):
             build_provider("CHAINLINK", _clock())
 
-    def test_no_chainlink_implementation_module_exists(self, source_root: Path) -> None:
-        """A1 Rule 2: no stubs. A guessed feed ID yields prices that look real."""
-        assert not list(source_root.glob("arc/**/chainlink*.py"))
+    def test_the_implementation_guesses_nothing(self, source_root: Path) -> None:
+        """A1 Rule 2, restated for a module that now exists: the two values that
+        fail SILENTLY when wrong — the stream ID and the decimal scale — must have
+        no default anywhere in the source. A guessed feed ID delivers real,
+        correctly-signed prices for the wrong asset; a guessed scale is off by
+        10^10 with every sample wrong by the same factor.
+        """
+        text = (source_root / "arc" / "market" / "chainlink.py").read_text(encoding="utf-8")
+        assert "feed_id: str = " not in text
+        assert "decimals: int = " not in text
 
     def test_no_feed_id_is_defaulted(self) -> None:
         assert ArcSettings(_env_file=None).chainlink_feed_id == ""
+
+    def test_no_decimal_scale_is_defaulted(self) -> None:
+        assert ArcSettings(_env_file=None).chainlink_decimals == 0
 
     def test_the_env_example_prepares_the_keys_and_leaves_them_blank(
         self, source_root: Path
