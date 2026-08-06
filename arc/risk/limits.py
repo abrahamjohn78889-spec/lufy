@@ -22,7 +22,7 @@ __all__ = ["RiskLimits", "limits_from_trading"]
 
 @dataclass(frozen=True, slots=True)
 class RiskLimits:
-    """Every configured bound the fourteen gates evaluate against."""
+    """Every configured bound the fifteen gates evaluate against."""
 
     max_trades_per_market: int
     max_concurrent_positions: int

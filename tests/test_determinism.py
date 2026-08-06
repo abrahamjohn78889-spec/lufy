@@ -83,7 +83,11 @@ def _health() -> RuntimeHealth:
     Stated explicitly rather than defaulted, because the shipped default is DISABLED
     (A8) and a harness that quietly enabled trading would hide that.
     """
-    return RuntimeHealth(trading_enabled=True, spec_status=SettlementSpecStatus.VERIFIED)
+    return RuntimeHealth(
+        trading_enabled=True,
+        spec_status=SettlementSpecStatus.VERIFIED,
+        execution_armed=True,
+    )
 
 
 class _Run:

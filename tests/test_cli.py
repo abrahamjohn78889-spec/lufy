@@ -1,4 +1,4 @@
-"""CLI: `arc doctor` validates and reports; `arc run` refuses to fake a runtime."""
+"""CLI: `arc doctor` validates and reports; `arc run` starts one of TWO modes."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from conftest import VALID_TRADING_VALUES, WINDOW_TS
 
 from arc.cli import doctor, main, run
 from arc.clock import FrozenClock
+from arc.domain.enums import Mode
 
 
 @pytest.fixture(autouse=True)
@@ -126,20 +127,33 @@ class TestDoctorAdvisoryWarningsDoNotBlock:
         assert "none" in out.getvalue()
 
 
-class TestRunAlwaysRefuses:
-    def test_run_returns_one(self) -> None:
-        assert run(io.StringIO()) == 1
+class TestOnlyTwoModes:
+    """Q4: V1 paper and V2 live. There is no third mode and no observe command."""
 
-    def test_run_explains_why_rather_than_pretending_to_work(self) -> None:
+    def test_mode_is_required(self) -> None:
+        """A defaulted mode makes one forgotten flag the paper/live difference."""
+        with pytest.raises(SystemExit):
+            main(["run"])
+
+    def test_observe_is_not_a_command(self) -> None:
+        with pytest.raises(SystemExit):
+            main(["observe"])
+
+    def test_a_third_mode_is_refused(self) -> None:
+        with pytest.raises(SystemExit):
+            main(["run", "--mode=observe"])
+
+    def test_run_reports_the_selected_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The header names the mode before anything else can go wrong.
+
+        Asserted on the header rather than on a completed run: starting the loop
+        needs a live feed, and the value under test is that the mode the operator
+        typed is the mode the process announces.
+        """
         out = io.StringIO()
-        run(out)
-        text = out.getvalue()
-        assert "not available" in text
-        assert "arc doctor" in text
-
-    def test_run_never_returns_zero(self) -> None:
-        """A6 Rule 2: a fake runtime that looked healthy is worse than an error."""
-        assert run(io.StringIO()) != 0
+        monkeypatch.setattr("arc.cli.asyncio.run", lambda coro: (coro.close(), 0)[1])
+        assert run(out, FrozenClock(WINDOW_TS), mode=Mode.V1, market_target=1) == 0
+        assert "ARC run — V1" in out.getvalue()
 
 
 class TestMainDispatchesSubcommands:
@@ -148,10 +162,12 @@ class TestMainDispatchesSubcommands:
         assert code in (0, 1)
         assert "ARC doctor" in capsys.readouterr().out
 
-    def test_run_subcommand_runs_run(self, capsys: pytest.CaptureFixture[str]) -> None:
-        code = main(["run"])
-        assert code == 1
-        assert "not available" in capsys.readouterr().out
+    def test_run_subcommand_runs_run(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("arc.cli.asyncio.run", lambda coro: (coro.close(), 0)[1])
+        assert main(["run", "--mode=v1", "--markets=1"]) == 0
+        assert "ARC run — V1" in capsys.readouterr().out
 
     def test_no_subcommand_is_a_usage_error(self) -> None:
         with pytest.raises(SystemExit):

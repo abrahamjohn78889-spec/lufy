@@ -195,6 +195,11 @@ class DenialReason(StrEnum):
     """
 
     TRADING_DISABLED_SPEC_UNVERIFIED = "TRADING_DISABLED_SPEC_UNVERIFIED"
+    # The operator gate, distinct from the system gate above. A runtime that is
+    # perfectly healthy but never armed is the NORMAL post-startup state, and
+    # reporting it as TRADING_DISABLED_SPEC_UNVERIFIED would send the operator
+    # hunting a verification failure that never happened.
+    EXECUTION_NOT_ARMED = "EXECUTION_NOT_ARMED"
     TRADING_PAUSED = "TRADING_PAUSED"
     MARKET_CANCELLING = "MARKET_CANCELLING"
     MARKET_DEAD = "MARKET_DEAD"

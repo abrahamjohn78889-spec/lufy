@@ -45,14 +45,27 @@ _FALSE: Final[str] = "false"
 
 @dataclass(frozen=True, slots=True)
 class TradingGate:
-    """A snapshot of whether trading is permitted, and why not."""
+    """A snapshot of whether trading is permitted, and why not.
+
+    Two independent flags, never collapsed into one boolean. `enabled` is the
+    SYSTEM gate, moved only by ARC's own safety checks; `armed` is the OPERATOR
+    gate, moved only by the Start/Stop Trading control. A dashboard that showed
+    one combined "trading" light could not tell the operator whether to press a
+    button or fix a fault.
+    """
 
     enabled: bool
     reason: str = ""
+    armed: bool = False
 
     @property
     def blocked(self) -> bool:
         return not self.enabled
+
+    @property
+    def submitting(self) -> bool:
+        """Both gates open: this is the only state in which an order can be sent."""
+        return self.enabled and self.armed
 
 
 class RuntimeState:
@@ -63,7 +76,7 @@ class RuntimeState:
     enabled on the strength of a state that was not durably recorded.
     """
 
-    __slots__ = ("_clock", "_enabled", "_reason", "_spec_status", "_store")
+    __slots__ = ("_armed", "_clock", "_enabled", "_reason", "_spec_status", "_store")
 
     def __init__(self, store: Store, clock: Clock) -> None:
         self._store = store
@@ -72,6 +85,13 @@ class RuntimeState:
         self._enabled = False
         self._reason = DenialReason.TRADING_DISABLED_SPEC_UNVERIFIED.value
         self._spec_status = SettlementSpecStatus.UNVERIFIED
+        # The OPERATOR gate, and the one flag here that is deliberately NOT
+        # persisted. A process that comes back up after a crash comes back up
+        # disarmed, because arming means "an operator is watching this right now"
+        # and a restart is precisely the moment that stops being true. Persisting
+        # it would let a bot resume submitting orders into a market nobody is
+        # looking at, on the strength of a click from before the crash.
+        self._armed = False
 
     # ── load ─────────────────────────────────────────────────────────────────
 
@@ -119,10 +139,38 @@ class RuntimeState:
         return self._spec_status
 
     @property
+    def execution_armed(self) -> bool:
+        """Whether the operator has started trading in THIS process lifetime."""
+        return self._armed
+
+    @property
     def gate(self) -> TradingGate:
-        return TradingGate(enabled=self._enabled, reason=self._reason)
+        return TradingGate(enabled=self._enabled, reason=self._reason, armed=self._armed)
 
     # ── write ────────────────────────────────────────────────────────────────
+
+    def arm_execution(self) -> TradingGate:
+        """Operator pressed Start Trading. Does NOT touch the system gate.
+
+        Deliberately succeeds even while trading_enabled is false. The two gates are
+        independent (state 4 of the operator's matrix): an armed operator plus a
+        system block is a real, displayable state meaning "the operator wants to
+        trade and the system is refusing", and silently declining to arm would erase
+        the operator's intent and show the same screen as never having pressed it.
+        """
+        self._armed = True
+        return self.gate
+
+    def disarm_execution(self) -> TradingGate:
+        """Operator pressed Stop Trading. Stops NEW submissions and nothing else.
+
+        Feeds, TWAP accumulation, PTB observation, recovery, reconciliation and the
+        websocket all keep running; already-resting orders are not cancelled here.
+        Cancelling on disarm would turn a pause into a position-flattening action the
+        operator did not ask for.
+        """
+        self._armed = False
+        return self.gate
 
     def enable_trading(self) -> TradingGate:
         """Permit trading. Refuses while the settlement spec is not VERIFIED.

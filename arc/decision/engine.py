@@ -4,7 +4,7 @@ One pipeline, and every intent goes through all six steps:
 
     1  Completed Window   a FIRED window, taken from the window pass
     2  Validate Window    frozen state is complete; snapshot it once
-    3  Apply Risk Gates   all fourteen, in order, first denial wins
+    3  Apply Risk Gates   all fifteen, in order, first denial wins
     4  Create Intent      immutable and self-sufficient
     5  Persist Intent     SQLite arbitrates exactly-one-per-window
     6  Return Intent
@@ -69,13 +69,17 @@ class RuntimeHealth:
     """Process-wide state the risk gates need, read once per decision pass.
 
     Gathered by the caller into one frozen object rather than reached for gate by
-    gate. Fourteen gates each pulling live readings would evaluate fourteen
+    gate. Fifteen gates each pulling live readings would evaluate fifteen
     slightly different worlds, and the verdict would depend on how long evaluation
     took.
     """
 
     trading_enabled: bool
     spec_status: SettlementSpecStatus
+    # The operator's Start Trading switch. Defaults False for the same reason the
+    # risk gate does: a caller that forgets to gather it records the decision and
+    # submits nothing, rather than submitting because a field was missing.
+    execution_armed: bool = False
     paused: bool = False
     trading_disabled_reason: str = ""
     feed_blocked: bool = False
@@ -383,6 +387,7 @@ class DecisionEngine:
         return RiskContext(
             trading_enabled=health.trading_enabled,
             spec_status=health.spec_status,
+            execution_armed=health.execution_armed,
             paused=health.paused,
             trading_disabled_reason=health.trading_disabled_reason,
             phase=market.phase,

@@ -67,13 +67,15 @@ def limits(config: TradingConfig | None = None) -> RiskLimits:
 def healthy(**overrides: object) -> RuntimeHealth:
     """A runtime in which every gate that can pass, passes.
 
-    trading_enabled and VERIFIED are stated explicitly rather than defaulted,
-    because the shipped default is DISABLED (A8) and a helper that quietly enabled
-    trading would make the A8 boundary test pass for the wrong reason.
+    trading_enabled, VERIFIED and execution_armed are stated explicitly rather
+    than defaulted, because all three ship DISABLED (A8, and the operator gate
+    disarms on every startup) and a helper that quietly enabled trading would make
+    the A8 boundary test and the arming test pass for the wrong reason.
     """
     base: dict[str, object] = {
         "trading_enabled": True,
         "spec_status": SettlementSpecStatus.VERIFIED,
+        "execution_armed": True,
     }
     base.update(overrides)
     return RuntimeHealth(**base)  # type: ignore[arg-type]

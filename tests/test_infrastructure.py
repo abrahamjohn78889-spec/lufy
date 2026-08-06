@@ -587,14 +587,15 @@ class TestMoneyNeverTouchesFloat:
 class TestNoFakeRuntime:
     """A1 Rule 2: nothing is stubbed to make an unbuilt path look functional."""
 
-    def test_run_command_returns_nonzero(self) -> None:
-        import io
+    def test_there_is_no_third_runtime_mode(self) -> None:
+        """Q4: V1 and V2 only. A legacy observe path would be an unused runtime."""
+        from arc.cli import main
+        from arc.domain.enums import Mode
 
-        from arc.cli import run
-
-        out = io.StringIO()
-        assert run(out) == 1
-        assert "not available" in out.getvalue()
+        assert [m.value for m in Mode] == ["V1", "V2"]
+        for argv in (["observe"], ["run", "--mode=observe"], ["run"]):
+            with pytest.raises(SystemExit):
+                main(argv)
 
     def test_network_imports_are_confined_to_the_market_package(
         self, parsed_source: tuple[tuple[Path, ast.Module], ...]

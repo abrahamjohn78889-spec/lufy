@@ -1,0 +1,904 @@
+"""The unified runtime. TWO modes, and nothing else: V1 paper, V2 live.
+
+    V1   the COMPLETE pipeline with PaperExecutor
+    V2   the COMPLETE pipeline with LiveExecutor
+
+There is no third mode. V1 is not a lightweight simulator and not an observation
+run: market engine, window engine, decision engine, risk engine, limit order
+engine, fills, reprice, sweep, reconcile and recovery all execute identically.
+The ONLY component that differs between the two is the executor, which is why
+this file selects it once at construction and nothing below that line branches
+on mode. A second runtime path is a second set of behaviour to keep in sync, and
+the paper evidence would stop being evidence about the live run.
+
+Startup order is A8's, and the order matters:
+
+    1  load config and validate the fatal invariants     (a bad config DOES refuse)
+    2  open SQLite, migrate, reconcile                   (the caller does this)
+    3  recovery, once                                    (before any submission)
+    4  connect the feeds
+    5  automatic settlement-spec verification
+
+THE PROCESS ALWAYS STARTS past step 1. A feed that will not connect, an
+unverifiable spec, a stale watchdog — none of these exit. They set
+`trading_enabled = False` with a recorded reason and everything else keeps
+running: feeds retrying, TWAP accumulating, markets rotating, observations
+persisted, dashboard served.
+
+TWO GATES, both required before an order exists (A19/Q1):
+
+    trading_enabled   the SYSTEM gate. Set by ARC only. The operator can never
+                      override it.
+    execution_armed   the OPERATOR gate. Start/Stop Trading only. FALSE after
+                      every startup, never persisted.
+
+Runtime running is not trading running. Disarming stops NEW submissions and
+nothing else — feeds, TWAP, PTB observation, recovery and the socket all keep
+going, because a kill switch that also tears down the observation stack leaves
+the operator blind at exactly the moment they reached for it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+from dataclasses import dataclass, field
+from decimal import Decimal
+from typing import Any, Final, TextIO
+
+import polymarket
+
+from arc.clock import Clock, DriftMonitor, DriftStatus
+from arc.config import Settings
+from arc.decision.engine import DecisionEngine, RuntimeHealth
+from arc.decision.quota import QuotaLedger
+from arc.domain.enums import Direction, MarketPhase, Mode
+from arc.domain.models import MarketInstance, Order
+from arc.domain.timing import MARKET_DURATION_SECONDS, slug_for
+from arc.errors import ArcError, FeedError, ObservationRejectedError
+from arc.execution.fill_engine import FillEngine
+from arc.execution.protocol import Executor
+from arc.execution.ratelimit import TokenBucket
+from arc.execution.reconcile import Reconciler
+from arc.execution.reprice import RepricePolicy, Repricer
+from arc.execution.submit import Submitter
+from arc.execution.sweep import Sweeper
+from arc.execution.v1_paper import PaperExecutor
+from arc.execution.v2_live import LiveExecutor
+from arc.logging_setup import log_event
+from arc.market.discovery import MarketDiscovery, open_discovery
+from arc.market.providers import TwapProvider, build_provider
+from arc.market.ptb import (
+    DEAD_REASON_PTB_UNAVAILABLE,
+    PreviousClosePtbCache,
+    PtbResolution,
+    freeze_ptb_for,
+    resolve_ptb,
+)
+from arc.market.rotation import MarketRotator
+from arc.market.settlement_feed import SettlementTwapCollector
+from arc.market.spec_check import SpecChecker
+from arc.market.validation import ObservationValidator
+from arc.market.watchdog import FeedWatchdog
+from arc.risk.limits import limits_from_trading
+from arc.runtime.recovery import RecoveryRunner
+from arc.runtime.state import RuntimeState
+from arc.storage.store import Store
+from arc.strategy.config import config_from_trading
+from arc.strategy.registry import default_registry
+from arc.windows.engine import WindowEngine
+
+__all__ = [
+    "EXPECTED_SYMBOL",
+    "ArcRuntime",
+    "RuntimeStats",
+    "RuntimeStatus",
+    "TokenCache",
+    "run_arc",
+]
+
+# The symbol the price stream reports for the pair these markets settle on.
+EXPECTED_SYMBOL: Final[str] = "BTC/USD"
+
+# How often the level-triggered pass runs. Fine enough that a boundary is noticed
+# within a fraction of a second, coarse enough to cost nothing. Not a schedule:
+# every pass compares the clock against the boundary from scratch (A12).
+_TICK_SECONDS: Final[float] = 0.2
+
+# How often an unresolved PTB is retried. The venue publishes a market's
+# `eventMetadata` roughly 25 seconds after it closes — i.e. roughly 25 seconds into
+# the NEXT market's life — so a market that opens without a PTB is not a dead
+# market, it is a market whose official opening reference has not been written yet.
+_PTB_RETRY_SECONDS: Final[float] = 5.0
+
+# One day, for the daily-loss gate's window.
+_DAY_SECONDS: Final[float] = 86400.0
+
+_ZERO: Final[Decimal] = Decimal("0")
+
+# Outcome labels the venue uses for these markets, lowercased. Matched rather than
+# positional: `clobTokenIds` carries no side information, and a token id taken by
+# index would place a real order on the opposite outcome while looking entirely
+# healthy. An unmatched label resolves to nothing and refuses the submission.
+_UP_LABELS: Final[frozenset[str]] = frozenset({"up", "yes"})
+_DOWN_LABELS: Final[frozenset[str]] = frozenset({"down", "no"})
+
+
+class RuntimeStatus:
+    """The complete set of runtime status values. Nothing else exists (Q4)."""
+
+    STOPPED: Final[str] = "STOPPED"
+    STARTING: Final[str] = "STARTING"
+    RUNNING_V1: Final[str] = "RUNNING (V1)"
+    RUNNING_V2: Final[str] = "RUNNING (V2)"
+    STOPPING: Final[str] = "STOPPING"
+
+    @staticmethod
+    def running_for(mode: Mode) -> str:
+        return RuntimeStatus.RUNNING_V2 if mode is Mode.V2 else RuntimeStatus.RUNNING_V1
+
+
+@dataclass(slots=True)
+class RuntimeStats:
+    """What the run did. Displayed; feeds no decision."""
+
+    markets_processed: int = 0
+    ptb_frozen: int = 0
+    ptb_unavailable: int = 0
+    observations_accepted: int = 0
+    observations_rejected: int = 0
+    settlement_samples: int = 0
+    settlement_stream_found: bool = False
+    reconnects: int = 0
+    orders_submitted: int = 0
+    orders_repriced: int = 0
+    fills_recorded: int = 0
+    per_market_ticks: dict[str, int] = field(default_factory=dict)
+
+    def observed_cadence_ms(self, elapsed_seconds: float) -> float | None:
+        """Mean gap between accepted observations, for the report only.
+
+        Says nothing about the settlement TWAP window length and is never used to
+        infer or check it.
+        """
+        if self.observations_accepted < 2 or elapsed_seconds <= 0:
+            return None
+        return elapsed_seconds * 1000.0 / self.observations_accepted
+
+
+class TokenCache:
+    """`(slug, direction) -> CLOB token id`, populated from official metadata.
+
+    The Executor's TokenResolver is synchronous and the lookup is a network call,
+    so ids are fetched once when a market opens and read from here afterwards. A
+    miss raises rather than returning a plausible id: submitting against a guessed
+    token places a real order on the opposite outcome and every field on it looks
+    correct.
+    """
+
+    __slots__ = ("_by_slug",)
+
+    def __init__(self) -> None:
+        self._by_slug: dict[str, dict[Direction, str]] = {}
+
+    def put(self, slug: str, direction: Direction, token_id: str) -> None:
+        self._by_slug.setdefault(slug, {})[direction] = token_id
+
+    def drop(self, slug: str) -> None:
+        self._by_slug.pop(slug, None)
+
+    def known(self, slug: str) -> bool:
+        return len(self._by_slug.get(slug, {})) == 2
+
+    def __call__(self, market_slug: str, direction: Direction) -> str:
+        token_id = self._by_slug.get(market_slug, {}).get(direction)
+        if token_id is None:
+            raise ArcError(
+                f"no official token id for {market_slug} {direction.value}; "
+                "refusing to trade a token id that was not published by the venue"
+            )
+        return token_id
+
+
+class ArcRuntime:
+    """One run. Owns every engine, in one process, for one mode.
+
+    Everything mutable is an attribute of this object. A second run in the same
+    process is a second instance with its own markets, accumulators and validator
+    history (A11).
+    """
+
+    __slots__ = (
+        "_bucket",
+        "_clock",
+        "_decisions",
+        "_discovery",
+        "_drift",
+        "_executor",
+        "_feed",
+        "_fills",
+        "_logger",
+        "_next_ptb_attempt",
+        "_out",
+        "_previous_close",
+        "_reconciler",
+        "_repricer",
+        "_runtime",
+        "_settings",
+        "_settlement",
+        "_spec",
+        "_store",
+        "_submitter",
+        "_sweeper",
+        "_validator",
+        "_venue_client",
+        "_watchdog",
+        "mode",
+        "rotator",
+        "started_at",
+        "stats",
+        "status",
+        "tokens",
+        "windows",
+    )
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        store: Store,
+        clock: Clock,
+        runtime: RuntimeState,
+        discovery: MarketDiscovery,
+        feed: TwapProvider,
+        executor: Executor,
+        out: TextIO,
+        venue_client: polymarket.AsyncSecureClient | None = None,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        trading = settings.trading
+        self._settings = settings
+        self._store = store
+        self._clock = clock
+        self._runtime = runtime
+        self._discovery = discovery
+        self._feed = feed
+        self._executor = executor
+        self._venue_client = venue_client
+        self._out = out
+        self._logger = logger
+        self.mode = executor.mode
+        self.status = RuntimeStatus.STOPPED
+        self.started_at = 0.0
+        self.stats = RuntimeStats()
+
+        self._validator = ObservationValidator()
+        self._watchdog = FeedWatchdog(
+            clock,
+            warn_ms=trading.feed_stale_warn_ms,
+            critical_ms=trading.feed_stale_critical_ms,
+        )
+        self._drift = DriftMonitor(
+            warn_ms=trading.clock_drift_warn_ms,
+            critical_ms=trading.clock_drift_critical_ms,
+        )
+        self._spec = SpecChecker(logger=logger)
+        self._settlement: dict[str, SettlementTwapCollector] = {}
+        # The L2 PTB source: the venue's published finalPrice for the previous
+        # market. Instance state, never module state — two runs in one process must
+        # not share a cached price (A11).
+        self._previous_close = PreviousClosePtbCache()
+        self._next_ptb_attempt: float = 0.0
+        self.tokens = TokenCache()
+
+        # ── execution half ───────────────────────────────────────────────────
+        self._bucket = TokenBucket(
+            sustained=trading.outbound_rate_sustained,
+            burst=trading.outbound_rate_burst,
+            now=clock.now(),
+        )
+        self._submitter = Submitter(
+            store,
+            executor,
+            bucket=self._bucket,
+            minimum=trading.min_tradable_size,
+            logger=logger,
+        )
+        self._fills = FillEngine(store, executor, logger=logger)
+        self._repricer = Repricer(
+            store,
+            executor,
+            RepricePolicy(
+                band_min=trading.entry_price_min,
+                band_max=trading.entry_price_max,
+                tick=trading.tick_size,
+            ),
+            bucket=self._bucket,
+            logger=logger,
+        )
+        self._sweeper = Sweeper(store, executor, logger=logger)
+        self._reconciler = Reconciler(store, executor, logger=logger)
+
+        # ── decision half ────────────────────────────────────────────────────
+        self._decisions = DecisionEngine(
+            store,
+            strategy_config=config_from_trading(trading),
+            limits=limits_from_trading(trading),
+            registry=default_registry(),
+            quota=QuotaLedger(
+                max_trades_per_market=trading.max_trades_per_market,
+                min_tradable_size=trading.min_tradable_size,
+            ),
+            quote_source=self._quote,
+            health_source=self.health,
+            logger=logger,
+        )
+
+        # The Window Engine holds no per-market state, so one instance correctly
+        # serves both markets alive across a close boundary (A11).
+        self.windows = WindowEngine(store, trading, logger=logger)
+        self.rotator = MarketRotator(
+            store,
+            clock,
+            offsets=trading.windows_by_priority,
+            windows=self.windows,
+            decisions=self._decisions,
+            logger=logger,
+        )
+
+    # ── operator gate ────────────────────────────────────────────────────────
+
+    def arm(self) -> None:
+        """The Start Trading button. Nothing else may call this."""
+        self._runtime.arm_execution()
+
+    def disarm(self) -> None:
+        """The Stop Trading button. Stops NEW submissions and nothing else."""
+        self._runtime.disarm_execution()
+
+    # ── gate inputs ──────────────────────────────────────────────────────────
+
+    def health(self) -> RuntimeHealth:
+        """One snapshot of process state for the risk gates.
+
+        Gathered once per decision pass rather than gate by gate: fifteen gates
+        each taking their own live reading would evaluate fifteen slightly
+        different worlds and the verdict would depend on how long evaluation took.
+        """
+        drift = self._drift.last
+        realised = self._realised_losses()
+        return RuntimeHealth(
+            trading_enabled=self._runtime.trading_enabled,
+            spec_status=self._runtime.spec_status,
+            execution_armed=self._runtime.execution_armed,
+            trading_disabled_reason=self._runtime.reason,
+            feed_blocked=self._watchdog.blocked,
+            feed_age_ms=self._watchdog.age_ms(),
+            clock_drift_critical=drift is not None and drift.status == DriftStatus.CRITICAL,
+            clock_drift_ms=0.0 if drift is None else drift.offset_ms,
+            healthy=self.status == RuntimeStatus.running_for(self.mode),
+            detail="" if self.status == RuntimeStatus.running_for(self.mode) else self.status,
+            open_positions=len(self._store.live_orders()),
+            daily_loss_usd=realised[0],
+            consecutive_losses=realised[1],
+        )
+
+    def _realised_losses(self) -> tuple[Decimal, int]:
+        """Today's loss magnitude and the current losing streak, from settlements.
+
+        Read from the persisted ledger rather than from an in-memory counter so a
+        restart cannot reset a breached daily limit back to zero — which would let
+        the process resume trading precisely because it had just crashed.
+        """
+        cutoff = self._clock.now() - _DAY_SECONDS
+        loss = _ZERO
+        streak = 0
+        counting = True
+        for record in self._store.settlement_history(limit=200):
+            if record.pnl < _ZERO:
+                if record.settled_at >= cutoff:
+                    loss -= record.pnl
+                if counting:
+                    streak += 1
+            elif record.pnl > _ZERO:
+                counting = False
+        return loss, streak
+
+    def _quote(self, market_slug: str, direction: Direction) -> Decimal | None:
+        """The book price the strategy sizes against.
+
+        Synchronous because the decision pass is synchronous. The executor's own
+        `best_price` is a coroutine, so the value is taken from the cached book the
+        feed loop maintains — asked for here, resolved by the caller's event loop.
+        """
+        return _await_now(self._executor.best_price(market_slug, direction))
+
+    # ── PTB ──────────────────────────────────────────────────────────────────
+
+    async def _attempt_ptb(self, now: float) -> None:
+        """Obtain the official PTB for the live market. Retries until too late.
+
+        A market that opens without a PTB is NOT yet a dead market. The venue writes
+        `eventMetadata` roughly 25 seconds after a market closes, so the live
+        market's official opening reference — the previous market's published
+        `finalPrice` — does not exist at the instant the market opens. Marking the
+        market DEAD on the first miss would kill every single market for a value
+        that was about to be published.
+
+        The retry is bounded by the market's own earliest execution window. Past
+        that instant a PTB could not be used, so the market is marked DEAD with the
+        reason recorded (A1 Rule 1). Nothing is estimated at any point.
+        """
+        market = self.rotator.current
+        if market is None or market.ptb is not None or market.phase is MarketPhase.DEAD:
+            return
+        if now < self._next_ptb_attempt:
+            return
+        self._next_ptb_attempt = now + _PTB_RETRY_SECONDS
+
+        # L2 first, and unconditionally: the previous market's finalPrice is fetched
+        # even when L1 is about to succeed, because caching it is how the NEXT market
+        # gets its reference. Doing it only on an L1 miss would leave the cache empty
+        # in exactly the runs where it is needed.
+        await self._cache_previous_close(market.window_ts)
+
+        try:
+            metadata = await self._discovery.fetch_metadata(market.slug)
+        except FeedError as exc:
+            self._maybe_dead(market, now, f"metadata request failed: {exc}")
+            return
+
+        resolution = resolve_ptb(
+            metadata,
+            window_ts=market.window_ts,
+            previous_close=self._previous_close.for_window(market.window_ts),
+        )
+        if not resolution.available:
+            self._maybe_dead(market, now, resolution.detail)
+            return
+
+        if freeze_ptb_for(market, resolution, logger=self._logger):
+            assert resolution.value is not None
+            self._store.save_ptb(market.slug, resolution.value, now)
+            self.stats.ptb_frozen += 1
+            self._print_ptb_line(market.slug, resolution)
+
+    async def _cache_previous_close(self, window_ts: int) -> None:
+        """Fetch the market that closed at `window_ts` and cache its final price.
+
+        Silent on failure. The field is null for a market's entire life, so a fetch
+        that finds nothing is the ordinary case; the caller discovers the absence by
+        the PTB staying unresolved.
+        """
+        settled_window_ts = window_ts - MARKET_DURATION_SECONDS
+        if self._previous_close.for_window(window_ts) is not None:
+            return
+        try:
+            metadata = await self._discovery.fetch_metadata(slug_for(settled_window_ts))
+        except FeedError:
+            return
+        entry = self._previous_close.offer(metadata, settled_window_ts=settled_window_ts)
+        if entry is not None:
+            log_event(
+                logging.INFO,
+                "PTB Cached",
+                f"{entry.raw}  from settled market {entry.settled_window_ts}  "
+                f"opens {entry.opens_window_ts}",
+                logger=self._logger,
+            )
+
+    def _maybe_dead(self, market: MarketInstance, now: float, detail: str) -> None:
+        """Mark the market DEAD only once its earliest execution window has passed.
+
+        Before that instant an unresolved PTB is a value that has not been published
+        yet and the correct response is to try again. After it, no PTB can arrive in
+        time, and leaving the market PENDING forever would hide a permanently
+        unusable market behind a hopeful state.
+        """
+        if now < self._ptb_deadline(market):
+            return
+        market.phase = MarketPhase.DEAD
+        market.dead_reason = DEAD_REASON_PTB_UNAVAILABLE
+        self._store.save_phase(market.slug, MarketPhase.DEAD, now, DEAD_REASON_PTB_UNAVAILABLE)
+        log_event(
+            logging.ERROR,
+            "PTB Unavailable",
+            f"{market.slug} — no trading this market ({detail})",
+            logger=self._logger,
+        )
+        self.stats.ptb_unavailable += 1
+
+    def _ptb_deadline(self, market: MarketInstance) -> float:
+        """The last instant a PTB could still be used: the first window's activation.
+
+        Derived from the configured offsets rather than a constant, so a change to
+        the window set moves the deadline with it instead of silently disagreeing.
+        """
+        offsets = self._settings.trading.windows_by_priority
+        return float(market.close_ts - max(offsets)) if offsets else float(market.close_ts)
+
+    # ── observations ─────────────────────────────────────────────────────────
+
+    def _handle_frame(self, frame: str | bytes) -> None:
+        """Validate one frame and route it. Rejections are counted, never repaired."""
+        received_at = self._clock.now()
+        try:
+            payload = json.loads(frame)
+        except ValueError:
+            self.stats.observations_rejected += 1
+            return
+
+        for message in _messages_in(payload):
+            self._handle_message(message, received_at)
+
+    def _handle_message(self, message: Any, received_at: float) -> None:
+        self._spec.offer(message)
+        try:
+            observation = self._validator.validate_payload(
+                message, expected_symbol=EXPECTED_SYMBOL, received_at=received_at
+            )
+        except ObservationRejectedError:
+            self.stats.observations_rejected += 1
+            return
+
+        self.stats.observations_accepted += 1
+        self._watchdog.tick()
+        # The feed carries the venue's own timestamp; comparing it to the local clock
+        # is the only drift measurement available on a VPS with no other reference.
+        self._drift.observe(received_at, observation.ts)
+
+        for market in self.rotator.route(observation):
+            self._store.save_observation(market.slug, observation, received_at)
+            self.stats.per_market_ticks[market.slug] = (
+                self.stats.per_market_ticks.get(market.slug, 0) + 1
+            )
+            collector = self._settlement.get(market.slug)
+            if collector is not None and collector.offer(observation):
+                self.stats.settlement_samples += 1
+                self.stats.settlement_stream_found = True
+
+        # Re-evaluate frozen triggers now, not on the next tick. The signal TWAP only
+        # moves when an observation lands, so this is the only instant at which a
+        # trigger can newly become satisfied; deferring it to the 200 ms loop would
+        # make the check sampled rather than continuous (A12).
+        self.rotator.evaluate_windows(received_at)
+
+    # ── the limit order engine ───────────────────────────────────────────────
+
+    async def _drive_execution(self, now: float) -> None:
+        """Submit, fill, reprice. Level-triggered and idempotent, like everything else.
+
+        Reads its work from SQLite rather than from a queue: an intent persisted but
+        not yet submitted is discovered on the next pass regardless of what killed
+        the process in between, which is what makes a restart resume instead of drop
+        the window.
+        """
+        for market in self._live_markets():
+            await self._submit_pending(market, now)
+            report = await self._fills.poll(market.slug, now)
+            self.stats.fills_recorded += len(report.new_fills)
+            await self._reprice_open(market.slug, now)
+
+    async def _submit_pending(self, market: MarketInstance, now: float) -> None:
+        """Submit every persisted intent that has no order yet.
+
+        BOTH gates are re-checked here and not only inside the risk engine. The
+        gates were evaluated when the intent was created; an operator pressing Stop
+        Trading, or ARC disabling trading, in the milliseconds between creation and
+        submission must stop the order, and the only place that can still see that
+        change is this one.
+        """
+        if market.phase is not MarketPhase.ACTIVE:
+            return
+        if not self._runtime.gate.submitting:
+            return
+        submitted_offsets = {o.offset_seconds for o in self._store.orders_for(market.slug)}
+        for intent in self._store.intents_for(market.slug):
+            if intent.offset_seconds in submitted_offsets:
+                continue
+            orders = await self._submitter.submit(
+                intent,
+                count=self._settings.trading.submission_count,
+                phase=market.phase,
+                now=now,
+            )
+            self.stats.orders_submitted += len(orders)
+
+    async def _reprice_open(self, market_slug: str, now: float) -> None:
+        for order in self._fills.unfilled(market_slug):
+            moved: Order = await self._repricer.maybe_reprice(order, now)
+            if moved.order_id != order.order_id:
+                self.stats.orders_repriced += 1
+
+    def _live_markets(self) -> tuple[MarketInstance, ...]:
+        return tuple(m for m in (self.rotator.current, self.rotator.closing) if m is not None)
+
+    # ── venue metadata ───────────────────────────────────────────────────────
+
+    async def _load_tokens(self, slug: str) -> None:
+        """Cache the official token id for each side of one market.
+
+        Labels are matched, never positions. `clobTokenIds` is an ordered list with
+        no side information attached; taking index 0 as Up would place real orders
+        on the opposite outcome on any market where the venue ordered them the other
+        way, and nothing about the resulting order would look wrong.
+        """
+        if self._venue_client is None or self.tokens.known(slug):
+            return
+        try:
+            market = await self._venue_client.get_market(slug=slug)
+        except Exception as exc:
+            log_event(
+                logging.WARNING,
+                "Token Ids Unavailable",
+                f"{slug}  {exc}",
+                logger=self._logger,
+            )
+            return
+        for outcome in (market.outcomes.yes, market.outcomes.no):
+            if outcome.token_id is None:
+                continue
+            label = outcome.label.strip().lower()
+            if label in _UP_LABELS:
+                self.tokens.put(slug, Direction.UP, str(outcome.token_id))
+            elif label in _DOWN_LABELS:
+                self.tokens.put(slug, Direction.DOWN, str(outcome.token_id))
+
+    # ── loops ────────────────────────────────────────────────────────────────
+
+    async def _main_loop(self, market_target: int | None) -> None:
+        """The level-triggered pass. Not a schedule (A12).
+
+        `market_target=None` is the production case: run until cancelled.
+        """
+        while market_target is None or self.stats.markets_processed < market_target:
+            now = self._clock.now()
+            event = self.rotator.advance(now)
+            if event.opened:
+                self.stats.markets_processed += 1
+                market = self.rotator.current
+                if market is not None:
+                    self._settlement[market.slug] = SettlementTwapCollector(
+                        market_slug=market.slug, close_ts=market.close_ts
+                    )
+                    await self._load_tokens(market.slug)
+                # Retry immediately on the new market rather than waiting out the
+                # interval left over from the previous one.
+                self._next_ptb_attempt = 0.0
+                self._print_market_line(event.opened, event.closed)
+            if event.closed:
+                # Every remaining order on the closed market is retracted before its
+                # settlement: an order still resting past close can fill against the
+                # settled outcome, and that position was never approved by any gate.
+                await self._sweeper.sweep(event.closed, now)
+            if event.archived:
+                self._settlement.pop(event.archived, None)
+                self.tokens.drop(event.archived)
+
+            await self._attempt_ptb(now)
+            self._watchdog.evaluate()
+            self._gate_on_health()
+            await self._drive_execution(now)
+            await asyncio.sleep(_TICK_SECONDS)
+
+    def _gate_on_health(self) -> None:
+        """A blocked feed disables trading; a recovered feed does not re-enable it.
+
+        Re-enabling is the spec check's job and requires VERIFIED status. A watchdog
+        that could enable trading would be a second, weaker authority over the same
+        flag, and the weaker one would win whenever data happened to be flowing.
+        """
+        if self._watchdog.blocked and self._runtime.trading_enabled:
+            self._runtime.disable_trading("FEED_STALE")
+
+    async def _feed_loop(self) -> None:
+        attempts = self._feed.connect_attempts
+        async for frame in self._feed.messages():
+            if self._feed.connect_attempts > attempts:
+                self.stats.reconnects += self._feed.connect_attempts - attempts
+                attempts = self._feed.connect_attempts
+            self._handle_frame(frame)
+
+    async def recover(self, now: float) -> None:
+        """Reconcile what the previous process left behind. Runs before any submission.
+
+        Reconciliation before submission, always: an order this process does not
+        know about may still be resting, and submitting on top of it doubles the
+        position while both orders look entirely genuine (A14).
+        """
+        runner = RecoveryRunner(self._store, self._reconciler, self._fills, logger=self._logger)
+        report = await runner.run(now)
+        if not report.safe_to_trade and self._runtime.trading_enabled:
+            self._runtime.disable_trading("RECOVERY_UNRESOLVED")
+
+    async def run(self, *, market_target: int | None = None) -> RuntimeStats:
+        """Start every engine and run until cancelled.
+
+        The feed task is cancelled by the main loop exiting rather than the other
+        way round: the feed reconnects forever by design, so it can never be what
+        ends the run.
+        """
+        self.status = RuntimeStatus.STARTING
+        self.started_at = self._clock.now()
+        self._print_header()
+        await self.recover(self.started_at)
+
+        feed_task = asyncio.create_task(self._feed_loop())
+        self.status = RuntimeStatus.running_for(self.mode)
+        try:
+            await self._main_loop(market_target)
+        finally:
+            self.status = RuntimeStatus.STOPPING
+            feed_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await feed_task
+            self.status = RuntimeStatus.STOPPED
+
+        self._spec.apply(self._runtime)
+        self._print_summary(self._clock.now() - self.started_at)
+        return self.stats
+
+    # ── output ───────────────────────────────────────────────────────────────
+
+    def _print_header(self) -> None:
+        gate = self._runtime.gate
+        self._out.write(
+            f"\narc run — mode {self.mode.value}\n"
+            f"  feed        {self._feed.url}\n"
+            f"  database    {self._store.path}\n"
+            f"  trading     {'ENABLED' if gate.enabled else 'DISABLED'}  {gate.reason}\n"
+            f"  execution   {'ARMED' if gate.armed else 'NOT ARMED'}\n\n"
+        )
+
+    def _print_market_line(self, opened: str, closed: str) -> None:
+        """Report the rotation. The PTB is deliberately NOT printed here.
+
+        At the instant a market opens its official opening reference has not been
+        published yet, so printing it here would print UNAVAILABLE on every healthy
+        market. The PTB gets its own line when it actually arrives.
+        """
+        ticks = self.stats.per_market_ticks.get(closed, 0) if closed else 0
+        if closed:
+            self._out.write(f"  rotated  {closed} closed after {ticks} ticks\n")
+        self._out.write(f"  opened   {opened}\n")
+
+    def _print_ptb_line(self, slug: str, resolution: PtbResolution) -> None:
+        self._out.write(f"  ptb      {resolution.value}  {slug}  via {resolution.source}\n")
+
+    def _print_summary(self, elapsed: float) -> None:
+        stats = self.stats
+        cadence = stats.observed_cadence_ms(elapsed)
+        result = self._spec.result
+        self._out.write(
+            "\nruntime summary\n"
+            f"  markets processed       {stats.markets_processed}\n"
+            f"  ptb frozen              {stats.ptb_frozen}\n"
+            f"  ptb unavailable         {stats.ptb_unavailable}\n"
+            f"  observations accepted   {stats.observations_accepted}\n"
+            f"  observations rejected   {stats.observations_rejected}\n"
+            f"  feed cadence            "
+            f"{'unknown' if cadence is None else f'{cadence:.0f} ms mean gap'}\n"
+            f"  reconnects              {stats.reconnects}\n"
+            f"  orders submitted        {stats.orders_submitted}\n"
+            f"  orders repriced         {stats.orders_repriced}\n"
+            f"  fills recorded          {stats.fills_recorded}\n"
+            f"  settlement stream       "
+            f"{'found' if stats.settlement_stream_found else 'NOT FOUND'}\n"
+            f"  settlement samples      {stats.settlement_samples}\n"
+            f"  spec status             {result.status.value}  {result.reason}\n"
+            f"  unresolved              {', '.join(result.unresolved()) or 'none'}\n"
+            f"  trading                 "
+            f"{'ENABLED' if self._runtime.trading_enabled else 'DISABLED'}"
+            f"  {self._runtime.reason}\n\n"
+        )
+
+
+def _messages_in(payload: object) -> tuple[Any, ...]:
+    """Flatten the relay envelope. A list of ticks and a single tick both occur."""
+    if isinstance(payload, list):
+        return tuple(payload)
+    if isinstance(payload, dict):
+        inner = payload.get("payload", payload.get("data"))
+        if isinstance(inner, list):
+            return tuple(inner)
+        if isinstance(inner, dict):
+            return (inner,)
+        return (payload,)
+    return ()
+
+
+def _await_now[T](awaitable: Any) -> T | None:
+    """Resolve an already-complete coroutine from synchronous code.
+
+    Both executors answer `best_price` from an in-memory book, so the coroutine
+    never suspends and completing it by hand is exact. If one ever did suspend,
+    this returns None — a missing quote, which skips the window — rather than a
+    stale price, because sizing against a price that has moved is the failure the
+    quote gate exists to prevent.
+    """
+    coro = awaitable
+    try:
+        coro.send(None)
+    except StopIteration as done:
+        return done.value  # type: ignore[no-any-return]
+    coro.close()
+    return None
+
+
+async def build_executor(
+    settings: Settings,
+    store: Store,
+    tokens: TokenCache,
+    *,
+    logger: logging.Logger | None = None,
+) -> tuple[Executor, polymarket.AsyncSecureClient | None]:
+    """The ONE component that differs between V1 and V2 (Q4).
+
+    Returns the venue client alongside it because V2 needs the same authenticated
+    client for official token metadata; V1 has none and returns None, which is what
+    keeps the paper path free of any venue credential.
+    """
+    if settings.mode is not Mode.V2:
+        return PaperExecutor(), None
+
+    env = settings.env
+    client = await polymarket.AsyncSecureClient.create(
+        private_key=env.polymarket_private_key.get_secret_value(),
+        credentials=polymarket.ApiKeyCreds(
+            key=env.polymarket_api_key.get_secret_value(),
+            secret=env.polymarket_api_secret.get_secret_value(),
+            passphrase=env.polymarket_api_passphrase.get_secret_value(),
+        ),
+    )
+
+    def local_id(market_slug: str, venue_order_id: str) -> str:
+        """Adapts the store's positional lookup to the resolver's keyword protocol."""
+        return store.local_order_id(market_slug, venue_order_id)
+
+    return LiveExecutor(client, tokens, local_id, logger=logger), client
+
+
+async def run_arc(
+    settings: Settings,
+    store: Store,
+    clock: Clock,
+    out: TextIO,
+    *,
+    market_target: int | None = None,
+    logger: logging.Logger | None = None,
+) -> int:
+    """Startup steps 2-5 and the runtime loop. Returns a process exit code.
+
+    Returns 0 even when the spec could not be verified. A non-zero exit would tell
+    PM2 to restart, and restarting changes nothing about an unverifiable spec while
+    losing the in-memory market and the observations it had collected.
+    """
+    async with open_discovery(logger=logger) as discovery:
+        runtime = RuntimeState(store, clock)
+        runtime.load()
+        tokens = TokenCache()
+        executor, client = await build_executor(settings, store, tokens, logger=logger)
+        run = ArcRuntime(
+            settings=settings,
+            store=store,
+            clock=clock,
+            runtime=runtime,
+            discovery=discovery,
+            feed=build_provider(settings.env.twap_provider, clock, logger=logger),
+            executor=executor,
+            out=out,
+            venue_client=client,
+            logger=logger,
+        )
+        # The runtime's own cache, so the resolver the executor holds is the one the
+        # market loop fills. Two caches would let the executor resolve from an empty
+        # one and refuse every submission on a perfectly healthy market.
+        run.tokens = tokens
+        try:
+            await run.run(market_target=market_target)
+        finally:
+            if client is not None:
+                await client.close()
+    return 0

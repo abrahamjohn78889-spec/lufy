@@ -1,0 +1,2408 @@
+ith subtly different behaviour inside the trading path is two strategies pretending to be one.
+
+
+
+# PROMPT 6 — OPERATIONS CENTER (PART 1)
+
+## Objective
+
+Build ARC's production-grade **Operations Center**.
+
+This is the operator's primary interface for monitoring and controlling the bot.
+
+It must provide complete transparency into everything happening inside ARC without introducing any trading logic.
+
+The Operations Center **must never**:
+
+* determine Direction
+* determine PTB
+* determine Signal TWAP
+* determine Settlement TWAP
+* determine Trigger
+* determine Buffer
+* determine Strategy
+* determine Risk
+* determine Execution
+
+It only visualizes and controls the existing engines.
+
+Everything displayed must originate from the runtime.
+
+No duplicated business logic is allowed inside the UI.
+
+The Operations Center must remain:
+
+* simple
+* fast
+* deterministic
+* transparent
+* responsive
+* production ready
+* suitable for continuous 24×7 VPS operation
+
+---
+
+# Objective Philosophy
+
+The operator should always know:
+
+* What market ARC is trading
+* What window is currently active
+* What Direction was frozen
+* What PTB was frozen
+* What Trigger is locked
+* What the Decision Engine decided
+* What the Limit Order Engine is doing
+* What orders exist
+* What fills happened
+* What remains pending
+* What recovery is doing
+* Whether ARC is healthy
+* Why ARC is waiting
+* Why ARC rejected something
+* Why trading is disabled
+
+Nothing important should ever be hidden.
+
+---
+
+# Scope
+
+```
+arc/api/app.py
+
+arc/api/routes.py
+
+arc/api/ws.py
+
+arc/api/models.py
+
+arc/web/index.html
+
+arc/web/app.js
+
+arc/web/style.css
+```
+
+Modify
+
+```
+arc/cli.py
+```
+
+`arc run` now starts:
+
+* Runtime
+* Market Engine
+* Window Engine
+* Decision Engine
+* Risk Engine
+* Limit Order Engine
+* Recovery
+* WebSocket
+* Dashboard
+
+as one production process.
+
+---
+
+# Out of Scope
+
+Do NOT build:
+
+* new strategies
+* strategy selector
+* strategy ranking
+* strategy recommendations
+* ML
+* AI
+* optimizer
+* login
+* users
+* sessions
+* JWT
+* OAuth
+* RBAC
+* cloud deployment
+* enterprise dashboards
+
+---
+
+# Dashboard Architecture
+
+The dashboard is divided into workspaces.
+
+Each workspace has one responsibility.
+
+```
+OPS DECK
+
+SIGNAL TANK
+
+LEDGER
+
+ANALYTICS
+
+SYSTEM
+
+SETTINGS
+
+BACKTEST
+
+ORDER BOOK
+```
+
+No additional pages unless required later.
+
+---
+
+# OPS DECK (Main Page)
+
+The OPS Deck is the default page.
+
+Everything required to safely operate ARC is visible here.
+
+The operator should rarely need another page during live trading.
+
+---
+
+# Two Official Polymarket Timers
+
+Display the official 5-minute countdown in TWO places.
+
+### Timer 1
+
+Top center of the OPS Deck.
+
+This is the primary market timer.
+
+It must visually match the official Polymarket timer.
+
+---
+
+### Timer 2
+
+Inside Signal Tank.
+
+The same countdown.
+
+Always synchronized.
+
+Never drift.
+
+---
+
+# Runtime Status
+
+Display
+
+* Bot Status
+* Runtime Status
+* Current Market
+* Next Market
+* Market Phase
+* Current Window
+* Current Strategy
+* Current Provider
+* Trading Enabled
+* Observation Mode
+* Disable Reason
+
+---
+
+# Engine Status
+
+Display live health of every engine.
+
+```
+Market Engine
+
+Window Engine
+
+Decision Engine
+
+Risk Engine
+
+Limit Order Engine
+
+Recovery Engine
+
+Provider
+
+WebSocket
+
+RPC
+
+Wallet
+```
+
+Each engine displays:
+
+* Running
+* Waiting
+* Reconnecting
+* Warning
+* Error
+
+Green
+
+Yellow
+
+Red
+
+---
+
+# V1 / V2 Controls
+
+Large Start / Stop buttons.
+
+Display
+
+```
+V1 PAPER
+
+V2 LIVE
+```
+
+Each has
+
+Start
+
+Stop
+
+Status
+
+Current Mode
+
+Never allow both to run simultaneously.
+
+---
+
+# Preflight Check
+
+Before V2 starts execute a complete preflight.
+
+Display
+
+PASS
+
+WARNING
+
+FAIL
+
+Checks include
+
+* Configuration
+* SQLite
+* Runtime
+* Wallet
+* Provider
+* RTDS
+* Clock
+* Feed
+* PTB
+* Recovery
+* Risk Engine
+* Decision Engine
+* Limit Order Engine
+* WebSocket
+* RPC
+
+If startup fails,
+
+the operator immediately knows why.
+
+---
+
+# Running TWAP Panel
+
+Continuously display
+
+* Running Signal TWAP
+* Official 30-second Settlement TWAP (Live Observation)
+* Frozen PTB
+* Frozen Direction
+* Locked Trigger
+* Active Window
+* Configured Buffer
+
+Frozen values never change.
+
+Running values update continuously.
+
+---
+
+# Active Window Panel
+
+Display
+
+* Current Window
+* Activation Time
+* Remaining Time
+* Frozen PTB
+* Frozen Signal TWAP
+* Frozen Direction
+* Locked Trigger
+* Trigger Status
+
+If
+
+```
+NO_DIRECTION
+```
+
+display it clearly.
+
+Never hide it.
+
+Never infer another Direction.
+
+---
+
+# Limit Order Engine
+
+This is one of the largest panels.
+
+Display live execution.
+
+Execution flow
+
+```
+Waiting For Window
+
+↓
+
+Window Open
+
+↓
+
+Values Frozen
+
+↓
+
+ExecutionIntent Created
+
+↓
+
+Order Submitted
+
+↓
+
+Waiting For Fill
+
+↓
+
+Filled
+
+or
+
+BUFFER_NOT_SATISFIED
+
+↓
+
+Settlement
+```
+
+Every transition visible.
+
+Nothing hidden.
+
+Submission and Fill remain separate.
+
+---
+
+# Market Information
+
+Display
+
+* Current Market
+* Current Phase
+* Current PTB
+* Running Signal TWAP
+* Settlement TWAP
+* Current Direction
+* Trigger Status
+* Buffer
+* Submission Count
+* Current Position
+* Current Balance
+* Running P/L
+
+---
+
+# Signal Tank
+
+Signal Tank is ARC's live activity stream.
+
+Everything happening inside the runtime appears here.
+
+Examples
+
+```
+Connected
+
+Disconnected
+
+Reconnecting
+
+RTDS Connected
+
+RTDS Disconnected
+
+Provider Connected
+
+Provider Reconnected
+
+Wallet Connected
+
+Wallet Reconnected
+
+RPC Connected
+
+RPC Reconnected
+
+Market Discovered
+
+PTB Frozen
+
+Signal TWAP Updated
+
+Settlement TWAP Updated
+
+Window Open
+
+Direction Frozen
+
+ExecutionIntent Created
+
+Order Submitted
+
+Partial Fill
+
+Order Filled
+
+Cancelled
+
+Rejected
+
+BUFFER_NOT_SATISFIED
+
+Settlement Received
+
+Recovery Started
+
+Recovery Completed
+
+PM2 Restart
+
+Process Restart
+
+Fatal Error
+
+Warning
+```
+
+Every entry displays
+
+* Timestamp
+* Engine
+* Severity
+* Message
+
+Signal Tank is the operator's runtime console.
+
+---
+
+# Unified Ledger
+
+There is NO separate Orders page.
+
+The Ledger contains everything.
+
+Live.
+
+Historical.
+
+Searchable.
+
+Filterable.
+
+Every order appears immediately after submission.
+
+Every update modifies the existing record.
+
+Nothing disappears.
+
+Each row contains
+
+* Market
+* Window
+* PTB
+* Signal TWAP
+* Settlement TWAP
+* Direction
+* Locked Trigger
+* ExecutionIntent ID
+* Local Order ID
+* Venue Order ID
+* Submission Time
+* Fill Time
+* Order Price
+* Fill Price
+* Quantity
+* Filled Quantity
+* Remaining Quantity
+* Current State
+* Rejection Reason
+* Settlement
+* Profit / Loss
+
+Live updates continue automatically.
+
+---
+
+# Analytics
+
+Operator analytics only.
+
+No optimization.
+
+Display
+
+* Markets Processed
+* Filled Orders
+* Rejected Orders
+* BUFFER_NOT_SATISFIED Count
+* Win Count
+* Loss Count
+* Average Fill Time
+* Runtime Uptime
+* Feed Latency
+* RPC Latency
+* WebSocket Latency
+
+No strategy recommendations.
+
+No optimization engine.
+
+No AI.
+
+---
+
+# System
+
+Runtime information only.
+
+Display
+
+* VPS Hostname
+* Operating System
+* CPU
+* Memory
+* Disk
+* SQLite Status
+* PM2 Status
+* Python Version
+* ARC Version
+* Git Commit
+* Active Provider
+* Wallet
+* RTDS
+* WebSocket
+* RPC
+* Telegram
+* Restart Count
+* Runtime Uptime
+
+Everything read-only.
+
+---
+
+# Telegram Integration
+
+Telegram support is part of the Operations Center.
+
+Telegram is notification only.
+
+It must NEVER control trading.
+
+Configurable via Settings.
+
+Notification categories:
+
+* Startup
+* Shutdown
+* Fatal Errors
+* Warnings
+* Feed Disconnect
+* Feed Reconnect
+* Wallet Disconnect
+* Wallet Reconnect
+* Provider Reconnect
+* PTB Frozen
+* Window Open
+* Direction Frozen
+* ExecutionIntent Created
+* Order Submitted
+* Partial Fill
+* Order Filled
+* Cancelled
+* Rejected
+* BUFFER_NOT_SATISFIED
+* Settlement
+* Daily Summary
+
+Each category can be individually enabled or disabled.
+
+---
+
+# Settings
+
+Display configuration only.
+
+Editable:
+
+* Buffers
+* Enabled Windows
+* Submission Count
+* Notification Settings
+* Provider Selection (RTDS default, Chainlink when configured)
+
+Read-only:
+
+* Strategy
+
+Always display
+
+```
+ARC TWAP Locked Buffer
+```
+
+No strategy selector.
+
+No dropdown.
+
+No strategy switching.
+
+---
+
+**End of Prompt 6 – Part 1**
+
+
+
+
+# PROMPT 6 — OPERATIONS CENTER (PART 2)
+
+# API Contract
+
+Exactly these routes.
+
+Nothing else.
+
+```
+CONTROL
+
+/start
+
+/pause
+
+/resume
+
+/stop
+
+
+STATE
+
+/status
+
+/settings
+
+/history
+
+
+STRATEGY
+
+/strategies
+
+/strategies/{id}
+
+/strategies/{id}/config
+
+
+RESEARCH
+
+/backtest
+
+/orderbook
+
+
+LIVE
+
+/ws
+```
+
+There is NO
+
+```
+/health
+```
+
+There are NO hidden endpoints.
+
+No debug endpoints.
+
+No admin endpoints.
+
+---
+
+# WebSocket Contract
+
+The dashboard must receive all runtime updates through WebSocket.
+
+Never poll continuously.
+
+Updates include
+
+* Runtime
+* Market
+* Provider
+* PTB
+* Signal TWAP
+* Settlement TWAP
+* Direction
+* Trigger
+* Window
+* Order
+* Fill
+* Ledger
+* Signal Tank
+* Statistics
+
+Reconnect automatically.
+
+If disconnected
+
+Grey out values.
+
+Never display stale values as live.
+
+---
+
+# Decimal Contract
+
+Every Decimal crossing the API boundary is serialized as STRING.
+
+Never JSON numbers.
+
+Examples
+
+```
+"0.74"
+
+"120153.42"
+
+"35.000000"
+
+"1.25"
+```
+
+No floating point precision loss anywhere.
+
+---
+
+# Dashboard Rules
+
+The dashboard MUST NEVER
+
+* calculate Direction
+* calculate PTB
+* calculate Signal TWAP
+* calculate Settlement TWAP
+* calculate Buffer
+* calculate Trigger
+* calculate Strategy
+* calculate Execution
+* calculate Risk
+
+It only visualizes backend state.
+
+Business logic belongs only inside the engines.
+
+---
+
+# Transparency Rules
+
+Every major action performed by ARC must become visible somewhere.
+
+Nothing important is silent.
+
+Examples
+
+```
+PTB Frozen
+
+Window Open
+
+Direction Frozen
+
+Trigger Locked
+
+ExecutionIntent Created
+
+Risk Approved
+
+Risk Denied
+
+Order Submitted
+
+Partial Fill
+
+Order Filled
+
+Cancelled
+
+Rejected
+
+BUFFER_NOT_SATISFIED
+
+Settlement
+
+Recovery Started
+
+Recovery Complete
+```
+
+The operator should always understand exactly what ARC is doing.
+
+---
+
+# Runtime Contracts
+
+The dashboard must correctly represent
+
+Waiting
+
+Running
+
+Paused
+
+Recovering
+
+Reconnecting
+
+Observation Only
+
+Trading Disabled
+
+Trading Enabled
+
+Fatal Error
+
+Graceful Shutdown
+
+No hidden runtime states.
+
+---
+
+# Limit Order Engine Visualization
+
+The dashboard must clearly distinguish
+
+```
+Order Submitted
+
+≠
+
+Order Filled
+```
+
+These are different lifecycle events.
+
+Display separately.
+
+If an order never fills
+
+Display
+
+```
+BUFFER_NOT_SATISFIED
+```
+
+Never classify it as a rejection.
+
+Never classify it as a fill.
+
+Never hide it.
+
+---
+
+# Rejection Visualization
+
+Display rejection reason separately from order state.
+
+Order State
+
+```
+Rejected
+```
+
+Reason
+
+```
+POST_ONLY_WOULD_CROSS
+
+ENTRY_PRICE_LIMIT
+
+MARKET_CANCELLING
+
+TRADING_DISABLED_SPEC_UNVERIFIED
+
+...
+
+```
+
+The reason survives restart.
+
+The dashboard reads the stable internal rejection code.
+
+Never depend on venue error text.
+
+---
+
+# Recovery Visualization
+
+When recovery starts
+
+Display
+
+```
+Recovery Running
+```
+
+Show
+
+* Recovery Stage
+* Markets Recovered
+* Orders Recovered
+* Pending Orders
+* Unknown Orders
+* Reconciliation Status
+
+Recovery progress updates continuously.
+
+---
+
+# Provider Panel
+
+Display
+
+```
+Provider
+
+RTDS
+
+Connection
+
+Latency
+
+Reconnect Count
+
+Last Observation
+
+Last Settlement Observation
+```
+
+If Chainlink becomes configured later
+
+Display
+
+```
+Provider
+
+CHAINLINK
+```
+
+Provider switching is configuration only.
+
+No UI logic.
+
+---
+
+# Execution Panel
+
+Display
+
+```
+Current Execution Mode
+
+Paper
+
+Live
+
+Submission Count
+
+Current Exposure
+
+Current Position
+
+Open Orders
+
+Working Orders
+
+Filled Orders
+
+Cancelled Orders
+
+Rejected Orders
+```
+
+Live updates.
+
+---
+
+# Order Book Monitor
+
+The Order Book Monitor exists for transparency only.
+
+It may display
+
+* Best Bid
+* Best Ask
+* Spread
+* Market Depth
+* Current Passive Limit Price
+
+It MUST NEVER
+
+* determine Direction
+* determine Strategy
+* determine PTB
+* determine Trigger
+
+Its only execution responsibility is showing the book that the Limit Order Engine already uses.
+
+---
+
+# Backtesting Page
+
+Build exactly as A18 specifies.
+
+Historical visualization only.
+
+Display
+
+* BTC candles
+* Signal TWAP
+* PTB
+* Locked Trigger
+* Fire points
+
+Never display
+
+* Win Rate
+* Sharpe
+* ROI
+* Equity Curve
+* Strategy Ranking
+* Optimizer
+
+Permanent warning banner
+
+```
+Signal visualization only.
+
+Not performance.
+
+Polymarket settles on a
+30-second TWAP.
+
+Spot candles cannot reproduce
+settlement outcomes.
+```
+
+---
+
+# Acceptance Criteria
+
+```
+1.
+All sixteen primary dashboard elements from A16 visible without scrolling.
+
+2.
+OPS Deck is the default page.
+
+3.
+Two synchronized official Polymarket timers.
+
+4.
+Signal TWAP and Settlement TWAP visible simultaneously.
+
+5.
+PTB, Direction and Locked Trigger clearly separated.
+
+6.
+Limit Order Engine panel displays every lifecycle transition.
+
+7.
+Submitted, Waiting For Fill, Filled and BUFFER_NOT_SATISFIED shown separately.
+
+8.
+Signal Tank receives every runtime event.
+
+9.
+Unified Ledger records every order from submission through settlement.
+
+10.
+Analytics remain informational only.
+
+11.
+System page exposes runtime health.
+
+12.
+Telegram notifications configurable per category.
+
+13.
+Dashboard greys stale values after socket loss.
+
+14.
+Every Decimal serialized as STRING.
+
+15.
+Loopback bind enforced.
+
+16.
+No authentication code.
+
+17.
+Exactly twelve API routes.
+
+18.
+No /health endpoint.
+
+19.
+Current Strategy shown as read-only text.
+
+20.
+Provider displayed but never selectable from dashboard runtime.
+
+21.
+Trading Disabled banner always shows full disable reason.
+
+22.
+Recovery progress visible during reconciliation.
+
+23.
+Dashboard never contains trading logic.
+
+24.
+Everything updates live through WebSocket.
+
+25.
+OPS Deck clearly shows V1/V2 controls, Preflight status, Running Signal TWAP, Settlement TWAP, PTB, Limit Order Engine state and current market information.
+
+26.
+All backend events flow into Signal Tank in chronological order.
+
+27.
+Every submitted order immediately appears in the Unified Ledger and remains permanently searchable.
+
+28.
+Dashboard remains responsive throughout continuous 24×7 operation with no memory leaks or UI degradation during extended runtime.
+
+29.
+All runtime values shown on the dashboard originate from backend engines only. The frontend performs no business logic calculations.
+
+30.
+The interface remains clean, deterministic and operator-focused, prioritizing transparency over unnecessary visual complexity.
+```
+
+---
+
+# Tests Required
+
+```
+tests/test_api.py
+
+• exactly twelve routes
+• no /health
+• no auth middleware
+• non-loopback bind refused
+• all Decimal values serialized as strings
+
+
+tests/test_ws.py
+
+• websocket reconnect
+• live updates
+• stale values greyed
+• no stale-as-live
+
+
+tests/test_countdown.py
+
+• official timer synchronization
+• never negative
+• seconds floored
+• smooth countdown
+• window countdown
+
+
+tests/test_ops_deck.py
+
+• all OPS Deck widgets present
+• preflight panel
+• engine status
+• provider panel
+• V1/V2 controls
+• two synchronized timers
+• running Signal TWAP
+• Settlement TWAP
+• PTB
+• Limit Order Engine
+
+
+tests/test_signal_tank.py
+
+• runtime events streamed
+• reconnect
+• ordering preserved
+• timestamps
+• severity
+• engine source
+
+
+tests/test_ledger.py
+
+• submission recorded
+• fill updates
+• rejection updates
+• settlement updates
+• searchable
+• historical persistence
+
+
+tests/test_dashboard_contract.py
+
+• every A16 field present
+• Current Strategy read-only
+• Provider shown
+• RTDS status shown
+• Disable Reason displayed verbatim
+• Submitted / Waiting / Filled distinct
+• BUFFER_NOT_SATISFIED distinct
+• quota triple
+
+
+tests/test_system.py
+
+• runtime information
+• VPS
+• PM2
+• Python
+• Git commit
+• Telegram
+• Provider
+• Wallet
+• uptime
+
+
+tests/test_telegram.py
+
+• notification categories
+• enable/disable
+• startup
+• shutdown
+• fills
+• settlements
+• reconnects
+• fatal errors
+
+
+tests/test_ui_blindness.py
+
+• dashboard performs no trading logic
+• no PTB calculations
+• no TWAP calculations
+• no strategy calculations
+• no risk calculations
+```
+
+---
+
+# Definition of Done
+
+```
+pytest -v green
+
+ruff clean
+
+mypy clean
+
+arc run launches the complete runtime and dashboard together.
+
+The dashboard operates continuously through multiple real market rotations without UI degradation.
+
+Both official Polymarket timers remain synchronized.
+
+Signal Tank displays every runtime event.
+
+The Unified Ledger records every order lifecycle from submission to settlement.
+
+Telegram notifications function correctly.
+
+Disconnecting the provider greys stale values immediately.
+
+Recovery is fully visible after restart.
+
+The dashboard contains zero trading logic and acts solely as a transparent operational interface for ARC.
+
+grep -ri "auth|jwt|login|session|rbac" arc/api/ returns nothing.
+
+The Operations Center is suitable for continuous 24×7 production operation on a VPS with complete visibility into every stage of the trading lifecycle.
+```
+
+---
+
+# Report Required
+
+At completion report:
+
+* Files created
+* Files modified
+* UI architecture decisions
+* API decisions
+* WebSocket decisions
+* Telegram integration decisions
+* Performance decisions
+* Anything intentionally deferred
+* Validation commands executed
+* Screenshots (or rendered views) of every workspace
+* Any remaining blockers before Prompt 7
+
+**Do not proceed to Prompt 7 until Prompt 6 is fully implemented, tested, synchronized with Prompts 1–5, and all acceptance criteria are satisfied.**
+
+
+
+
+I would add **only** the following to Prompt 6. These don't change your trading strategy or Limit Order Engine—they make the operation more transparent and easier to monitor.
+
+---
+
+
+
+
+
+# PROMPT 6 — OPERATIONS CENTER (PART 3)
+
+## Final Production Requirements
+
+The Operations Center is the **single operational interface** for ARC.
+
+The operator should never need:
+
+* SSH
+* PM2 logs
+* SQLite browser
+* terminal output
+* Python console
+
+to understand what ARC is doing.
+
+Everything must be visible from the dashboard.
+
+---
+
+# Operational Philosophy
+
+Every action performed by ARC must satisfy one of these:
+
+* Visible on the OPS Deck
+* Streamed into Signal Tank
+* Recorded permanently in the Unified Ledger
+
+No execution may happen silently.
+
+---
+
+# Runtime Control
+
+The dashboard controls the runtime.
+
+Separate controls exist for
+
+```text
+V1 PAPER
+
+Start
+Stop
+```
+
+and
+
+```text
+V2 LIVE
+
+Start
+Stop
+```
+
+Both engines cannot run simultaneously.
+
+The runtime controls remain independent from trading.
+
+---
+
+# Trading Control
+
+Trading starts ONLY after the operator explicitly enables the **Limit Order Engine**.
+
+Runtime running ≠ Trading running.
+
+Workflow
+
+```text
+Start Runtime
+
+↓
+
+Runtime Healthy
+
+↓
+
+Operator Configures
+
+Buffer
+
+Enabled Windows
+
+Submission Count
+
+Position Size
+
+↓
+
+START TRADING
+
+↓
+
+Limit Order Engine
+
+Waiting For Window
+
+↓
+
+Automatic Trading
+```
+
+Stopping trading
+
+* stops NEW submissions
+* does NOT corrupt runtime
+* does NOT stop feeds
+* does NOT stop websocket
+* does NOT stop TWAP
+* does NOT stop PTB observation
+* does NOT stop recovery
+
+---
+
+# Configuration Lock
+
+While trading is active
+
+lock
+
+* Buffers
+* Enabled Windows
+* Submission Count
+* Position Size
+* Strategy configuration
+
+Operator workflow
+
+```text
+Stop Trading
+
+↓
+
+Edit Configuration
+
+↓
+
+Save
+
+↓
+
+Start Trading
+```
+
+Configuration cannot change during active execution.
+
+---
+
+# Runtime Timeline
+
+Display a compact timeline.
+
+Example
+
+```text
+Market Open
+
+↓
+
+15s Window
+
+↓
+
+10s Window
+
+↓
+
+7s Window
+
+↓
+
+5s Window
+
+↓
+
+3s Window
+
+↓
+
+Settlement
+
+↓
+
+Archive
+```
+
+The current stage is highlighted.
+
+---
+
+# Startup Summary
+
+Every runtime startup displays
+
+```text
+Configuration
+
+PASS
+
+SQLite
+
+PASS
+
+Recovery
+
+PASS
+
+Wallet
+
+PASS
+
+RTDS
+
+PASS
+
+Provider
+
+PASS
+
+Clock
+
+PASS
+
+Decision Engine
+
+PASS
+
+Risk Engine
+
+PASS
+
+Limit Order Engine
+
+PASS
+
+Ready
+```
+
+Failures clearly indicate why startup cannot continue.
+
+---
+
+# Runtime Snapshot
+
+Display
+
+* ARC Version
+* Git Commit
+* Database Schema Version
+* Runtime Version
+* Strategy Version
+* Build Timestamp
+
+Read-only.
+
+---
+
+# API Latency
+
+Display live
+
+* RTDS latency
+* Provider latency
+* RPC latency
+* WebSocket latency
+* Order submission latency
+* Fill notification latency
+
+For transparency only.
+
+---
+
+# Runtime Counters
+
+Display
+
+* Markets Seen
+* Markets Traded
+* Markets Skipped
+* Windows Opened
+* Windows Triggered
+* NO_DIRECTION Windows
+* BUFFER_NOT_SATISFIED
+* Orders Submitted
+* Orders Filled
+* Orders Cancelled
+* Orders Rejected
+* Recoveries
+* Feed Reconnects
+* Provider Reconnects
+* Wallet Reconnects
+
+---
+
+# Error Summary
+
+Display
+
+* Warnings Today
+* Errors Today
+* Fatal Errors
+* Last Error
+* Last Warning
+
+Selecting an entry jumps directly to the corresponding Signal Tank event.
+
+---
+
+# Wallet Panel (OPS Deck Bottom)
+
+Display
+
+Connection
+
+* Wallet Address
+* Wallet Status
+* Network
+* Wallet Provider
+* Authentication Status
+
+Balances
+
+* Available Balance
+* Reserved Balance
+* Balance in Open Positions
+* Buying Power
+* Available Buying Power
+* Total Account Value
+
+Trading
+
+* Current Exposure
+* Remaining Exposure
+* Current Position Value
+* Pending Position Value
+
+PnL
+
+* Today's Realized PnL
+* Today's Unrealized PnL
+* Session Realized PnL
+* Session Unrealized PnL
+* Lifetime Realized PnL
+* Lifetime Unrealized PnL
+
+Statistics
+
+* Largest Win
+* Largest Loss
+* Current Winning Streak
+* Current Losing Streak
+
+Update automatically after
+
+* Submission
+* Fill
+* Cancellation
+* Settlement
+* Recovery
+* Startup
+
+---
+
+# Market Summary Card
+
+Always display the latest completed market
+
+including
+
+* Market
+* PTB
+* Settlement TWAP
+* Direction
+* Filled
+* Result
+* Profit/Loss
+
+This updates after every settlement.
+
+---
+
+# Database Backup
+
+Provide
+
+```text
+Backup Database
+```
+
+Creates a timestamped SQLite backup.
+
+Local only.
+
+No cloud storage.
+
+---
+
+# Configuration Snapshots
+
+Every configuration save creates a snapshot.
+
+Example
+
+```text
+Timestamp
+
+Enabled Windows
+
+Buffers
+
+Submission Count
+
+Position Size
+
+Provider
+
+Notifications
+```
+
+Allows historical review.
+
+---
+
+# Search
+
+Global search should support
+
+* Market
+* Window
+* Local Order ID
+* Venue Order ID
+* ExecutionIntent
+* Direction
+* PTB
+* Date
+* Result
+
+Searches the Unified Ledger.
+
+---
+
+# Export
+
+Support exporting
+
+* Unified Ledger
+* Trading History
+* PnL History
+
+CSV only.
+
+---
+
+# Dashboard Performance
+
+The dashboard must remain responsive during continuous operation.
+
+Target
+
+* 24×7 runtime
+* No memory leaks
+* No increasing browser memory
+* No duplicate websocket events
+* No duplicate Signal Tank events
+* Smooth updates
+* No UI freezes
+
+---
+
+# UI Synchronization
+
+Every panel must update from the same backend state.
+
+Never allow
+
+OPS Deck
+
+Signal Tank
+
+Ledger
+
+Analytics
+
+System
+
+to disagree.
+
+There is only one runtime state.
+
+---
+
+# Signal Tank Contract
+
+Signal Tank is the live runtime console.
+
+Every websocket event flowing through ARC should appear here.
+
+Examples include
+
+* Market Discovery
+* PTB Freeze
+* Signal TWAP Update
+* Settlement TWAP Update
+* Window Activation
+* Direction Freeze
+* Trigger Locked
+* Risk Evaluation
+* ExecutionIntent Created
+* Order Submitted
+* Partial Fill
+* Order Filled
+* Cancelled
+* Rejected
+* BUFFER_NOT_SATISFIED
+* Settlement
+* Recovery
+* Feed Reconnect
+* Wallet Reconnect
+* Provider Reconnect
+* PM2 Restart
+* Runtime Restart
+* Warning
+* Error
+* Fatal Error
+
+Every event includes
+
+* Timestamp
+* Severity
+* Source Engine
+* Short Description
+
+---
+
+# Unified Ledger Contract
+
+The Ledger is the permanent record.
+
+No Orders page.
+
+No Trade History page.
+
+Everything lives here.
+
+Each record contains
+
+* Market
+* Window
+* PTB
+* Signal TWAP
+* Settlement TWAP
+* Direction
+* Locked Trigger
+* Buffer
+* ExecutionIntent
+* Local Order ID
+* Venue Order ID
+* Submission Time
+* Fill Time
+* Settlement Time
+* Fill Price
+* Quantity
+* Current State
+* Rejection Reason
+* Buffer Status
+* Settlement Result
+* PnL
+* Notes
+
+Records update in place through the order lifecycle and remain permanently searchable.
+
+---
+
+# Final Dashboard Principles
+
+The dashboard should resemble a professional trading terminal.
+
+Priority order
+
+1. Transparency
+2. Reliability
+3. Simplicity
+4. Speed
+5. Determinism
+
+Avoid
+
+* unnecessary animations
+* decorative effects
+* duplicate information
+* excessive charts
+* unnecessary pages
+* hidden runtime state
+
+Every panel must help operate ARC.
+
+If a feature does not improve operating, monitoring, debugging, or understanding the bot, it should not be added.
+
+---
+
+# Final Operator Requirement
+
+The operator should be able to monitor an entire trading session—from startup, through market discovery, window activation, execution, fills, settlement, recovery, and shutdown—without leaving the Operations Center.
+
+The combination of:
+
+* **OPS Deck** (live operational state)
+* **Signal Tank** (live event stream)
+* **Unified Ledger** (complete historical record)
+* **Analytics** (summaries and statistics)
+* **System** (runtime and infrastructure health)
+* **Settings** (configuration)
+
+must provide complete visibility into ARC's operation while keeping the interface clean, deterministic, and free of any business logic or trading decisions.
+
+
+
+
+# Additional High Priority Requirements 
+
+## LIMIT ORDER ENGINE IS THE OPERATOR'S PRIMARY CONTROL PANEL
+
+The **Limit Order Engine** is the operator's primary trading interface.
+
+Trading begins **only** after the operator explicitly starts the Limit Order Engine.
+
+The lifecycle is:
+
+```text
+ARC Runtime Started
+
+↓
+
+V1 Paper or V2 Live Started
+
+↓
+
+All runtime engines become healthy
+
+↓
+
+Operator configures:
+
+• Enabled Windows
+• Buffer
+• Submission Count
+• Position Size
+
+↓
+
+Operator presses
+
+START TRADING
+
+↓
+
+Limit Order Engine enters
+
+WAITING FOR WINDOW
+
+↓
+
+Trading begins automatically
+```
+
+The Limit Order Engine is responsible only for execution.
+
+It never changes:
+
+* Strategy
+* Direction
+* PTB
+* Buffer
+* Trigger
+* Signal TWAP
+
+It only executes the immutable ExecutionIntent.
+
+---
+
+# WAITING FOR WINDOW
+
+Before a window opens the dashboard must clearly display
+
+```text
+Waiting for Window
+
+15s
+
+00:12
+
+↓
+
+Waiting for Window
+
+10s
+
+00:17
+
+↓
+
+Waiting for Window
+
+7s
+
+00:20
+```
+
+If multiple windows are enabled
+
+Every enabled window has its own live countdown.
+
+The operator immediately knows which execution window is opening next.
+
+---
+
+# MULTIPLE WINDOWS
+
+If
+
+```text
+3
+
+5
+
+7
+
+10
+
+15
+```
+
+are enabled
+
+The Limit Order Engine shows all five.
+
+Each window independently displays
+
+* Remaining Time
+* Frozen Status
+* Direction
+* Trigger
+* Submission Count
+* Order State
+* Fill State
+
+No hidden activity.
+
+---
+
+# ORDER FLOW
+
+Display the complete lifecycle.
+
+```text
+Waiting
+
+↓
+
+Window Open
+
+↓
+
+Values Frozen
+
+↓
+
+ExecutionIntent Created
+
+↓
+
+Order Submitted
+
+↓
+
+Waiting For Fill
+
+↓
+
+Filled
+
+or
+
+BUFFER_NOT_SATISFIED
+
+↓
+
+Settlement
+
+↓
+
+Archived into Ledger
+```
+
+Every transition visible.
+
+---
+
+# LEDGER IS THE SINGLE SOURCE OF HISTORY
+
+There is NO Orders page.
+
+There is NO Trade History page.
+
+The Ledger stores everything.
+
+After submission
+
+↓
+
+Live updates
+
+↓
+
+Fill
+
+↓
+
+Settlement
+
+↓
+
+Historical archive
+
+The same record is updated.
+
+Nothing moves between pages.
+
+Nothing disappears.
+
+---
+
+# SIGNAL TANK IS THE LIVE DATA STREAM
+
+Signal Tank is the runtime monitor.
+
+Every websocket update should flow here.
+
+Examples
+
+```text
+Signal TWAP
+
+Settlement TWAP
+
+Official Polymarket Data
+
+Provider Events
+
+RTDS Events
+
+Chainlink Events
+
+Order Book Updates
+
+Market Discovery
+
+Market Rotation
+
+PTB Freeze
+
+Window Open
+
+Trigger Locked
+
+ExecutionIntent
+
+Risk Decision
+
+Submission
+
+Fill
+
+Settlement
+
+Reconnect
+
+Recovery
+
+Heartbeat
+
+Latency
+
+Warnings
+
+Errors
+
+PM2 Restart
+
+Wallet Events
+
+RPC Events
+```
+
+The operator should be able to watch the entire runtime in real time.
+
+---
+
+# OPS DECK SHOULD REMAIN CLEAN
+
+Do NOT overload the OPS Deck.
+
+Only display information needed to make trading decisions and monitor execution.
+
+Display
+
+* Official Polymarket 5-minute Timer
+* Running Signal TWAP
+* Live 30-second Settlement TWAP
+* Frozen PTB
+* Frozen Direction (UP or DOWN only)
+* Locked Trigger
+* Current Active Window
+* Buffer
+* Submission Count
+* Limit Order Engine Status
+* Current Market
+* Market Phase
+* Trading Enabled
+* Execution Mode
+* Position
+* Balance
+* Running P/L
+* Preflight Status
+
+Do **not** stream websocket noise here.
+
+Keep the live event stream inside Signal Tank.
+
+---
+
+# DIRECTION DISPLAY
+
+OPS Deck should display only
+
+```text
+UP
+```
+
+or
+
+```text
+DOWN
+```
+
+or
+
+```text
+NO_DIRECTION
+```
+
+Never display calculations.
+
+Never display comparison formulas.
+
+Never show PTB comparison logic.
+
+That belongs only inside the backend.
+
+---
+
+# LIVE TWAP DISPLAY
+
+OPS Deck must always display
+
+* Running Signal TWAP
+* Official 30-second Settlement TWAP
+
+These are separate values.
+
+Label them clearly.
+
+Never imply they are identical.
+
+---
+
+# SIGNAL TANK DATA
+
+Signal Tank should display all runtime websocket data flowing through ARC.
+
+Including
+
+* Running Signal TWAP updates
+* 30-second Settlement TWAP updates
+* Official Polymarket websocket events
+* Provider reconnects
+* Feed reconnects
+* Wallet reconnects
+* Order Book updates
+* Market discovery
+* Market lifecycle
+* Runtime lifecycle
+* Recovery lifecycle
+* Execution lifecycle
+
+This page acts as the runtime console.
+
+---
+
+# TRANSPARENCY RULE
+
+The operator should never need SSH, SQLite, logs or terminal access to understand what ARC is doing.
+
+Everything happening inside the runtime should be visible through either:
+
+* OPS Deck (current operational state)
+* Signal Tank (live event stream)
+* Unified Ledger (complete historical record)
+* System (runtime health)
+* Analytics (summaries)
+
+No execution should ever happen silently.
+
+---

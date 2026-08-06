@@ -1,17 +1,17 @@
 """Command line interface.
 
-    arc doctor    validate configuration and storage, print a full report
-    arc observe   run the market engine with no trading, ever
-    arc run       errors clearly — the trading runtime does not exist yet
+    arc doctor           validate configuration and storage, print a full report
+    arc run --mode=v1    the complete pipeline, paper execution
+    arc run --mode=v2    the complete pipeline, live execution
 
-`arc run` deliberately fails. The feed connection, market discovery and PTB
-fetching exist as of phase 2, but the decision engine, risk engine and execution
-adapters do not. A `run` that started a loop which appeared to trade would be
-exactly the fake implementation that is forbidden (A1 Rule 2), and its worst
-property is that it would look fine.
+There are TWO runtime modes and no third. V1 is not an observation run and not a
+simulator: market engine, window engine, decision engine, risk engine, limit
+order engine, recovery and dashboard all execute, and the only component that
+differs from V2 is the executor.
 
-`arc observe` is the honest half of that: it runs everything that does exist, and it
-cannot trade because no execution adapter is in its import graph at all.
+`--mode` is required rather than defaulted. A defaulted mode means one forgotten
+flag is the difference between paper and real money, and the mistake is
+indistinguishable from a correct start until the first fill.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from typing import TextIO
 
 from arc.clock import Clock, SystemClock
 from arc.config import ArcSettings, Settings, load_settings
+from arc.domain.enums import Mode
 from arc.domain.money import dec_str
 from arc.domain.timing import (
     close_ts_for,
@@ -34,13 +35,13 @@ from arc.domain.timing import (
 )
 from arc.errors import ArcFatalError
 from arc.logging_setup import ensure_utf8_streams, setup_logging
-from arc.runtime.observe import observe as run_observe
+from arc.runtime.engine import run_arc
 from arc.storage.store import Store
 
 __all__ = ["main"]
 
-# `observe`, `doctor` and `run` are module-level functions rather than exports so the
-# entry point stays the single documented surface.
+# `doctor` and `run` are module-level functions rather than exports so the entry
+# point stays the single documented surface.
 
 _RULE = "─" * 68
 
@@ -188,21 +189,31 @@ def _report(out: TextIO, settings: Settings, store: Store, version: int, clock: 
         out.write("  none\n")
 
 
-def observe(out: TextIO, clock: Clock, *, market_target: int) -> int:
-    """Run the market engine with no trading. Startup order per A8.
+def run(out: TextIO, clock: Clock, *, mode: Mode, market_target: int | None) -> int:
+    """Start the complete runtime in one mode. Startup order per A8.
 
     Step 1 (config) is the only step that may refuse: a bad configuration must not
     boot. Everything after it starts regardless — a feed that will not connect or a
     settlement spec that cannot be verified disables trading and records why, and the
-    process stays up collecting the data that resolves the problem.
+    process stays up serving its dashboard and collecting the data that resolves the
+    problem.
+
+    Trading does not start here. `execution_armed` is FALSE after every startup and
+    only the operator's Start Trading control opens it, so a process that restarts
+    unattended comes back observing rather than trading (Q1).
     """
-    out.write(f"\nARC observe\n{_RULE}\n")
+    out.write(f"\nARC run — {mode.value}\n{_RULE}\n")
 
     try:
         env = ArcSettings()
     except Exception as exc:
         out.write(f"\nFATAL  configuration rejected\n\n  {exc}\n\n")
         return 1
+
+    # The flag wins over the environment, and the environment is then rewritten to
+    # match: every later read of settings.mode — including the V2 credential check
+    # inside load_settings — must see the mode the operator actually asked for.
+    env.mode = mode
 
     store: Store | None = None
     try:
@@ -232,35 +243,13 @@ def observe(out: TextIO, clock: Clock, *, market_target: int) -> int:
 
     try:
         return asyncio.run(
-            run_observe(
-                settings, store, clock, out, market_target=market_target, logger=logger
-            )
+            run_arc(settings, store, clock, out, market_target=market_target, logger=logger)
         )
     except KeyboardInterrupt:
         out.write("\n  interrupted\n\n")
         return 0
     finally:
         store.close()
-
-
-def run(out: TextIO) -> int:
-    """Refuse to run. There is no runtime yet, and pretending otherwise is worse."""
-    out.write(
-        "\nARC run is not available.\n"
-        "\n"
-        "Phases 1 and 2 built the deterministic foundation and the market engine:\n"
-        "configuration, timing, domain models, storage, clock, logging, feed\n"
-        "connection, market discovery, PTB fetching and market rotation. The window\n"
-        "activation loop, decision engine, risk engine, execution adapters and\n"
-        "dashboard are not implemented yet.\n"
-        "\n"
-        "Nothing here is stubbed to make this command appear to work — a runtime\n"
-        "that looked healthy while trading nothing would be worse than this error.\n"
-        "\n"
-        "Validate what exists with:  arc doctor\n"
-        "Watch the market engine with:  arc observe\n\n"
-    )
-    return 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -270,16 +259,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("doctor", help="validate configuration and storage")
-    observe_parser = subparsers.add_parser(
-        "observe", help="run the market engine with no trading"
+    run_parser = subparsers.add_parser("run", help="start the runtime (V1 paper or V2 live)")
+    run_parser.add_argument(
+        "--mode",
+        required=True,
+        choices=["v1", "v2"],
+        help="v1 = paper trading, v2 = live trading",
     )
-    observe_parser.add_argument(
+    run_parser.add_argument(
         "--markets",
         type=int,
-        default=3,
-        help="stop after this many consecutive markets (default 3)",
+        default=None,
+        help="stop after this many consecutive markets (default: run until stopped)",
     )
-    subparsers.add_parser("run", help="start the trading engine (not available yet)")
 
     args = parser.parse_args(argv)
 
@@ -289,9 +281,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "doctor":
         return doctor(sys.stdout, SystemClock())
-    if args.command == "observe":
-        return observe(sys.stdout, SystemClock(), market_target=args.markets)
-    return run(sys.stdout)
+    return run(
+        sys.stdout,
+        SystemClock(),
+        mode=Mode(args.mode.upper()),
+        market_target=args.markets,
+    )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """The Risk Engine: the union of every gate, in one deterministic order.
 
-Fourteen gates. Each owns exactly one DenialReason, so a rejection line names the
+Fifteen gates. Each owns exactly one DenialReason, so a rejection line names the
 condition that refused rather than a category that several conditions share. The
 order is fixed and the evaluation short-circuits on the first denial, which is what
 makes the rejection log stable: the same situation always reports the same reason,
@@ -8,16 +8,18 @@ so a change in the log means a change in the world rather than a change in
 evaluation order.
 
 Why this order. The cheapest and most global gates run first — trading disabled,
-wrong phase, window not triggered — because none of them need a quote, a book, a
-size or a database read, and a market that is not tradeable at all should not cause
-any of that work. The gates that need the strategy's output (price, size) run last.
+not armed, wrong phase, window not triggered — because none of them need a quote, a
+book, a size or a database read, and a market that is not tradeable at all should
+not cause any of that work. The gates that need the strategy's output (price, size)
+run last.
 
 This engine is PURE. It evaluates a frozen RiskContext and returns a verdict. It
 opens no socket, holds no wallet, submits nothing and mutates nothing. The A8
 submission boundary is enforced by gate 1 refusing every intent while the
 settlement spec is unverified — enforced HERE because this is the single place an
 order can be authorised, so a caller who forgets to consult the runtime flag still
-cannot submit.
+cannot submit. Gate 2 is the operator's separate arming switch: BOTH must pass
+before an intent may become an order, and neither can override the other.
 
 There is no lead-time gate. The lead-time gate is repealed entirely (A10/D1): the
 only execution boundary is the market phase, and nothing here reads a clock to
@@ -43,6 +45,7 @@ _ZERO: Final[Decimal] = Decimal("0")
 # bottom, and so a reordering is a visible diff in one place.
 GATE_ORDER: Final[tuple[str, ...]] = (
     "trading_enabled",
+    "execution_armed",
     "market_phase",
     "window_triggered",
     "price_to_beat",
@@ -75,54 +78,60 @@ class RiskContext:
     paused: bool = False
     trading_disabled_reason: str = ""
 
-    # ── gate 2: market phase ─────────────────────────────────────────────────
+    # ── gate 2: operator arming ──────────────────────────────────────────────
+    # Defaults False so a caller that forgets to gather it submits nothing rather
+    # than submitting on an assumption. This is the operator's own switch and is
+    # never inferred from runtime health.
+    execution_armed: bool = False
+
+    # ── gate 3: market phase ─────────────────────────────────────────────────
     phase: MarketPhase = MarketPhase.ACTIVE
 
-    # ── gate 3: window triggered ─────────────────────────────────────────────
+    # ── gate 4: window triggered ─────────────────────────────────────────────
     window_triggered: bool = False
 
-    # ── gate 4: official PTB ─────────────────────────────────────────────────
+    # ── gate 5: official PTB ─────────────────────────────────────────────────
     ptb: Decimal | None = None
 
-    # ── gate 5: strategy enabled ─────────────────────────────────────────────
+    # ── gate 6: strategy enabled ─────────────────────────────────────────────
     strategy_enabled: bool = True
     strategy_id: str = ""
 
-    # ── gate 6: duplicate intent ─────────────────────────────────────────────
+    # ── gate 7: duplicate intent ─────────────────────────────────────────────
     intent_exists: bool = False
 
-    # ── gate 7: trade quota ──────────────────────────────────────────────────
+    # ── gate 8: trade quota ──────────────────────────────────────────────────
     quota_used: int = 0
     quota_reserved: int = 0
     max_trades_per_market: int = 0
 
-    # ── gate 8: opposing direction ───────────────────────────────────────────
+    # ── gate 9: opposing direction ───────────────────────────────────────────
     direction: Direction = Direction.UP
     directions_held: frozenset[Direction] = field(default_factory=frozenset)
     allow_opposing_directions: bool = False
 
-    # ── gate 9: concurrent positions ─────────────────────────────────────────
+    # ── gate 10: concurrent positions ─────────────────────────────────────────
     open_positions: int = 0
     max_concurrent_positions: int = 0
 
-    # ── gates 10 and 11: price and size ──────────────────────────────────────
+    # ── gates 11 and 12: price and size ──────────────────────────────────────
     limit_price: Decimal = _ZERO
     size: Decimal = _ZERO
     entry_price_min: Decimal = _ZERO
     entry_price_max: Decimal = _ZERO
     min_tradable_size: Decimal = _ZERO
 
-    # ── gate 12: loss limits ─────────────────────────────────────────────────
+    # ── gate 13: loss limits ─────────────────────────────────────────────────
     daily_loss_usd: Decimal = _ZERO
     consecutive_losses: int = 0
     max_daily_loss_usd: Decimal = _ZERO
     max_consecutive_losses: int = 0
 
-    # ── gate 13: feed freshness ──────────────────────────────────────────────
+    # ── gate 14: feed freshness ──────────────────────────────────────────────
     feed_blocked: bool = False
     feed_age_ms: float | None = None
 
-    # ── gate 14: clock drift and runtime health ──────────────────────────────
+    # ── gate 15: clock drift and runtime health ──────────────────────────────
     clock_drift_critical: bool = False
     clock_drift_ms: float = 0.0
     runtime_healthy: bool = True
@@ -211,6 +220,33 @@ class RiskEngine:
 
     # ── 2 ────────────────────────────────────────────────────────────────────
 
+    def _gate_execution_armed(self, c: RiskContext) -> RiskVerdict:
+        """The OPERATOR boundary, independent of gate 1's SYSTEM boundary.
+
+        Two gates rather than one flag because they answer different questions and
+        have different owners. Gate 1 asks whether ARC is technically permitted to
+        trade and is moved only by ARC's own safety checks; this gate asks whether
+        the operator has asked it to, and is moved only by the Start/Stop Trading
+        control. Collapsing them would let a dashboard click clear a disable that a
+        failed spec verification imposed — the operator would be able to override
+        system safety by pressing a button, which is exactly backwards.
+
+        Ordered SECOND, after the system gate, so that when both are blocking, the
+        reported reason is the system one. An operator told "not armed" while the
+        real obstacle is an unverified spec would arm the bot and see nothing
+        happen, with no reason given for the second refusal.
+        """
+        if not c.execution_armed:
+            return RiskVerdict(
+                allowed=False,
+                gate="execution_armed",
+                reason=DenialReason.EXECUTION_NOT_ARMED,
+                detail="the Limit Order Engine is waiting for the operator to start trading",
+            )
+        return _ALLOWED
+
+    # ── 3 ────────────────────────────────────────────────────────────────────
+
     def _gate_market_phase(self, c: RiskContext) -> RiskVerdict:
         """Phase is the ONLY execution boundary that exists (A10/D1).
 
@@ -242,7 +278,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 3 ────────────────────────────────────────────────────────────────────
+    # ── 4 ────────────────────────────────────────────────────────────────────
 
     def _gate_window_triggered(self, c: RiskContext) -> RiskVerdict:
         """Only a window whose frozen trigger was satisfied may become an intent.
@@ -260,7 +296,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 4 ────────────────────────────────────────────────────────────────────
+    # ── 5 ────────────────────────────────────────────────────────────────────
 
     def _gate_price_to_beat(self, c: RiskContext) -> RiskVerdict:
         """No official PTB, no trade. Never calculated, never estimated (A1 Rule 1).
@@ -278,7 +314,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 5 ────────────────────────────────────────────────────────────────────
+    # ── 6 ────────────────────────────────────────────────────────────────────
 
     def _gate_strategy_enabled(self, c: RiskContext) -> RiskVerdict:
         """A disabled or missing strategy must say so, not silently not trade.
@@ -295,7 +331,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 6 ────────────────────────────────────────────────────────────────────
+    # ── 7 ────────────────────────────────────────────────────────────────────
 
     def _gate_duplicate_intent(self, c: RiskContext) -> RiskVerdict:
         """Exactly one intent per window, ever (A12).
@@ -315,7 +351,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 7 ────────────────────────────────────────────────────────────────────
+    # ── 8 ────────────────────────────────────────────────────────────────────
 
     def _gate_trade_quota(self, c: RiskContext) -> RiskVerdict:
         """Used plus RESERVED against the per-market budget (hazard H2).
@@ -338,7 +374,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 8 ────────────────────────────────────────────────────────────────────
+    # ── 9 ────────────────────────────────────────────────────────────────────
 
     def _gate_opposing_direction(self, c: RiskContext) -> RiskVerdict:
         """Holding both sides of one market is a guaranteed loss (hazard H3).
@@ -361,7 +397,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 9 ────────────────────────────────────────────────────────────────────
+    # ── 10 ───────────────────────────────────────────────────────────────────
 
     def _gate_position_limit(self, c: RiskContext) -> RiskVerdict:
         """Concurrent open positions across the process, not per market.
@@ -379,7 +415,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 10 ───────────────────────────────────────────────────────────────────
+    # ── 11 ───────────────────────────────────────────────────────────────────
 
     def _gate_entry_band(self, c: RiskContext) -> RiskVerdict:
         """The limit price must sit inside the configured band.
@@ -409,7 +445,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 11 ───────────────────────────────────────────────────────────────────
+    # ── 12 ───────────────────────────────────────────────────────────────────
 
     def _gate_exchange_minimum(self, c: RiskContext) -> RiskVerdict:
         """Size must reach the venue's minimum tradable quantity.
@@ -427,7 +463,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 12 ───────────────────────────────────────────────────────────────────
+    # ── 13 ───────────────────────────────────────────────────────────────────
 
     def _gate_loss_limits(self, c: RiskContext) -> RiskVerdict:
         """Daily loss and consecutive losses. Zero on either DISABLES that limit.
@@ -464,7 +500,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 13 ───────────────────────────────────────────────────────────────────
+    # ── 14 ───────────────────────────────────────────────────────────────────
 
     def _gate_feed_freshness(self, c: RiskContext) -> RiskVerdict:
         """A stale feed means the signal TWAP is stale.
@@ -484,7 +520,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 14 ───────────────────────────────────────────────────────────────────
+    # ── 15 ───────────────────────────────────────────────────────────────────
 
     def _gate_runtime_health(self, c: RiskContext) -> RiskVerdict:
         """Critical clock drift, then general runtime health.

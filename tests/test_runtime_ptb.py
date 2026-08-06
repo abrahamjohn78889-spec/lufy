@@ -36,10 +36,11 @@ from arc.config import ArcSettings, Settings, TradingConfig, build_trading_confi
 from arc.domain.enums import MarketPhase
 from arc.domain.timing import slug_for, window_ts_for
 from arc.errors import FeedError
+from arc.execution.v1_paper import PaperExecutor
 from arc.market.discovery import MarketMetadata
 from arc.market.feed import RtdsFeed
 from arc.market.ptb import DEAD_REASON_PTB_UNAVAILABLE, SOURCE_METADATA, SOURCE_PREVIOUS_CLOSE
-from arc.runtime.observe import ObservationRun
+from arc.runtime.engine import ArcRuntime
 from arc.runtime.state import RuntimeState
 from arc.storage.store import Store
 
@@ -111,19 +112,23 @@ def _settings() -> Settings:
     return Settings(env=ArcSettings(), trading=trading, seeded_from_env=False)
 
 
-def _run(store: Store, clock: FrozenClock, discovery: _Discovery) -> ObservationRun:
+def _run(store: Store, clock: FrozenClock, discovery: _Discovery) -> ArcRuntime:
     settings = _settings()
     runtime = RuntimeState(store, clock)
     runtime.load()
-    return ObservationRun(
+    return ArcRuntime(
         settings=settings,
         store=store,
         clock=clock,
         runtime=runtime,
         discovery=discovery,  # type: ignore[arg-type]
         feed=RtdsFeed(clock),
+        # V1's executor. The PTB path is identical in both modes, so the paper
+        # adapter is the honest choice here: a V2 run would differ only in the
+        # executor, and no test should need venue credentials to check PTB retry.
+        executor=PaperExecutor(),
         out=io.StringIO(),
-        logger=logging.getLogger("arc.test.observe"),
+        logger=logging.getLogger("arc.test.runtime"),
     )
 
 
@@ -135,7 +140,7 @@ def _final_prices_for(count: int) -> dict[int, str]:
     }
 
 
-def _step(run: ObservationRun, clock: FrozenClock, seconds: float, step: float = 1.0) -> None:
+def _step(run: ArcRuntime, clock: FrozenClock, seconds: float, step: float = 1.0) -> None:
     """Drive the rotation and PTB paths forward through `seconds` of wall clock.
 
     Deliberately calls advance() and _attempt_ptb() the way the real loop does rather
@@ -147,7 +152,7 @@ def _step(run: ObservationRun, clock: FrozenClock, seconds: float, step: float =
         now = clock.now()
         event = run.rotator.advance(now)
         if event.opened:
-            run.stats.markets_observed += 1
+            run.stats.markets_processed += 1
             run._next_ptb_attempt = 0.0
         asyncio.run(run._attempt_ptb(now))
         clock.advance(step)
@@ -411,7 +416,7 @@ class TestFailClosed:
         discovery = _Discovery(clock=clock, final_prices={})
         run = _run(store, clock, discovery)
 
-        with caplog.at_level(logging.ERROR, logger="arc.test.observe"):
+        with caplog.at_level(logging.ERROR, logger="arc.test.runtime"):
             _step(run, clock, 290.0)
 
         assert "PTB Unavailable" in caplog.text
@@ -488,7 +493,7 @@ class TestNoBoundaryPathRemains:
     """
 
     def test_the_runtime_holds_no_boundary_reference(self, source_root: Path) -> None:
-        text = (source_root / "arc" / "runtime" / "observe.py").read_text(encoding="utf-8")
+        text = (source_root / "arc" / "runtime" / "engine.py").read_text(encoding="utf-8")
         assert "BoundaryReference" not in text
         assert "_record_boundary" not in text
 
