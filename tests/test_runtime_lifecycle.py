@@ -179,6 +179,23 @@ class TestStopLeavesNothingRunning:
         started, idle = asyncio.run(go())
         assert idle is not started
 
+    def test_trading_is_disarmed_before_anything_is_cancelled(self, tmp_path: Any) -> None:
+        """Between the cancel and the last loop pass the runtime can still reach
+        `_submit_pending`. An intent submitted during a teardown is an order placed
+        by the act of stopping."""
+        sup = _supervisor(tmp_path)
+
+        async def go() -> tuple[bool, bool]:
+            run = await sup.start(Mode.V1)
+            run.arm()
+            armed_while_running = run.state.execution_armed
+            await sup.stop()
+            return armed_while_running, run.state.execution_armed
+
+        armed, still_armed = asyncio.run(go())
+        assert armed is True
+        assert still_armed is False
+
 
 class TestIsolation:
     """No object may cross a stop. The rule the specification lists item by item."""

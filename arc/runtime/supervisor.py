@@ -188,10 +188,11 @@ class RuntimeSupervisor:
     async def stop(self) -> None:
         """STOP RUNTIME. Nothing may still be running when this returns.
 
-        Feeds, websockets, background workers, polling tasks, execution tasks,
-        the recorder and every runtime service go down together, and the venue
-        session and HTTP client are closed. The process returns to idle with a
-        fresh inert runtime for the same mode, so the dashboard keeps rendering.
+        Trading is disarmed first, then feeds, websockets, background workers,
+        polling tasks, execution tasks, the recorder and every runtime service go
+        down together, and the venue client and HTTP client are closed. The process
+        returns to idle with a fresh inert runtime for the same mode, so the
+        dashboard keeps rendering.
         """
         async with self._lock:
             await self._stop_locked()
@@ -296,6 +297,11 @@ class RuntimeSupervisor:
         """The teardown itself. Caller holds the lock."""
         task, self._task = self._task, None
         if task is not None and not task.done():
+            # Trading goes down first, in its own step, before anything is
+            # cancelled. Between the cancel and the last loop pass the runtime can
+            # still reach `_submit_pending`, and an intent submitted during the
+            # teardown is an order placed by the act of stopping.
+            self.runtime.disarm()
             self.runtime.status = RuntimeStatus.STOPPING
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, ArcError):

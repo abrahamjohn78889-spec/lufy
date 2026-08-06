@@ -91,29 +91,30 @@
       </p>
       <div class="controls">
         <button class="big go" id="runtime-start">START RUNTIME</button>
-        <button class="big stop" data-post="/stop">STOP RUNTIME</button>
+        <button class="big stop" id="runtime-stop" data-post="/stop">STOP RUNTIME</button>
       </div>
       <div id="control-msg" class="msg"></div>
     </section>
 
     <section class="panel span2">
-      <h2>Trading Control</h2>
+      <h2>Trading Control (Limit Order Engine)</h2>
       <p class="note">
         The Limit Order Engine's own gate. Configure buffers, windows and submission
         count on the Settings page first; START TRADING opens the operator gate and
-        nothing else. STOP TRADING holds new submissions and leaves every feed,
-        accumulator and recovery service running.
+        nothing else. PAUSE holds new ExecutionIntents while resting orders continue
+        to be managed. STOP TRADING disarms; every feed, accumulator and recovery
+        service keeps running.
       </p>
       <div class="controls">
         <button class="big go" data-post="/strategies/arc_twap_locked_buffer/config?action=arm">
           START TRADING
         </button>
+        <button class="big" data-post="/pause">PAUSE TRADING</button>
+        <button class="big" data-post="/resume">RESUME TRADING</button>
         <button class="big stop"
                 data-post="/strategies/arc_twap_locked_buffer/config?action=disarm">
           STOP TRADING
         </button>
-        <button data-post="/pause">Pause</button>
-        <button data-post="/resume">Resume</button>
       </div>
       <div id="trading-msg" class="msg"></div>
     </section>

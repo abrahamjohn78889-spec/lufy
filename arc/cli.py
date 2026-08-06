@@ -12,6 +12,13 @@ differs from V2 is the executor.
 `--mode` is required rather than defaulted. A defaulted mode means one forgotten
 flag is the difference between paper and real money, and the mistake is
 indistinguishable from a correct start until the first fill.
+
+THE FLAG IS NOT THE ONLY WAY IN. `--mode` picks which runtime the process starts
+WITH, so a PM2 restart comes back running rather than idle; from then on the OPS
+Deck owns the lifecycle — select V1 or V2, press START RUNTIME, press STOP
+RUNTIME — and the mode is not fixed for the life of the process. Either way the
+runtime comes up DISARMED: starting a runtime is never starting trading, which is
+the operator's own separate button in the Limit Order Engine.
 """
 
 from __future__ import annotations

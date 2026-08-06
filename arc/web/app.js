@@ -205,6 +205,11 @@ function paintModes() {
   const active = selectedMode || state.runtime.mode;
   $('#mode-v1').classList.toggle('on', active === 'V1');
   $('#mode-v2').classList.toggle('on', active === 'V2');
+  // The buttons name the mode they will act on. "START RUNTIME" next to a
+  // highlighted V2 is one glance away from being read as V1, and the two differ
+  // by whether the orders are real.
+  $('#runtime-start').textContent = `START ${active} RUNTIME`;
+  $('#runtime-stop').textContent = `STOP ${active} RUNTIME`;
 }
 
 function paintAnalytics() {

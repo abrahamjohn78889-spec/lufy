@@ -133,23 +133,38 @@ def preflight(run: ArcRuntime) -> dict[str, Any]:
     Every line names what is wrong rather than only that something is. A preflight
     that says FAIL with no detail sends the operator to the logs, which is the exact
     trip this dashboard exists to remove.
+
+    Runs in BOTH positions: continuously on the deck against a live runtime, and
+    once against the idle runtime immediately before V2 starts. So a check may only
+    FAIL on something that is wrong, never on something that has not happened yet —
+    an idle process has no feed and no ticks by definition, and failing it for that
+    would make V2 unstartable forever.
     """
     trading = run.settings.trading
     gate = run.state.gate
     drift = run.drift.last
     spec = run.spec.result
     report = run.recovery_report
+    # Whether this runtime has actually been started. Nothing that can only be true
+    # of a running system is allowed to FAIL while it is false: preflight is what
+    # V2 must pass BEFORE it starts, so a check that demands a live feed would
+    # deadlock the start it guards.
+    live = run.status.startswith("RUNNING")
     checks = [
         _check("Configuration", True, f"{len(trading.windows_by_priority)} windows enabled"),
         _check("SQLite", run.store.integrity_check() == "ok", run.store.integrity_check()),
-        _check("Runtime", run.status.startswith("RUNNING"), run.status),
+        _check("Runtime", live, run.status, warn=not live),
         _check("Wallet", run.venue_client is not None, "V1 has no venue account", warn=True),
         _check("Provider", run.feed.connect_attempts > 0, run.feed.url, warn=True),
         _check("RTDS", run.watchdog.has_ticked, run.watchdog.status, warn=True),
         _check("Clock", drift is None or not run.health().clock_drift_critical,
                "no reading yet" if drift is None else f"{drift.offset_ms:.0f} ms",
                warn=drift is None),
-        _check("Feed", not run.watchdog.blocked, run.watchdog.status),
+        # Stale is a FAIL only once there is a feed to be stale. Before the first
+        # tick the watchdog reports blocked because nothing has connected yet, which
+        # is the normal state of an idle process rather than a fault.
+        _check("Feed", not run.watchdog.blocked, run.watchdog.status,
+               warn=not run.watchdog.has_ticked),
         _check("PTB", run.stats.ptb_frozen > 0 or run.stats.markets_processed == 0,
                f"{run.stats.ptb_unavailable} unavailable", warn=True),
         _check("Recovery", report is None or report.safe_to_trade,

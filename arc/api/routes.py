@@ -154,7 +154,7 @@ async def start(
     if selected is Mode.V2:
         report = preflight(sup.runtime)
         if report["result"] == "FAIL":
-            failed = [c["name"] for c in report["checks"] if c["result"] == "FAIL"]
+            failed = [c["check"] for c in report["checks"] if c["result"] == "FAIL"]
             raise HTTPException(
                 status_code=409,
                 detail=f"V2 preflight failed: {', '.join(failed)}",

@@ -145,6 +145,26 @@ class TestPanelsRequiredByTheSpec:
             if "data-mode=" in line:
                 assert "data-post=" not in line, line
 
+    def test_the_runtime_buttons_name_the_selected_mode(self) -> None:
+        """"START RUNTIME" beside a highlighted V2 reads as V1 at a glance, and the
+        two differ by whether the orders are real. app.js rewrites both labels
+        whenever the selection changes."""
+        app = (_WEB / "app.js").read_text(encoding="utf-8")
+        assert "#runtime-start" in app and "#runtime-stop" in app
+        for target in ("$('#runtime-start').textContent", "$('#runtime-stop').textContent"):
+            assert target in app, target
+        assert 'id="runtime-stop"' in _OPS
+
+    def test_trading_control_has_all_four_buttons(self) -> None:
+        """Pause and resume belong to the Limit Order Engine, not to a general
+        controls row. An operator who cannot find PAUSE reaches for STOP RUNTIME,
+        which tears down the feeds instead of holding one window."""
+        trading = _OPS.split("<h2>Trading Control", 1)[1].split("</section>", 1)[0]
+        for label in ("START TRADING", "PAUSE TRADING", "RESUME TRADING", "STOP TRADING"):
+            assert label in trading, label
+        assert 'data-post="/pause"' in trading
+        assert 'data-post="/resume"' in trading
+
     def test_both_gates_are_displayed_independently(self) -> None:
         """A single combined light would hide system-disabled-while-armed."""
         assert 'data-f="runtime.trading_enabled"' in _OPS
@@ -264,6 +284,25 @@ class TestPreflight:
         for check in preflight(run)["checks"]:
             if check["result"] != "PASS":
                 assert check["detail"], check
+
+    def test_an_idle_runtime_does_not_fail_the_check_that_gates_its_own_start(
+        self, run: ArcRuntime
+    ) -> None:
+        """Preflight runs BEFORE V2 starts, against a runtime that has never been
+        run. If "not running yet" or "no feed yet" counted as FAIL, the check that
+        guards the start would make the start permanently impossible."""
+        report = preflight(run)
+        failed = {c["check"] for c in report["checks"] if c["result"] == "FAIL"}
+        assert failed <= {"Risk Engine"}, failed
+
+    def test_the_failing_names_the_start_route_reports_are_real_keys(
+        self, run: ArcRuntime
+    ) -> None:
+        """`/start` builds its 409 detail out of these. A key that does not exist
+        would raise inside the refusal and turn a clear "V2 preflight failed:
+        Risk Engine" into a 500 with no reason at all."""
+        for check in preflight(run)["checks"]:
+            assert set(check) == {"check", "result", "detail"}
 
 
 class TestDerivedStage:

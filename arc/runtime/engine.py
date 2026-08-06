@@ -491,17 +491,40 @@ class ArcRuntime:
     def arm(self) -> None:
         """The Start Trading button. Nothing else may call this."""
         self._runtime.arm_execution()
+        self._log_gate("Trading Started", "the Limit Order Engine is armed")
 
     def disarm(self) -> None:
         """The Stop Trading button. Stops NEW submissions and nothing else."""
         self._runtime.disarm_execution()
+        self._log_gate(
+            "Trading Stopped",
+            "no new intents; resting orders continue to reconciliation and settlement",
+        )
 
     def pause(self) -> None:
         """Hold new submissions without disarming. Feeds, TWAP and recovery continue."""
         self._paused = True
+        self._log_gate("Trading Paused", "no new intents; resting orders are still managed")
 
     def resume(self) -> None:
         self._paused = False
+        self._log_gate("Trading Resumed", "new intents may be created again")
+
+    def _log_gate(self, title: str, detail: str) -> None:
+        """One line per operator gate change, on the same stream as everything else.
+
+        Through `log_event` rather than a direct hub publish, so the change lands in
+        the Signal Tank, the Telegram feed and the log file together. A gate that
+        moved with no line is the operator's own action becoming the one thing they
+        cannot find afterwards when reconstructing why a window did not trade.
+        """
+        gate = self._runtime.gate
+        log_event(
+            logging.INFO,
+            title,
+            f"{detail}  (armed {gate.armed}, paused {self._paused})",
+            logger=self._logger,
+        )
 
     # ── gate inputs ──────────────────────────────────────────────────────────
 
