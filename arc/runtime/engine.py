@@ -50,6 +50,8 @@ from typing import Any, Final, TextIO
 
 import polymarket
 
+from arc.api.app import check_bind
+from arc.api.app import serve as serve_dashboard
 from arc.clock import Clock, DriftMonitor, DriftStatus
 from arc.config import Settings
 from arc.decision.engine import DecisionEngine, RuntimeHealth
@@ -67,6 +69,7 @@ from arc.execution.submit import Submitter
 from arc.execution.sweep import Sweeper
 from arc.execution.v1_paper import PaperExecutor
 from arc.execution.v2_live import LiveExecutor
+from arc.execution.wallet import WalletReader, WalletSnapshot, build_wallet
 from arc.logging_setup import log_event
 from arc.market.discovery import MarketDiscovery, open_discovery
 from arc.market.providers import TwapProvider, build_provider
@@ -82,8 +85,10 @@ from arc.market.settlement_feed import SettlementTwapCollector
 from arc.market.spec_check import SpecChecker
 from arc.market.validation import ObservationValidator
 from arc.market.watchdog import FeedWatchdog
+from arc.notify.telegram import TelegramNotifier, category_settings
 from arc.risk.limits import limits_from_trading
-from arc.runtime.recovery import RecoveryRunner
+from arc.runtime.events import EventHub, attach
+from arc.runtime.recovery import RecoveryReport, RecoveryRunner
 from arc.runtime.state import RuntimeState
 from arc.storage.store import Store
 from arc.strategy.config import config_from_trading
@@ -106,6 +111,9 @@ EXPECTED_SYMBOL: Final[str] = "BTC/USD"
 # within a fraction of a second, coarse enough to cost nothing. Not a schedule:
 # every pass compares the clock against the boundary from scratch (A12).
 _TICK_SECONDS: Final[float] = 0.2
+
+# runtime_state key for the restart counter.
+_RESTART_KEY: Final[str] = "restart_count"
 
 # How often an unresolved PTB is retried. The venue publishes a market's
 # `eventMetadata` roughly 25 seconds after it closes — i.e. roughly 25 seconds into
@@ -219,11 +227,15 @@ class ArcRuntime:
         "_executor",
         "_feed",
         "_fills",
+        "_hub",
         "_logger",
         "_next_ptb_attempt",
+        "_notifier",
         "_out",
+        "_paused",
         "_previous_close",
         "_reconciler",
+        "_recovery",
         "_repricer",
         "_runtime",
         "_settings",
@@ -234,8 +246,11 @@ class ArcRuntime:
         "_sweeper",
         "_validator",
         "_venue_client",
+        "_wallet",
+        "_wallet_status",
         "_watchdog",
         "mode",
+        "restart_count",
         "rotator",
         "started_at",
         "stats",
@@ -269,9 +284,18 @@ class ArcRuntime:
         self._venue_client = venue_client
         self._out = out
         self._logger = logger
+        # Pause is the operator's "hold new submissions" and is deliberately
+        # separate from disarming: pausing must not clear the arm state, or resuming
+        # would silently require a second confirmation the operator did not expect.
+        self._paused = False
+        self._hub = EventHub()
         self.mode = executor.mode
         self.status = RuntimeStatus.STOPPED
         self.started_at = 0.0
+        # Persisted across restarts, so the System page can show "restarted 14
+        # times" — the number that tells the operator PM2 is looping on a crash
+        # rather than that the process has been up all week.
+        self.restart_count = int(store.get_runtime_state(_RESTART_KEY) or 0)
         self.stats = RuntimeStats()
 
         self._validator = ObservationValidator()
@@ -292,6 +316,24 @@ class ArcRuntime:
         self._previous_close = PreviousClosePtbCache()
         self._next_ptb_attempt: float = 0.0
         self.tokens = TokenCache()
+        # Recovery's own report, kept so the dashboard can show reconciliation
+        # progress. None until recovery runs: "not yet run" and "ran and found
+        # nothing" are different facts, and a restart is exactly when the operator
+        # needs to know which one they are looking at.
+        self._recovery: RecoveryReport | None = None
+        self._wallet = build_wallet(executor.mode, store, venue_client)
+        # Last reported wallet status, so a transition is logged once instead of on
+        # every poll. An event per poll would bury the one that mattered.
+        self._wallet_status = ""
+        # Notification only. Constructed unconditionally and inert without a token, so
+        # there is no code path that exists only when Telegram is configured — the
+        # untested path is the one that breaks the night it is first needed.
+        self._notifier = TelegramNotifier(
+            token=settings.env.telegram_bot_token.get_secret_value(),
+            chat_id=settings.env.telegram_chat_id,
+            flags=category_settings(store.load_settings()),
+            logger=logger,
+        )
 
         # ── execution half ───────────────────────────────────────────────────
         self._bucket = TokenBucket(
@@ -348,6 +390,100 @@ class ArcRuntime:
             logger=logger,
         )
 
+    # ── read access for the dashboard ────────────────────────────────────────
+    # Properties rather than public attributes so the API can only READ. A
+    # dashboard that could reach in and set a frozen value would be the one place
+    # in the process able to change a number after it was locked.
+
+    @property
+    def settings(self) -> Settings:
+        return self._settings
+
+    @property
+    def store(self) -> Store:
+        return self._store
+
+    @property
+    def clock(self) -> Clock:
+        return self._clock
+
+    @property
+    def state(self) -> RuntimeState:
+        return self._runtime
+
+    @property
+    def feed(self) -> TwapProvider:
+        return self._feed
+
+    @property
+    def executor(self) -> Executor:
+        return self._executor
+
+    @property
+    def watchdog(self) -> FeedWatchdog:
+        return self._watchdog
+
+    @property
+    def drift(self) -> DriftMonitor:
+        return self._drift
+
+    @property
+    def spec(self) -> SpecChecker:
+        return self._spec
+
+    @property
+    def wallet(self) -> WalletReader:
+        return self._wallet
+
+    @property
+    def recovery_report(self) -> RecoveryReport | None:
+        """What the last recovery pass found. None until recovery has run."""
+        return self._recovery
+
+    @property
+    def venue_client(self) -> polymarket.AsyncSecureClient | None:
+        return self._venue_client
+
+    @property
+    def hub(self) -> EventHub:
+        """The Signal Tank. The API subscribes; the engines only publish."""
+        return self._hub
+
+    @property
+    def notifier(self) -> TelegramNotifier:
+        """Telegram. Read-only from here: it observes the hub and controls nothing."""
+        return self._notifier
+
+    async def wallet_snapshot(self, now: float) -> WalletSnapshot:
+        """One wallet read, with a connection CHANGE logged as an event.
+
+        The panel is polled once per status frame, so logging the status itself would
+        produce a line per second. Only a transition is an event — and it has to be
+        one, because a wallet that silently went DISCONNECTED means every balance on
+        screen is the last one that was true rather than the one that is.
+        """
+        snapshot = await self._wallet.snapshot(now, run_start=self.started_at)
+        if snapshot.status != self._wallet_status:
+            previous, self._wallet_status = self._wallet_status, snapshot.status
+            if previous:
+                connected = snapshot.status != "DISCONNECTED"
+                log_event(
+                    logging.INFO if connected else logging.WARNING,
+                    "Wallet Reconnected" if connected else "Wallet Disconnected",
+                    f"{snapshot.provider}  {snapshot.status}",
+                    logger=self._logger,
+                )
+        return snapshot
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    def settlement_twap(self, slug: str) -> Decimal | None:
+        """The venue's 30s mean as collected so far. Observational only."""
+        collector = self._settlement.get(slug)
+        return None if collector is None else collector.settlement_twap
+
     # ── operator gate ────────────────────────────────────────────────────────
 
     def arm(self) -> None:
@@ -357,6 +493,13 @@ class ArcRuntime:
     def disarm(self) -> None:
         """The Stop Trading button. Stops NEW submissions and nothing else."""
         self._runtime.disarm_execution()
+
+    def pause(self) -> None:
+        """Hold new submissions without disarming. Feeds, TWAP and recovery continue."""
+        self._paused = True
+
+    def resume(self) -> None:
+        self._paused = False
 
     # ── gate inputs ──────────────────────────────────────────────────────────
 
@@ -373,6 +516,7 @@ class ArcRuntime:
             trading_enabled=self._runtime.trading_enabled,
             spec_status=self._runtime.spec_status,
             execution_armed=self._runtime.execution_armed,
+            paused=self._paused,
             trading_disabled_reason=self._runtime.reason,
             feed_blocked=self._watchdog.blocked,
             feed_age_ms=self._watchdog.age_ms(),
@@ -588,11 +732,12 @@ class ArcRuntime:
         gates were evaluated when the intent was created; an operator pressing Stop
         Trading, or ARC disabling trading, in the milliseconds between creation and
         submission must stop the order, and the only place that can still see that
-        change is this one.
+        change is this one. Pause is checked in the same breath and for the same
+        reason.
         """
         if market.phase is not MarketPhase.ACTIVE:
             return
-        if not self._runtime.gate.submitting:
+        if self._paused or not self._runtime.gate.submitting:
             return
         submitted_offsets = {o.offset_seconds for o in self._store.orders_for(market.slug)}
         for intent in self._store.intents_for(market.slug):
@@ -681,6 +826,18 @@ class ArcRuntime:
             self._watchdog.evaluate()
             self._gate_on_health()
             await self._drive_execution(now)
+            if self._notifier.summary_due(now):
+                stats = self.stats
+                await self._notifier.send_summary(
+                    {
+                        "markets_processed": stats.markets_processed,
+                        "orders_submitted": stats.orders_submitted,
+                        "fills_recorded": stats.fills_recorded,
+                        "reconnects": stats.reconnects,
+                        "trading_enabled": self._runtime.trading_enabled,
+                        "execution_armed": self._runtime.execution_armed,
+                    }
+                )
             await asyncio.sleep(_TICK_SECONDS)
 
     def _gate_on_health(self) -> None:
@@ -710,6 +867,7 @@ class ArcRuntime:
         """
         runner = RecoveryRunner(self._store, self._reconciler, self._fills, logger=self._logger)
         report = await runner.run(now)
+        self._recovery = report
         if not report.safe_to_trade and self._runtime.trading_enabled:
             self._runtime.disable_trading("RECOVERY_UNRESOLVED")
 
@@ -722,18 +880,48 @@ class ArcRuntime:
         """
         self.status = RuntimeStatus.STARTING
         self.started_at = self._clock.now()
+        # Counted on start rather than on clean exit: a process killed by OOM never
+        # reaches an exit path, and those are precisely the restarts worth counting.
+        self.restart_count += 1
+        self._store.set_runtime_state(_RESTART_KEY, str(self.restart_count), self.started_at)
+        # Bound here rather than at construction: the hub broadcasts to websocket
+        # subscribers through call_soon_threadsafe, and the loop it must target is
+        # the one actually running the runtime, not whichever loop built the object.
+        self._hub.bind_loop(asyncio.get_running_loop())
+        attach(self._hub, self._logger)
         self._print_header()
+        # After attach, so the first line of the run is in the Signal Tank and in
+        # Telegram rather than only on stdout.
+        log_event(
+            logging.INFO,
+            "Runtime Started",
+            f"mode {self.mode.value}  trading "
+            f"{'ENABLED' if self._runtime.trading_enabled else 'DISABLED'}",
+            logger=self._logger,
+        )
         await self.recover(self.started_at)
 
         feed_task = asyncio.create_task(self._feed_loop())
+        # The notifier is a subscriber like the websocket, not a step in any engine.
+        # If it dies the runtime does not notice and must not: notifications are not
+        # in the trading path.
+        notify_task = asyncio.create_task(self._notifier.run(self._hub))
         self.status = RuntimeStatus.running_for(self.mode)
         try:
             await self._main_loop(market_target)
         finally:
             self.status = RuntimeStatus.STOPPING
-            feed_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await feed_task
+            log_event(
+                logging.INFO,
+                "Runtime Stopped",
+                f"{self.stats.markets_processed} markets processed",
+                logger=self._logger,
+            )
+            for task in (feed_task, notify_task):
+                task.cancel()
+            for task in (feed_task, notify_task):
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
             self.status = RuntimeStatus.STOPPED
 
         self._spec.apply(self._runtime)
@@ -896,9 +1084,20 @@ async def run_arc(
         # market loop fills. Two caches would let the executor resolve from an empty
         # one and refuse every submission on a perfectly healthy market.
         run.tokens = tokens
+        # The dashboard is a task of this process, not a second process. `arc run`
+        # starts runtime, engines, recovery, websocket and dashboard together, so
+        # there is exactly one runtime state and the UI reads the live object.
+        # Bind is checked before the loop starts: a non-loopback bind must fail the
+        # startup, not warn during it.
+        dashboard = asyncio.create_task(
+            serve_dashboard(run, host=check_bind(settings.env.api_bind), port=settings.env.api_port)
+        )
         try:
             await run.run(market_target=market_target)
         finally:
+            dashboard.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await dashboard
             if client is not None:
                 await client.close()
     return 0

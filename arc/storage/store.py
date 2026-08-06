@@ -82,6 +82,16 @@ class Store:
     def expected_schema_version(self) -> int:
         return SCHEMA_VERSION
 
+    def checkpoint(self) -> None:
+        """Fold the WAL back into the main file.
+
+        Called before a file-copy backup: in WAL mode the newest committed rows live
+        in the -wal sidecar, so copying only the .db would produce a backup missing
+        everything since the last automatic checkpoint — silently, and only
+        discovered when it is restored.
+        """
+        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
     def close(self) -> None:
         self._conn.close()
 

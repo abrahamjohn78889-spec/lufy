@@ -102,9 +102,14 @@ class FillEngine:
             accepted.append(fill)
             apply_fill(order, fill.size, now)
             self._store.save_order(order)
+            # Submission, partial fill and complete fill are three separate facts and
+            # are logged as three separate events. One "Order Filled" line for a
+            # partial would tell the operator the position is on when most of it is
+            # still resting in the book.
+            complete = order.filled_size >= order.size
             log_event(
                 logging.INFO,
-                "Order Filled",
+                "Order Filled" if complete else "Partial Fill",
                 f"{order.order_id}  {dec_str(fill.size)} @ {dec_str(fill.price)}  "
                 f"({dec_str(order.filled_size)}/{dec_str(order.size)})",
                 logger=self._logger,

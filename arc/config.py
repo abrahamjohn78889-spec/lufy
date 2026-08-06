@@ -80,6 +80,9 @@ _SECRET_FIELDS: Final[tuple[str, ...]] = (
     *_VENUE_SECRET_FIELDS,
     "chainlink_api_key",
     "chainlink_api_secret",
+    # A bot token is a credential: anyone holding it can post as ARC. It is redacted
+    # for the same reason as the venue keys, not because Telegram can trade.
+    "telegram_bot_token",
 )
 
 
@@ -172,6 +175,13 @@ class ArcSettings(BaseSettings):
     polymarket_api_secret: SecretStr = SecretStr("")
     polymarket_api_passphrase: SecretStr = SecretStr("")
     polymarket_private_key: SecretStr = SecretStr("")
+
+    # Telegram is notification only and can never control trading. Bootstrap-only,
+    # like the provider: the per-category toggles live in the settings table and are
+    # editable from the dashboard, but the credential is not, because a bot token
+    # reachable from a web form is a bot token that can be replaced from a web form.
+    telegram_bot_token: SecretStr = SecretStr("")
+    telegram_chat_id: str = ""
 
     @field_validator("mode", mode="before")
     @classmethod

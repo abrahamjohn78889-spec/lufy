@@ -1,0 +1,310 @@
+/*
+  ARC Operations Center — presentation only.
+
+  Dark, dense, and static: no animations beyond one 600ms flash on a jumped-to
+  event, because a 24x7 panel with running transitions is a browser burning CPU
+  on a VPS all week. Grid areas are fixed so a value never moves under the cursor
+  as it updates.
+
+  The stale rule is enforced here: body.stale desaturates and dims the whole
+  document at once, so a disconnected socket cannot leave one live-looking panel.
+*/
+
+:root {
+  --bg: #0b0e13;
+  --panel: #141922;
+  --line: #232a36;
+  --text: #dfe5ee;
+  --dim: #7d8798;
+  --green: #3ddc84;
+  --amber: #ffbe3d;
+  --red: #ff5f56;
+  --accent: #5aa9ff;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 var(--mono);
+}
+
+/* Stale is never live. One class, whole document. */
+body.stale { filter: grayscale(0.85) brightness(0.65); }
+
+/* ── header ───────────────────────────────────────────────────────────────── */
+
+header {
+  position: sticky; top: 0; z-index: 10;
+  display: flex; align-items: center; gap: 14px;
+  padding: 8px 14px;
+  background: #0e131b;
+  border-bottom: 1px solid var(--line);
+}
+
+.brand { font-weight: 700; letter-spacing: 2px; color: var(--accent); }
+
+#tabs { display: flex; gap: 4px; flex: 1; flex-wrap: wrap; }
+
+.tab {
+  background: transparent; color: var(--dim);
+  border: 1px solid transparent; border-radius: 3px;
+  padding: 4px 10px; font: inherit; cursor: pointer;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--text); border-color: var(--line); background: var(--panel); }
+
+.link { padding: 3px 8px; border-radius: 3px; font-size: 11px; }
+.link.up { color: var(--green); border: 1px solid var(--green); }
+.link.down { color: var(--red); border: 1px solid var(--red); }
+
+/* ── banner ───────────────────────────────────────────────────────────────── */
+
+.banner { padding: 8px 14px; font-weight: 700; letter-spacing: 0.5px; }
+.banner.red { background: #3a1216; color: var(--red); }
+.banner.amber { background: #33280d; color: var(--amber); }
+.banner.green { background: #0f2b1c; color: var(--green); }
+.banner.hidden { display: none; }
+
+/* ── workspaces ───────────────────────────────────────────────────────────── */
+
+.ws { display: none; padding: 12px; }
+.ws.active { display: block; }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+.span2 { grid-column: span 2; }
+.span3 { grid-column: span 3; }
+.span4 { grid-column: span 4; }
+
+@media (max-width: 1100px) {
+  .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .span3, .span4 { grid-column: span 2; }
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 10px 12px;
+  min-width: 0;
+}
+
+.panel h2 {
+  margin: 0 0 8px;
+  font-size: 11px; letter-spacing: 1.5px; text-transform: uppercase;
+  color: var(--dim); font-weight: 600;
+}
+
+.note { color: var(--dim); font-size: 11px; margin: 8px 0 0; }
+.note code { color: var(--accent); }
+
+/* ── the two official timers ───────────────────────────────────────────────── */
+
+.timer-bar {
+  display: flex; align-items: center; justify-content: center; gap: 22px;
+  padding: 10px 0 16px;
+}
+.timer {
+  font-size: 56px; font-weight: 700; letter-spacing: 3px;
+  /* Tabular figures: proportional digits make the countdown jitter horizontally
+     every second, which reads as an unstable panel. */
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.timer-meta .slug { font-size: 16px; }
+.timer-meta .sub { color: var(--dim); font-size: 11px; }
+
+/* ── key/value ────────────────────────────────────────────────────────────── */
+
+.kv {
+  display: grid; grid-template-columns: minmax(120px, auto) 1fr;
+  gap: 2px 12px; margin: 0;
+}
+.kv dt { color: var(--dim); }
+.kv dd { margin: 0; overflow-wrap: anywhere; }
+.kv.tight { font-size: 11px; }
+
+.yes { color: var(--green); }
+.no { color: var(--red); }
+
+/* ── engines ──────────────────────────────────────────────────────────────── */
+
+.engine {
+  display: grid; grid-template-columns: 12px 150px 90px 1fr;
+  align-items: center; gap: 8px; padding: 1px 0;
+}
+.dot { width: 8px; height: 8px; border-radius: 50%; }
+.dot.green { background: var(--green); }
+.dot.yellow { background: var(--amber); }
+.dot.red { background: var(--red); }
+.engine .es { color: var(--text); }
+.engine .ed { color: var(--dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis;
+              white-space: nowrap; }
+
+/* ── checks / pills ───────────────────────────────────────────────────────── */
+
+.checks { display: flex; flex-direction: column; gap: 1px; }
+.check { display: grid; grid-template-columns: 68px 170px 1fr; gap: 8px; }
+.check b { font-weight: 700; }
+.check.pass b { color: var(--green); }
+.check.warning b { color: var(--amber); }
+.check.fail b { color: var(--red); }
+.check i { color: var(--dim); font-style: normal; }
+
+.pill {
+  font-size: 10px; padding: 1px 6px; border-radius: 8px;
+  border: 1px solid var(--line); color: var(--dim);
+}
+.pill.pass { color: var(--green); border-color: var(--green); }
+.pill.warning { color: var(--amber); border-color: var(--amber); }
+.pill.fail { color: var(--red); border-color: var(--red); }
+
+/* ── controls ─────────────────────────────────────────────────────────────── */
+
+.mode-row { display: flex; gap: 8px; margin-bottom: 8px; }
+.mode {
+  flex: 1; text-align: center; padding: 8px;
+  border: 1px solid var(--line); border-radius: 3px; color: var(--dim);
+}
+.mode.on { color: var(--text); border-color: var(--accent); background: #14243a; }
+
+.controls { display: flex; gap: 8px; flex-wrap: wrap; }
+
+button {
+  background: #1d2430; color: var(--text);
+  border: 1px solid var(--line); border-radius: 3px;
+  padding: 6px 12px; font: inherit; cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.big { flex: 1; padding: 14px; font-size: 15px; font-weight: 700; letter-spacing: 1px; }
+.big.go { border-color: var(--green); color: var(--green); }
+.big.stop { border-color: var(--red); color: var(--red); }
+
+.msg { margin-top: 8px; font-size: 11px; overflow-wrap: anywhere; }
+.msg.ok { color: var(--green); }
+.msg.bad { color: var(--red); }
+
+/* ── big values ───────────────────────────────────────────────────────────── */
+
+.big-values {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px;
+}
+.big-values .lbl { display: block; color: var(--dim); font-size: 10px;
+                   text-transform: uppercase; letter-spacing: 0.5px; }
+.big-values b { font-size: 20px; font-variant-numeric: tabular-nums; }
+
+/* ── Limit Order Engine lifecycle ─────────────────────────────────────────── */
+
+.lifecycle {
+  list-style: none; margin: 0 0 12px; padding: 0;
+  display: flex; flex-wrap: wrap; gap: 4px; counter-reset: stage;
+}
+.lifecycle li {
+  padding: 5px 10px; border: 1px solid var(--line); border-radius: 3px;
+  color: var(--dim); font-size: 11px;
+}
+.lifecycle li.done { color: var(--text); border-color: #2f4a38; }
+.lifecycle li.now {
+  color: #0b0e13; background: var(--accent); border-color: var(--accent); font-weight: 700;
+}
+/* Submitted and Filled are separate boxes and separately coloured: a fill drawn
+   as "submitted, done" would tell the operator a position is on when it is not. */
+.lifecycle li[data-stage="BUFFER_NOT_SATISFIED"].now { background: var(--amber); }
+.lifecycle li[data-stage="FILLED"].now { background: var(--green); }
+
+.windows { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; }
+.win { border: 1px solid var(--line); border-radius: 3px; padding: 8px; }
+.win .wl { font-size: 16px; font-weight: 700; }
+.win .wst { font-size: 10px; color: var(--dim); letter-spacing: 1px; }
+.win .wd { font-size: 13px; margin-bottom: 4px; }
+.win.frozen { border-color: var(--accent); }
+.win.fired { border-color: var(--green); }
+.win.no_direction { border-color: var(--amber); }
+.win.no_direction .wd { color: var(--amber); font-weight: 700; }
+.win.expired { opacity: 0.6; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.chip { border: 1px solid var(--line); border-radius: 8px; padding: 1px 8px;
+        font-size: 11px; color: var(--dim); }
+
+/* ── wallet ───────────────────────────────────────────────────────────────── */
+
+.wallet { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+
+/* ── tables / streams ─────────────────────────────────────────────────────── */
+
+.toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+
+input, select {
+  background: #0e131b; color: var(--text);
+  border: 1px solid var(--line); border-radius: 3px;
+  padding: 5px 8px; font: inherit;
+}
+input:disabled { opacity: 0.4; }
+
+a { color: var(--accent); }
+
+.scroll-x { overflow-x: auto; }
+
+.stream { width: 100%; border-collapse: collapse; font-size: 11px; }
+.stream th {
+  position: sticky; top: 44px; z-index: 2;
+  text-align: left; padding: 5px 8px; white-space: nowrap;
+  background: #0e131b; border-bottom: 1px solid var(--line);
+  color: var(--dim); font-weight: 600;
+}
+.stream td { padding: 3px 8px; border-bottom: 1px solid #1a2028; white-space: nowrap; }
+.stream tr:hover td { background: #182030; }
+
+.stream tr.fatal td, .stream tr.error td { color: var(--red); }
+.stream tr.warning td { color: var(--amber); }
+.stream tr.rejected td { color: var(--red); }
+.stream tr.filled td { color: var(--green); }
+
+.flash { animation: flash 600ms ease-out 1; }
+@keyframes flash { from { background: var(--accent); } to { background: transparent; } }
+
+.jump { cursor: pointer; text-decoration: underline dotted; }
+
+.plain { margin: 0; padding-left: 18px; color: var(--dim); }
+
+/* ── settings ─────────────────────────────────────────────────────────────── */
+
+.field { display: block; margin-bottom: 8px; }
+.field span { display: block; color: var(--dim); font-size: 11px; margin-bottom: 2px; }
+.field input { width: 100%; }
+
+.toggles { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 4px; }
+.toggle { display: flex; align-items: center; gap: 6px; }
+
+/* ── backtest ─────────────────────────────────────────────────────────────── */
+
+/* Not a dialog and with no close control: the warning cannot be dismissed
+   because a signal chart read as a performance chart is the whole hazard. */
+.warn-banner {
+  background: #33280d; color: var(--amber);
+  border: 1px solid var(--amber); border-radius: 4px;
+  padding: 10px 12px; margin-bottom: 12px; font-weight: 600;
+}
+
+#bt-chart {
+  width: 100%; height: 420px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+}
+#bt-chart .candle { stroke: #4a5566; stroke-width: 1; }
+#bt-chart .body { stroke-width: 3; }
+#bt-chart .body.up { stroke: var(--green); }
+#bt-chart .body.down { stroke: var(--red); }
+#bt-chart .ptb { stroke: var(--accent); stroke-width: 1.5; }
+#bt-chart .twap { stroke: #d38bff; stroke-width: 1.5; }
+#bt-chart .trigger { stroke: var(--amber); stroke-width: 1; stroke-dasharray: 4 3; }
+#bt-chart .fire { fill: var(--green); }

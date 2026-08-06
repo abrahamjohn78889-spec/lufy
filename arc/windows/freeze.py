@@ -94,6 +94,19 @@ def freeze_window(
             "a window without a buffer can never fire"
         ) from exc
 
+    # The activation instant has passed and this window is now open. Logged BEFORE the
+    # freeze, and as its own event, because "Window Open" and "Values Frozen" are two
+    # stages of the Limit Order Engine's lifecycle: a window that opened and could not
+    # freeze yet must show as open rather than as nothing at all. A retry logs it again,
+    # always alongside the rejection line that explains why the first attempt did not
+    # complete.
+    log_event(
+        logging.INFO,
+        "Window Open",
+        f"{market.slug}  {offset}s  buffer {buffer}",
+        logger=logger,
+    )
+
     # freeze_window on the instance validates the PTB and the TWAP and performs the
     # single-assignment commit. Anything it raises leaves the window untouched.
     market.freeze_window(offset, buffer=buffer, frozen_at=now)
