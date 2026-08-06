@@ -22,13 +22,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Final
 
+from arc.clock import Clock, SystemClock
 from arc.domain.enums import OrderState
+from arc.runtime.metrics import RuntimeMetrics, runtime_metrics
 from arc.runtime.recorder import RecorderReport, audit_recording
 from arc.runtime.stats import FillStats, fill_statistics
 from arc.storage.store import Store
 
 __all__ = [
     "OPERATOR_VERIFIED",
+    "VERDICT_NOT_READY",
+    "VERDICT_READY",
     "Criterion",
     "ValidationReport",
     "validate_run",
@@ -37,6 +41,11 @@ __all__ = [
 PASS: Final[str] = "PASS"
 FAIL: Final[str] = "FAIL"
 UNVERIFIED: Final[str] = "UNVERIFIED"
+
+# The two verdicts. Exactly two, spelled exactly this way, so a reader searching a
+# pasted report for either string finds it or finds nothing.
+VERDICT_READY: Final[str] = "READY FOR V2 LIVE TRADING"
+VERDICT_NOT_READY: Final[str] = "NOT READY FOR V2 LIVE TRADING"
 
 # How many consecutive real markets the phase requires.
 REQUIRED_MARKETS: Final[int] = 100
@@ -84,6 +93,7 @@ class ValidationReport:
     criteria: list[Criterion] = field(default_factory=list)
     recorder: RecorderReport | None = None
     stats: FillStats | None = None
+    metrics: RuntimeMetrics | None = None
 
     @property
     def failed(self) -> tuple[Criterion, ...]:
@@ -103,8 +113,19 @@ class ValidationReport:
         """
         return not self.failed and not self.unverified
 
+    @property
+    def verdict(self) -> str:
+        """Exactly one of two strings. There is no third, softer outcome.
+
+        "Mostly ready", "ready with caveats" and "ready pending X" are all the same
+        sentence to somebody about to enable live trading, and all three would be
+        read as the first word.
+        """
+        return VERDICT_READY if self.ready_for_live else VERDICT_NOT_READY
+
     def as_json(self) -> dict[str, Any]:
         return {
+            "verdict": self.verdict,
             "ready_for_live": self.ready_for_live,
             "passed": sum(1 for c in self.criteria if c.result == PASS),
             "failed": len(self.failed),
@@ -113,6 +134,7 @@ class ValidationReport:
             "operator_verified_required": OPERATOR_VERIFIED,
             "recorder": self.recorder.as_json() if self.recorder is not None else None,
             "statistics": self.stats.as_json() if self.stats is not None else None,
+            "metrics": self.metrics.as_json() if self.metrics is not None else None,
         }
 
 
@@ -187,8 +209,20 @@ def validate_run(
     offsets: tuple[int, ...],
     cadence_seconds: int,
     market_limit: int = 500,
+    uptime_seconds: float = 0.0,
+    restarts: int = 0,
+    reconnects: int = 0,
+    chainlink_enabled: bool = False,
+    clock: Clock | None = None,
 ) -> ValidationReport:
-    """Read the run back and report against every acceptance criterion."""
+    """Read the run back and report against every acceptance criterion.
+
+    The runtime figures are passed in rather than read from a global: the validator
+    must be runnable against a database with no process attached to it, and one that
+    silently reported zero uptime for a live run would be worse than one that says so.
+    """
+    clock = clock if clock is not None else SystemClock()
+    started = clock.monotonic()
     recorder = audit_recording(
         store,
         expected_windows=len(offsets),
@@ -289,6 +323,19 @@ def validate_run(
     add(_c(13, "Database health", store.integrity_check() == "ok",
            store.integrity_check(),
            f"schema v{store.schema_version}, {store.market_count()} markets"))
+
+    # The runtime figures. Attached last so the elapsed time covers every check
+    # above it — the duration the operator reads is the duration they waited.
+    report.metrics = runtime_metrics(
+        store,
+        stats,
+        uptime_seconds=uptime_seconds,
+        restarts=restarts,
+        reconnects=reconnects,
+        observations=sum(store.observation_count(s) for s in slugs),
+        duration_seconds=clock.monotonic() - started,
+        chainlink_enabled=chainlink_enabled,
+    )
 
     return report
 

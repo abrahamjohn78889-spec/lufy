@@ -50,6 +50,30 @@ PRICE = Decimal("0.70")
 SIZE = Decimal("35")
 
 
+# The metrics block reports how long this run and this validation took, so two
+# renderings of the same rows differ in those figures by design. Everything else
+# must match exactly — the comparisons below blank the clocks and nothing more.
+_VOLATILE: tuple[str, ...] = (
+    "runtime_uptime_seconds",
+    "validation_duration_seconds",
+    "runtime uptime (s)",
+    "validation duration (s)",
+)
+
+
+def _stable_json(payload: dict[str, Any]) -> dict[str, Any]:
+    metrics = payload.get("metrics")
+    if not metrics:
+        return payload
+    return {**payload, "metrics": {**metrics, **{k: None for k in _VOLATILE if k in metrics}}}
+
+
+def _stable_text(text: str) -> str:
+    return "\n".join(
+        line for line in text.splitlines() if not any(v in line for v in _VOLATILE)
+    )
+
+
 class _Discovery:
     """Metadata that never publishes. Nothing here needs the venue."""
 
@@ -264,7 +288,8 @@ class TestTheRouteReadsTheSameRowsTheValidatorDoes:
             cadence_seconds=MARKET_DURATION_SECONDS,
             market_limit=50,
         )
-        assert client.get("/history?validate=1").json()["validation"] == direct.as_json()
+        over_the_route = client.get("/history?validate=1").json()["validation"]
+        assert _stable_json(over_the_route) == _stable_json(direct.as_json())
 
     def test_the_rendered_text_matches_render_report(
         self, client: TestClient, run: ArcRuntime
@@ -278,7 +303,9 @@ class TestTheRouteReadsTheSameRowsTheValidatorDoes:
         expected = render_report(
             direct, mode=run.mode.value, provider=run.settings.env.twap_provider
         )
-        assert client.get("/history?format=report").text == expected
+        assert _stable_text(client.get("/history?format=report").text) == _stable_text(
+            expected
+        )
 
     def test_the_market_limit_reaches_the_validator(self, client: TestClient) -> None:
         """`?markets=` bounds the audit as well as the ledger, so a report and the
@@ -300,8 +327,8 @@ class TestTheReportIsReadOnly:
         assert after == before
 
     def test_two_reads_agree(self, client: TestClient) -> None:
-        first = client.get("/history?format=report").text
-        assert client.get("/history?format=report").text == first
+        first = _stable_text(client.get("/history?format=report").text)
+        assert _stable_text(client.get("/history?format=report").text) == first
 
 
 class TestAnEmptyRunReportsHonestly:

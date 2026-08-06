@@ -27,6 +27,26 @@ __all__ = ["render_report"]
 
 _RULE = "─" * 78
 
+# The metric rows, in the order the addendum lists them. A tuple rather than a walk
+# over the dict so the report's layout is fixed: an operator comparing two runs
+# side by side must find the same figure on the same line.
+_METRIC_ROWS: tuple[tuple[str, str], ...] = (
+    ("runtime uptime (s)", "runtime_uptime_seconds"),
+    ("runtime restarts", "runtime_restarts"),
+    ("runtime reconnects", "runtime_reconnects"),
+    ("avg websocket latency ms", "avg_websocket_latency_ms"),
+    ("avg CLOB latency ms", "avg_clob_latency_ms"),
+    ("avg RTDS latency ms", "avg_rtds_latency_ms"),
+    ("avg Chainlink latency ms", "avg_chainlink_latency_ms"),
+    ("avg order latency ms", "avg_order_latency_ms"),
+    ("recorder markets", "recorder_markets"),
+    ("recorder observations", "recorder_observations"),
+    ("database bytes", "database_bytes"),
+    ("database bytes / market", "database_bytes_per_market"),
+    ("database bytes / day", "database_bytes_per_day_projected"),
+    ("validation duration (s)", "validation_duration_seconds"),
+)
+
 
 def _section(title: str) -> str:
     return f"\n{title}\n{_RULE}\n"
@@ -48,11 +68,7 @@ def render_report(report: ValidationReport, *, mode: str, provider: str) -> str:
         _row("criteria passed", sum(1 for c in report.criteria if c.result == PASS)),
         _row("criteria failed", len(report.failed)),
         _row("criteria unverified", len(report.unverified)),
-        _row(
-            "verdict",
-            "READY FOR LIVE (V2)" if report.ready_for_live
-            else "NOT READY — see unverified and failed below",
-        ),
+        _row("verdict", report.verdict),
     ]
 
     if report.failed:
@@ -113,6 +129,13 @@ def render_report(report: ValidationReport, *, mode: str, provider: str) -> str:
             f"\n  totals: {totals['submissions']} submissions, "
             f"{totals['filled']} filled across {totals['markets']} markets\n"
         )
+
+    metrics = report.metrics
+    if metrics is not None:
+        lines.append(_section("RUNTIME METRICS"))
+        values = metrics.as_json()
+        for label, field in _METRIC_ROWS:
+            lines.append(_row(label, values[field]))
 
     lines.append(_section("NOT MEASURED BY ARC"))
     lines.append(

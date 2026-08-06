@@ -35,16 +35,17 @@ from conftest import OFFSETS
 from execution_fixtures import fill_engine, intent_for, make_market, store_at, submitter
 
 from arc.domain.enums import Direction, MarketPhase, OrderState, Outcome, WindowState
-from arc.domain.models import ExecutionWindow, Fill, Order, Settlement
+from arc.domain.models import ExecutionWindow, Fill, Observation, Order, Settlement
 from arc.domain.timing import slug_for
 from arc.execution.v1_paper import PaperExecutor
+from arc.runtime.metrics import UNAVAILABLE, RuntimeMetrics
 from arc.runtime.recorder import (
     RUNTIME_STATE_KEY,
     audit_market,
     audit_recording,
     submission_records,
 )
-from arc.runtime.report import render_report
+from arc.runtime.report import _METRIC_ROWS, render_report
 from arc.runtime.stats import fill_statistics
 from arc.runtime.validation import (
     FAIL,
@@ -52,6 +53,8 @@ from arc.runtime.validation import (
     PASS,
     REQUIRED_MARKETS,
     UNVERIFIED,
+    VERDICT_NOT_READY,
+    VERDICT_READY,
     unresolved_summary,
     validate_run,
 )
@@ -721,3 +724,143 @@ class TestTheRenderedReport:
         assert "<" not in text
         assert text.isprintable() is False  # newlines
         text.encode("utf-8")
+
+
+# ── the runtime metrics block ────────────────────────────────────────────────
+
+
+class TestRuntimeMetrics:
+    """Addendum item 9. Every figure printed must be measured or say it is not."""
+
+    def _metrics(self, store: Store, **kwargs: object) -> RuntimeMetrics:
+        report = validate_run(
+            store, offsets=OFFSETS, cadence_seconds=CADENCE, **kwargs  # type: ignore[arg-type]
+        )
+        assert report.metrics is not None
+        return report.metrics
+
+    def test_the_runtime_figures_are_what_was_passed_in(self, store: Store) -> None:
+        m = self._metrics(store, uptime_seconds=3601.5, restarts=2, reconnects=7)
+        assert (m.uptime_seconds, m.restarts, m.reconnects) == (3601.5, 2, 7)
+
+    def test_a_negative_uptime_is_clamped_rather_than_printed(self, store: Store) -> None:
+        assert self._metrics(store, uptime_seconds=-1.0).uptime_seconds == 0.0
+
+    def test_the_uninstrumented_latencies_say_so(self, store: Store) -> None:
+        """The whole point: an unmeasured number printed beside measured ones is
+        read as measured."""
+        m = self._metrics(store)
+        assert m.websocket_latency_ms == UNAVAILABLE
+        assert m.clob_latency_ms == UNAVAILABLE
+        assert m.rtds_latency_ms == UNAVAILABLE
+
+    def test_chainlink_is_not_applicable_unless_it_is_the_provider(
+        self, store: Store
+    ) -> None:
+        assert "N/A" in str(self._metrics(store).chainlink_latency_ms)
+        assert self._metrics(store, chainlink_enabled=True).chainlink_latency_ms == (
+            UNAVAILABLE
+        )
+
+    def test_order_latency_is_a_real_number_once_orders_exist(self, store: Store) -> None:
+        _run(store, 2)
+        assert isinstance(self._metrics(store).order_latency_ms, float)
+
+    def test_order_latency_is_unavailable_before_anything_submits(
+        self, store: Store
+    ) -> None:
+        assert self._metrics(store).order_latency_ms == UNAVAILABLE
+
+    def test_the_recorder_size_counts_markets_and_observations(self, store: Store) -> None:
+        """Observations are the raw tick rows, not the accumulator's count: the
+        accumulator survives pruning, so it would report a recorder size that is no
+        longer on disk."""
+        slugs = _run(store, 3)
+        store.save_observation(
+            slugs[0],
+            Observation(ts=float(FIRST_TS + 1), price=Decimal("64100.00")),
+            float(FIRST_TS + 1),
+        )
+        m = self._metrics(store)
+        assert m.recorder_markets == 3
+        assert m.recorder_observations == 1
+
+    def test_the_database_size_includes_the_wal_sidecar(self, store: Store) -> None:
+        """WAL mode keeps the newest rows in the sidecar. Reporting only the main
+        file shows a database that appears not to grow, then jumps at checkpoint."""
+        _run(store, 2)
+        main = store.path.stat().st_size
+        assert self._metrics(store).database_bytes > main
+
+    def test_growth_is_per_market_and_projects_to_a_day(self, store: Store) -> None:
+        _run(store, 2)
+        payload = self._metrics(store).as_json()
+        per_market = payload["database_bytes_per_market"]
+        assert isinstance(per_market, float)
+        assert payload["database_bytes_per_day_projected"] == round(per_market * 288)
+
+    def test_growth_is_unavailable_with_no_markets_to_divide_by(
+        self, store: Store
+    ) -> None:
+        payload = self._metrics(store).as_json()
+        assert payload["database_bytes_per_market"] == UNAVAILABLE
+        assert payload["database_bytes_per_day_projected"] == UNAVAILABLE
+
+    def test_the_validation_duration_is_measured(self, store: Store) -> None:
+        assert isinstance(self._metrics(store).validation_duration_seconds, float)
+
+    def test_every_metric_row_the_report_prints_exists(self, store: Store) -> None:
+        payload = self._metrics(store).as_json()
+        assert [f for _, f in _METRIC_ROWS if f not in payload] == []
+
+    def test_the_metrics_reach_the_rendered_report(self, store: Store) -> None:
+        _run(store, 2)
+        text = render_report(
+            _validate(store), mode="V1", provider="RTDS"  # type: ignore[arg-type]
+        )
+        assert "RUNTIME METRICS" in text
+        for label, _ in _METRIC_ROWS:
+            assert label in text
+
+    def test_the_metrics_cannot_change_the_verdict(self, store: Store) -> None:
+        """Item 9 describes the run; item 10 judges it. Separate questions."""
+        report = validate_run(
+            store, offsets=OFFSETS, cadence_seconds=CADENCE, uptime_seconds=99999.0
+        )
+        assert report.verdict == VERDICT_NOT_READY
+
+
+# ── the verdict ──────────────────────────────────────────────────────────────
+
+
+class TestTheVerdict:
+    """Addendum item 10. Exactly one of two strings, and never the green one on
+    a run that did not demonstrate the hard parts."""
+
+    def test_an_unexercised_run_is_not_ready(self, store: Store) -> None:
+        _run(store, 3)
+        assert _validate(store).verdict == VERDICT_NOT_READY  # type: ignore[attr-defined]
+
+    def test_the_verdict_is_one_of_exactly_two_strings(self, store: Store) -> None:
+        assert _validate(store).verdict in {  # type: ignore[attr-defined]
+            VERDICT_READY,
+            VERDICT_NOT_READY,
+        }
+
+    def test_ready_tracks_ready_for_live_and_nothing_else(self, store: Store) -> None:
+        report = _validate(store)
+        report.criteria.clear()  # type: ignore[attr-defined]
+        assert report.ready_for_live is True  # type: ignore[attr-defined]
+        assert report.verdict == VERDICT_READY  # type: ignore[attr-defined]
+
+    def test_the_verdict_is_printed_in_the_report(self, store: Store) -> None:
+        text = render_report(
+            _validate(store), mode="V1", provider="RTDS"  # type: ignore[arg-type]
+        )
+        assert VERDICT_NOT_READY in text
+        assert VERDICT_READY not in text.replace(VERDICT_NOT_READY, "")
+
+    def test_the_verdict_is_in_the_json(self, store: Store) -> None:
+        assert _validate(store).as_json()["verdict"] == (  # type: ignore[attr-defined]
+            VERDICT_NOT_READY
+        )

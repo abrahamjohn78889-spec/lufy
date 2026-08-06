@@ -345,11 +345,19 @@ async def history(
     if fmt == "csv":
         return _csv(rows)
     if fmt == "report" or validate:
+        # The runtime's own figures, passed in rather than read from a global: the
+        # validator must also be runnable against a database with no process on it.
+        now = run.clock.now()
         report = validate_run(
             run.store,
             offsets=tuple(run.settings.trading.windows_by_priority),
             cadence_seconds=MARKET_DURATION_SECONDS,
             market_limit=markets,
+            uptime_seconds=max(now - run.started_at, 0.0) if run.started_at else 0.0,
+            restarts=run.restart_count,
+            reconnects=run.stats.reconnects,
+            chainlink_enabled=run.settings.env.twap_provider.upper() == "CHAINLINK",
+            clock=run.clock,
         )
         if fmt == "report":
             return Response(
