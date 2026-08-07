@@ -70,6 +70,9 @@ from arc.execution.submit import Submitter
 from arc.execution.sweep import Sweeper
 from arc.execution.v1_paper import PaperExecutor
 from arc.execution.v2_live import LiveExecutor
+from arc.execution.wallet import (
+    STATUS_DISCONNECTED as _WALLET_DISCONNECTED,
+)
 from arc.execution.wallet import WalletReader, WalletSnapshot, build_wallet
 from arc.logging_setup import log_event
 from arc.market.discovery import MarketDiscovery
@@ -137,6 +140,11 @@ _DAY_SECONDS: Final[float] = 86400.0
 # slack, so one dropped request does not skip a window.
 _BOOK_REFRESH_SECONDS: Final[float] = 0.5
 _BOOK_MAX_AGE_SECONDS: Final[float] = 2.0
+
+# The balance gate's input, on its own clock. Far slower than the book because a
+# balance only moves when ARC itself trades or the operator funds the account, and
+# a venue account call per tick would spend the rate limit that submissions need.
+_WALLET_REFRESH_SECONDS: Final[float] = 15.0
 
 _ZERO: Final[Decimal] = Decimal("0")
 
@@ -276,6 +284,7 @@ class ArcRuntime:
         "_logger",
         "_next_book_read",
         "_next_ptb_attempt",
+        "_next_wallet_read",
         "_notifier",
         "_out",
         "_paused",
@@ -293,6 +302,7 @@ class ArcRuntime:
         "_validator",
         "_venue_client",
         "_wallet",
+        "_wallet_available",
         "_wallet_status",
         "_watchdog",
         "mode",
@@ -301,6 +311,8 @@ class ArcRuntime:
         "started_at",
         "stats",
         "status",
+        "supervisor_detail",
+        "supervisor_ready",
         "tokens",
         "windows",
     )
@@ -379,6 +391,20 @@ class ArcRuntime:
         # Last reported wallet status, so a transition is logged once instead of on
         # every poll. An event per poll would bury the one that mattered.
         self._wallet_status = ""
+        # The last balance gate 19 evaluated, and when the next read is due. Read on
+        # the loop rather than inside the gate: the decision pass is synchronous and
+        # a gate that awaited a venue call would put a round trip inside the freeze.
+        # None means no official source has published one, which is V1's permanent
+        # state and gate 19 treats as "no opinion" rather than as zero.
+        self._wallet_available: Decimal | None = None
+        self._next_wallet_read: float = 0.0
+        # The supervisor's own verdict on this runtime, pushed down rather than
+        # pulled: the runtime must not hold a reference to the object that owns it,
+        # or a stopped runtime keeps its supervisor alive. Defaults READY so a
+        # runtime nobody supervises — every test, and `arc run` before the
+        # supervisor attaches — is not refused by a gate about the supervisor.
+        self.supervisor_ready = True
+        self.supervisor_detail = ""
         # Notification only. Constructed unconditionally and inert without a token, so
         # there is no code path that exists only when Telegram is configured — the
         # untested path is the one that breaks the night it is first needed.
@@ -521,7 +547,7 @@ class ArcRuntime:
         snapshot = await self._wallet.snapshot(now, run_start=self.started_at)
         if snapshot.status != self._wallet_status:
             previous, self._wallet_status = self._wallet_status, snapshot.status
-            connected = snapshot.status != "DISCONNECTED"
+            connected = snapshot.status != _WALLET_DISCONNECTED
             log_event(
                 logging.INFO if connected else logging.WARNING,
                 # The first reading is "Connected", every later one "Reconnected".
@@ -589,12 +615,19 @@ class ArcRuntime:
     def health(self) -> RuntimeHealth:
         """One snapshot of process state for the risk gates.
 
-        Gathered once per decision pass rather than gate by gate: fifteen gates
-        each taking their own live reading would evaluate fifteen slightly
+        Gathered once per decision pass rather than gate by gate: nineteen gates
+        each taking their own live reading would evaluate nineteen slightly
         different worlds and the verdict would depend on how long evaluation took.
+
+        Synchronous, so nothing here may await. The two fields that need a venue —
+        the wallet's status and its balance — are refreshed by the main loop into
+        `_wallet_status` and `_wallet_available` and read from there. A gate that
+        awaited a round trip would put it inside the decision pass, which is the
+        one place in ARC that must not block.
         """
         drift = self._drift.last
         realised = self._realised_losses()
+        report = self._recovery
         return RuntimeHealth(
             trading_enabled=self._runtime.trading_enabled,
             spec_status=self._runtime.spec_status,
@@ -610,6 +643,15 @@ class ArcRuntime:
             open_positions=len(self._store.live_orders()),
             daily_loss_usd=realised[0],
             consecutive_losses=realised[1],
+            supervisor_ready=self.supervisor_ready,
+            supervisor_detail=self.supervisor_detail,
+            # Only an ERRORED read is a disconnection. The empty string is "no
+            # poll has completed yet" and PAPER is V1's permanent, correct state;
+            # refusing on either would refuse the first pass of every run.
+            wallet_connected=self._wallet_status != _WALLET_DISCONNECTED,
+            wallet_status=self._wallet_status,
+            orphan_orders=() if report is None else report.orphans,
+            available_balance=self._wallet_available,
         )
 
     def _realised_losses(self) -> tuple[Decimal, int]:
@@ -695,6 +737,25 @@ class ArcRuntime:
                     # repricer and /orderbook read — answers with the live price.
                     # V2 reads the venue directly and needs nothing handed to it.
                     self._executor.quote(market.slug, direction, best)
+
+    async def _refresh_wallet(self, now: float) -> None:
+        """Re-read the venue account so gate 19 has a current balance.
+
+        On the loop for the same reason the book is: the decision pass is
+        synchronous and a gate that awaited a venue call would put a round trip
+        inside the freeze.
+
+        A read that fails leaves `available_balance` at whatever the reader
+        published — None when there is no official source, which gate 19 treats as
+        "no opinion" rather than as an empty account. `wallet_snapshot` is reused
+        rather than reading the wallet directly, so a connection change is logged
+        exactly once from exactly one place.
+        """
+        if now < self._next_wallet_read:
+            return
+        self._next_wallet_read = now + _WALLET_REFRESH_SECONDS
+        snapshot = await self.wallet_snapshot(now)
+        self._wallet_available = snapshot.available_balance
 
     def _forget_book(self, slug: str) -> None:
         for direction in Direction:
@@ -973,6 +1034,7 @@ class ArcRuntime:
 
             await self._attempt_ptb(now)
             await self._refresh_books(now)
+            await self._refresh_wallet(now)
             self._watchdog.evaluate()
             self._gate_on_health()
             await self._drive_execution(now)

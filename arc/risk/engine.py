@@ -1,6 +1,6 @@
 """The Risk Engine: the union of every gate, in one deterministic order.
 
-Fifteen gates. Each owns exactly one DenialReason, so a rejection line names the
+Nineteen gates. Each owns exactly one DenialReason, so a rejection line names the
 condition that refused rather than a category that several conditions share. The
 order is fixed and the evaluation short-circuits on the first denial, which is what
 makes the rejection log stable: the same situation always reports the same reason,
@@ -12,6 +12,13 @@ not armed, wrong phase, window not triggered — because none of them need a quo
 book, a size or a database read, and a market that is not tradeable at all should
 not cause any of that work. The gates that need the strategy's output (price, size)
 run last.
+
+Gates 16 to 19 are the LIVE-MONEY preconditions: the supervisor is ready, the
+wallet is connected, reconciliation left nothing unaccounted for, and the account
+can actually pay for the order. They live here, and not in the execution adapter,
+because this is the single admission point before any submission — a check the
+adapter owned would be a second decision layer that V1 never exercises, so the
+paper run would stop being evidence about the live one.
 
 This engine is PURE. It evaluates a frozen RiskContext and returns a verdict. It
 opens no socket, holds no wallet, submits nothing and mutates nothing. The A8
@@ -59,6 +66,10 @@ GATE_ORDER: Final[tuple[str, ...]] = (
     "loss_limits",
     "feed_freshness",
     "runtime_health",
+    "supervisor_ready",
+    "wallet_connected",
+    "orphan_orders",
+    "available_balance",
 )
 
 
@@ -136,6 +147,37 @@ class RiskContext:
     clock_drift_ms: float = 0.0
     runtime_healthy: bool = True
     runtime_detail: str = ""
+
+    # ── gate 16: supervisor readiness ────────────────────────────────────────
+    # Whether the supervisor still considers this runtime the attached one. The
+    # runtime cannot see its own detachment — `runtime_healthy` above is the
+    # runtime reporting on itself, and a cancelled-but-still-looping object
+    # reports itself perfectly healthy while nothing owns it any more.
+    supervisor_ready: bool = True
+    supervisor_detail: str = ""
+
+    # ── gate 17: wallet connectivity ─────────────────────────────────────────
+    # False only on a wallet the venue refused to answer for. V1 has no venue
+    # account at all, which is not a disconnection: the paper wallet reports
+    # PAPER and passes, or V1 could never produce the validation evidence V2
+    # depends on.
+    wallet_connected: bool = True
+    wallet_status: str = ""
+
+    # ── gate 18: orphan orders ───────────────────────────────────────────────
+    # Orders at the venue that reconciliation could not account for. Named
+    # individually rather than counted, so the denial line says which ones.
+    orphan_orders: tuple[str, ...] = ()
+
+    # ── gate 19: available balance ───────────────────────────────────────────
+    # None means no official source reported one, and that is NOT a denial: the
+    # venue publishes collateral only for a live account, and refusing on an
+    # absent figure would be refusing on a number ARC invented. A DISCONNECTED
+    # wallet is caught by gate 17 above, which is the case this would otherwise
+    # be standing in for. The cost is not carried separately — it is
+    # limit_price * size, both already frozen into this context above, and a
+    # second copy could disagree with the order actually submitted.
+    available_balance: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -547,5 +589,104 @@ class RiskEngine:
                 gate="runtime_health",
                 reason=DenialReason.RUNTIME_UNHEALTHY,
                 detail=c.runtime_detail or "the runtime reported itself unhealthy",
+            )
+        return _ALLOWED
+
+    # ── 16 ───────────────────────────────────────────────────────────────────
+
+    def _gate_supervisor_ready(self, c: RiskContext) -> RiskVerdict:
+        """The supervisor's view of the run, which the runtime cannot see itself.
+
+        Gate 15 is the runtime reporting on its own status. This is the layer above
+        reporting on whether that runtime is still the attached one and whether its
+        task is alive. The failure it catches is a runtime whose task was cancelled
+        or replaced mid-teardown but whose loop reaches one more decision pass: it
+        reports itself RUNNING, every engine looks correct, and the order it submits
+        belongs to a run nobody owns any more.
+        """
+        if not c.supervisor_ready:
+            return RiskVerdict(
+                allowed=False,
+                gate="supervisor_ready",
+                reason=DenialReason.RUNTIME_SUPERVISOR_NOT_READY,
+                detail=c.supervisor_detail or "the runtime supervisor is not READY",
+            )
+        return _ALLOWED
+
+    # ── 17 ───────────────────────────────────────────────────────────────────
+
+    def _gate_wallet_connected(self, c: RiskContext) -> RiskVerdict:
+        """A wallet the venue would not answer for makes every balance stale.
+
+        The quiet failure: the deck still shows the last balance that was true, the
+        gates below still compare against it, and the operator reads a screen that
+        describes an account state from some minutes ago. Refused rather than
+        warned, because the balance gate underneath would otherwise pass on a
+        remembered number.
+
+        V1 has no venue account and is NOT disconnected — `wallet_connected`
+        arrives True for the paper wallet. A paper run refused here would produce
+        no validation evidence at all, which is the one thing V2 depends on.
+        """
+        if not c.wallet_connected:
+            return RiskVerdict(
+                allowed=False,
+                gate="wallet_connected",
+                reason=DenialReason.WALLET_DISCONNECTED,
+                detail=c.wallet_status or "the venue account could not be read",
+            )
+        return _ALLOWED
+
+    # ── 18 ───────────────────────────────────────────────────────────────────
+
+    def _gate_orphan_orders(self, c: RiskContext) -> RiskVerdict:
+        """An order at the venue that reconciliation could not account for (A14).
+
+        Submitting on top of one doubles the position while both orders look
+        entirely genuine, and neither the ledger nor the deck would show anything
+        wrong until settlement. The orphans are named in the detail rather than
+        counted: "2 orphans" sends the operator to the logs, which is the trip this
+        gate exists to remove.
+        """
+        if c.orphan_orders:
+            return RiskVerdict(
+                allowed=False,
+                gate="orphan_orders",
+                reason=DenialReason.ORPHAN_ORDERS_UNRECONCILED,
+                detail=f"unreconciled at the venue: {', '.join(c.orphan_orders)}",
+            )
+        return _ALLOWED
+
+    # ── 19 ───────────────────────────────────────────────────────────────────
+
+    def _gate_available_balance(self, c: RiskContext) -> RiskVerdict:
+        """The account must be able to pay for this order.
+
+        Cost is `limit_price * size` — the same two frozen values gate 11 and gate
+        12 already checked, so what is priced here is what is submitted.
+
+        Last, deliberately. It is the only gate that needs both the strategy's
+        output and a venue read, and reaching it means every cheaper condition
+        already passed, so "not enough money" is the true answer rather than the
+        first of several.
+
+        `available_balance is None` ALLOWS. None means no official source reported
+        a figure, which is V1's normal state and, per the wallet contract, the
+        state of any field the venue does not publish. Denying on an absent number
+        would be denying on a number ARC made up; a wallet that genuinely failed to
+        read is DISCONNECTED and gate 17 already refused it.
+        """
+        if c.available_balance is None:
+            return _ALLOWED
+        cost = c.limit_price * c.size
+        if cost > c.available_balance:
+            return RiskVerdict(
+                allowed=False,
+                gate="available_balance",
+                reason=DenialReason.INSUFFICIENT_BALANCE,
+                detail=(
+                    f"order costs {dec_str(cost)} and "
+                    f"{dec_str(c.available_balance)} is available"
+                ),
             )
         return _ALLOWED

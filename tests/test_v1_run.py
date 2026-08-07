@@ -45,6 +45,7 @@ from arc.market.feed import RtdsFeed
 from arc.runtime.engine import (
     _BOOK_MAX_AGE_SECONDS,
     _BOOK_REFRESH_SECONDS,
+    _WALLET_REFRESH_SECONDS,
     ArcRuntime,
     RuntimeStatus,
     TokenCache,
@@ -236,6 +237,7 @@ def _pass(run: ArcRuntime, clock: FrozenClock) -> None:
         run._forget_book(event.archived)
     asyncio.run(run._attempt_ptb(now))
     asyncio.run(run._refresh_books(now))
+    asyncio.run(run._refresh_wallet(now))
     run._watchdog.evaluate()
     run._gate_on_health()
     asyncio.run(run._drive_execution(now))
@@ -575,6 +577,61 @@ class TestTheBookIsDroppedWithItsMarket:
         assert run.rotator.current is not None
         assert run.rotator.current.slug != first
         assert run._quote(first, Direction.UP) is None
+
+
+class TestTheWalletFeedsTheBalanceGate:
+    """Gate 19's input is refreshed by the loop, exactly as the book's is.
+
+    The decision pass is synchronous, so a gate that awaited a venue call would put
+    a round trip inside the freeze. The gate therefore reads an attribute, and this
+    is the only thing that writes it.
+    """
+
+    def test_v1_publishes_no_balance_and_the_gate_has_no_opinion(
+        self, store: Store, clock: FrozenClock, book: FakeBook
+    ) -> None:
+        """No venue account exists in V1, so `None` is the correct, permanent
+        answer. Zero would be a real, denying figure and would stop every paper
+        run — which is the evidence the live run depends on."""
+        run = _runtime(store, clock, book=book)
+        _pass(run, clock)
+        assert run.health().available_balance is None
+        assert run.health().wallet_connected is True
+
+    def test_a_disconnected_read_closes_the_wallet_gate(
+        self, store: Store, clock: FrozenClock, book: FakeBook
+    ) -> None:
+        run = _runtime(store, clock, book=book)
+        _pass(run, clock)
+        assert run.health().wallet_connected is True
+
+        run._wallet_status = "DISCONNECTED"
+        assert run.health().wallet_connected is False
+        assert run.health().wallet_status == "DISCONNECTED"
+
+    def test_the_read_is_on_its_own_clock_not_every_tick(
+        self, store: Store, clock: FrozenClock, book: FakeBook
+    ) -> None:
+        """A venue account call per tick would spend the rate limit submissions
+        need. A balance only moves when ARC trades or the operator funds."""
+        run = _runtime(store, clock, book=book)
+        reads: list[float] = []
+        inner = run._wallet
+
+        class Counting:
+            async def snapshot(self, now: float, *, run_start: float) -> Any:
+                reads.append(now)
+                return await inner.snapshot(now, run_start=run_start)
+
+        run._wallet = Counting()  # type: ignore[assignment]
+        for _ in range(5):
+            clock.advance(0.5)
+            asyncio.run(run._refresh_wallet(clock.now()))
+        assert len(reads) == 1
+
+        clock.advance(_WALLET_REFRESH_SECONDS)
+        asyncio.run(run._refresh_wallet(clock.now()))
+        assert len(reads) == 2
 
 
 class TestNoTradingBehaviourMovedIntoTheAdapter:

@@ -4,7 +4,7 @@ One pipeline, and every intent goes through all six steps:
 
     1  Completed Window   a FIRED window, taken from the window pass
     2  Validate Window    frozen state is complete; snapshot it once
-    3  Apply Risk Gates   all fifteen, in order, first denial wins
+    3  Apply Risk Gates   all nineteen, in order, first denial wins
     4  Create Intent      immutable and self-sufficient
     5  Persist Intent     SQLite arbitrates exactly-one-per-window
     6  Return Intent
@@ -69,7 +69,7 @@ class RuntimeHealth:
     """Process-wide state the risk gates need, read once per decision pass.
 
     Gathered by the caller into one frozen object rather than reached for gate by
-    gate. Fifteen gates each pulling live readings would evaluate fifteen
+    gate. Nineteen gates each pulling live readings would evaluate nineteen
     slightly different worlds, and the verdict would depend on how long evaluation
     took.
     """
@@ -91,6 +91,21 @@ class RuntimeHealth:
     open_positions: int = 0
     daily_loss_usd: Decimal = _ZERO
     consecutive_losses: int = 0
+    # ── the live-money preconditions (gates 16-19) ───────────────────────────
+    # Each defaults to the value that means "nothing is wrong", because that is
+    # what is true of every caller that does not have a venue: V1, the inert
+    # runtime and every unit test. Gate 2's arming switch defaults the other way
+    # on purpose — it is the operator's intent, and absence of intent is not
+    # consent — but absence of an orphan is genuinely the absence of an orphan.
+    supervisor_ready: bool = True
+    supervisor_detail: str = ""
+    wallet_connected: bool = True
+    wallet_status: str = ""
+    orphan_orders: tuple[str, ...] = ()
+    # None = no official source published a balance. Never zero as a stand-in:
+    # zero is a real, denying figure and "unknown" must not be able to look like
+    # an empty account.
+    available_balance: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,4 +436,10 @@ class DecisionEngine:
             clock_drift_ms=health.clock_drift_ms,
             runtime_healthy=health.healthy,
             runtime_detail=health.detail,
+            supervisor_ready=health.supervisor_ready,
+            supervisor_detail=health.supervisor_detail,
+            wallet_connected=health.wallet_connected,
+            wallet_status=health.wallet_status,
+            orphan_orders=health.orphan_orders,
+            available_balance=health.available_balance,
         )

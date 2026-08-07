@@ -86,6 +86,9 @@ simulated. A long V1 run is therefore evidence about the production runtime.
 ## 5. First live start
 
 - [ ] Wallet funded, and the balance shown on the deck matches the wallet.
+- [ ] Recovery panel shows no unreconciled orphan orders. Gate 18 refuses every
+      submission while one exists — clear it by hand at the venue, not by
+      restarting.
 - [ ] Select V2. Press START V2 RUNTIME. Preflight must pass; a FAIL refuses the
       start and names the failing check.
 - [ ] Leave trading **disarmed** for one full market and watch it. A start is not

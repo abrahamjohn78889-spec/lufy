@@ -1,4 +1,4 @@
-"""The Risk Engine: fifteen gates, one order, one reason each.
+"""The Risk Engine: nineteen gates, one order, one reason each.
 
 The union of every gate in the frozen specifications. Every gate gets its own test
 here; what the Decision Engine does with a verdict is test_decision_engine.py's job,
@@ -21,7 +21,7 @@ from arc.domain.enums import DenialReason, Direction, MarketPhase, SettlementSpe
 from arc.risk.engine import GATE_ORDER, RiskContext, RiskEngine
 from arc.risk.limits import limits_from_trading
 
-GATE_COUNT = 15
+GATE_COUNT = 19
 
 
 def _context(**overrides: object) -> RiskContext:
@@ -77,7 +77,7 @@ class TestTheBaselinePasses:
 
 
 class TestTheGateInventory:
-    def test_there_are_exactly_fifteen_gates(self) -> None:
+    def test_there_are_exactly_nineteen_gates(self) -> None:
         assert len(GATE_ORDER) == GATE_COUNT
         assert len(set(GATE_ORDER)) == GATE_COUNT
 
@@ -424,6 +424,104 @@ class TestGate15RuntimeHealth:
         assert verdict.reason is DenialReason.CLOCK_DRIFT_CRITICAL
 
 
+class TestGate16SupervisorReady:
+    def test_a_supervisor_that_is_not_ready_denies(self, engine: RiskEngine) -> None:
+        verdict = engine.evaluate(
+            _context(supervisor_ready=False, supervisor_detail="no runtime is running")
+        )
+        assert verdict.gate == "supervisor_ready"
+        assert verdict.reason is DenialReason.RUNTIME_SUPERVISOR_NOT_READY
+        assert verdict.detail == "no runtime is running"
+
+    def test_the_detail_is_never_empty(self, engine: RiskEngine) -> None:
+        """A denial with no detail reaches the operator as a bare reason code."""
+        verdict = engine.evaluate(_context(supervisor_ready=False))
+        assert verdict.detail
+
+    def test_it_is_distinct_from_general_runtime_health(self, engine: RiskEngine) -> None:
+        """The runtime reporting on itself cannot see that it has been detached, so
+        the two conditions must not collapse into one reason."""
+        assert (
+            DenialReason.RUNTIME_SUPERVISOR_NOT_READY is not DenialReason.RUNTIME_UNHEALTHY
+        )
+
+
+class TestGate17WalletConnected:
+    def test_a_disconnected_wallet_denies(self, engine: RiskEngine) -> None:
+        verdict = engine.evaluate(
+            _context(wallet_connected=False, wallet_status="DISCONNECTED")
+        )
+        assert verdict.gate == "wallet_connected"
+        assert verdict.reason is DenialReason.WALLET_DISCONNECTED
+        assert "DISCONNECTED" in verdict.detail
+
+    def test_the_detail_is_never_empty(self, engine: RiskEngine) -> None:
+        verdict = engine.evaluate(_context(wallet_connected=False))
+        assert verdict.detail
+
+    def test_v1s_paper_wallet_passes(self, engine: RiskEngine) -> None:
+        """V1 has no venue account and never will. Denying it here would stop the
+        paper run from being evidence about the live one."""
+        verdict = engine.evaluate(
+            _context(wallet_connected=True, wallet_status="PAPER (no venue account)")
+        )
+        assert verdict.allowed
+
+
+class TestGate18OrphanOrders:
+    def test_one_unreconciled_order_denies(self, engine: RiskEngine) -> None:
+        verdict = engine.evaluate(_context(orphan_orders=("0xabc",)))
+        assert verdict.gate == "orphan_orders"
+        assert verdict.reason is DenialReason.ORPHAN_ORDERS_UNRECONCILED
+        assert "0xabc" in verdict.detail
+
+    def test_every_orphan_is_named(self, engine: RiskEngine) -> None:
+        """An operator has to go cancel these by hand; a count would not be enough."""
+        verdict = engine.evaluate(_context(orphan_orders=("0xabc", "0xdef")))
+        assert "0xabc" in verdict.detail
+        assert "0xdef" in verdict.detail
+
+    def test_no_orphans_passes(self, engine: RiskEngine) -> None:
+        assert engine.evaluate(_context(orphan_orders=())).allowed
+
+
+class TestGate19AvailableBalance:
+    def test_an_order_costing_more_than_the_balance_denies(self, engine: RiskEngine) -> None:
+        # 0.70 * 35 = 24.50
+        verdict = engine.evaluate(_context(available_balance=Decimal("24.49")))
+        assert verdict.gate == "available_balance"
+        assert verdict.reason is DenialReason.INSUFFICIENT_BALANCE
+        assert "24.50" in verdict.detail
+        assert "24.49" in verdict.detail
+
+    def test_exactly_enough_passes(self, engine: RiskEngine) -> None:
+        """Denial is on cost EXCEEDING the balance. Refusing an order the account can
+        precisely afford would make the last trade of a session unreachable."""
+        assert engine.evaluate(_context(available_balance=Decimal("24.50"))).allowed
+
+    def test_an_unknown_balance_is_not_a_denial(self, engine: RiskEngine) -> None:
+        """None means no official source published one — V1's permanent state. Zero
+        is a real, denying figure and must not be usable as a stand-in for unknown."""
+        assert engine.evaluate(_context(available_balance=None)).allowed
+
+    def test_a_zero_balance_denies(self, engine: RiskEngine) -> None:
+        verdict = engine.evaluate(_context(available_balance=Decimal("0")))
+        assert verdict.reason is DenialReason.INSUFFICIENT_BALANCE
+
+    def test_cost_is_derived_from_the_order_being_submitted(self, engine: RiskEngine) -> None:
+        """Cost is limit_price * size from this same frozen context, so it cannot
+        disagree with the order that would actually reach the venue."""
+        verdict = engine.evaluate(
+            _context(
+                limit_price=Decimal("0.60"),
+                size=Decimal("100"),
+                available_balance=Decimal("59.99"),
+            )
+        )
+        assert verdict.reason is DenialReason.INSUFFICIENT_BALANCE
+        assert "60.00" in verdict.detail
+
+
 class TestOrderIsDeterministic:
     def test_each_gate_reports_itself_when_it_is_the_only_failure(
         self, engine: RiskEngine
@@ -446,6 +544,10 @@ class TestOrderIsDeterministic:
             "loss_limits": {"consecutive_losses": 5},
             "feed_freshness": {"feed_blocked": True},
             "runtime_health": {"runtime_healthy": False},
+            "supervisor_ready": {"supervisor_ready": False},
+            "wallet_connected": {"wallet_connected": False},
+            "orphan_orders": {"orphan_orders": ("0xabc",)},
+            "available_balance": {"available_balance": Decimal("0")},
         }
         assert set(breakages) == set(GATE_ORDER)
         for gate, breakage in breakages.items():
@@ -472,6 +574,10 @@ class TestOrderIsDeterministic:
                 "consecutive_losses": 99,
                 "feed_blocked": True,
                 "runtime_healthy": False,
+                "supervisor_ready": False,
+                "wallet_connected": False,
+                "orphan_orders": ("0xabc",),
+                "available_balance": Decimal("0"),
             }
             healthy_again: dict[str, object] = {
                 "spec_status": SettlementSpecStatus.VERIFIED,
@@ -489,6 +595,10 @@ class TestOrderIsDeterministic:
                 "consecutive_losses": 0,
                 "feed_blocked": False,
                 "runtime_healthy": True,
+                "supervisor_ready": True,
+                "wallet_connected": True,
+                "orphan_orders": (),
+                "available_balance": None,
             }
             keys = list(healthy_again)
             # Repair everything before `index`, leave the rest broken.

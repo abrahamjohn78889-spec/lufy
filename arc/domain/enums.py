@@ -215,7 +215,18 @@ class DenialReason(StrEnum):
     POSITION_LIMIT_REACHED = "POSITION_LIMIT_REACHED"
     LOSS_LIMIT_REACHED = "LOSS_LIMIT_REACHED"
     DUPLICATE_INTENT = "DUPLICATE_INTENT"
+    # The venue account is unreachable, so no balance on screen is current and no
+    # submission can be reasoned about. Distinct from INSUFFICIENT_BALANCE: an
+    # unknown balance and a known-too-small one call for opposite operator actions.
+    WALLET_DISCONNECTED = "WALLET_DISCONNECTED"
     INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
+    # An order at the venue that reconciliation could not account for. Submitting
+    # on top of one doubles a position while both orders look entirely genuine.
+    ORPHAN_ORDERS_UNRECONCILED = "ORPHAN_ORDERS_UNRECONCILED"
+    # The supervisor's own view of the run — is the task alive, does the attached
+    # runtime match the selected mode. Distinct from RUNTIME_UNHEALTHY, which is
+    # the runtime reporting on itself and cannot see that it has been detached.
+    RUNTIME_SUPERVISOR_NOT_READY = "RUNTIME_SUPERVISOR_NOT_READY"
     FEED_STALE = "FEED_STALE"
     CLOCK_DRIFT_CRITICAL = "CLOCK_DRIFT_CRITICAL"
     RUNTIME_UNHEALTHY = "RUNTIME_UNHEALTHY"

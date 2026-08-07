@@ -36,7 +36,10 @@ from arc.config import ArcSettings, Settings, build_trading_config
 from arc.domain.enums import Mode
 from arc.errors import ArcError, ConfigInvariantError
 from arc.execution.v1_paper import PaperExecutor
+from arc.market.discovery import build_discovery
+from arc.market.feed import RtdsFeed
 from arc.runtime.engine import ArcRuntime, RuntimeStatus
+from arc.runtime.state import RuntimeState
 from arc.runtime.supervisor import RuntimeSupervisor
 from arc.storage.store import Store
 
@@ -133,6 +136,82 @@ class TestStartIsNotTrading:
                 await sup.stop()
 
         asyncio.run(go())
+
+
+class TestSupervisorReadinessFeedsGate16:
+    """The one input the runtime cannot gather itself.
+
+    Gate 16 denies on a runtime the supervisor is not standing behind. The verdict
+    is PUSHED DOWN onto plain attributes rather than pulled through a back-
+    reference: a runtime holding its supervisor would keep the supervisor alive
+    after it was stopped and replaced.
+    """
+
+    def test_the_idle_runtime_is_not_ready(self, tmp_path: Any) -> None:
+        """No loop is scheduled on it. An intent reaching it at all means something
+        is holding a runtime the supervisor already replaced."""
+        sup = _supervisor(tmp_path)
+        assert sup.runtime.supervisor_ready is False
+        assert sup.runtime.supervisor_detail
+
+    def test_start_makes_it_ready(self, tmp_path: Any) -> None:
+        sup = _supervisor(tmp_path)
+
+        async def go() -> tuple[bool, str]:
+            run = await sup.start(Mode.V1)
+            result = (run.supervisor_ready, run.supervisor_detail)
+            await sup.stop()
+            return result
+
+        ready, detail = asyncio.run(go())
+        assert ready is True
+        assert detail == ""
+
+    def test_stop_un_readies_the_runtime_that_was_running(self, tmp_path: Any) -> None:
+        """Closed in the same step as the disarm, before the cancel: between the
+        cancel and the last loop pass the runtime can still reach submission."""
+        sup = _supervisor(tmp_path)
+
+        async def go() -> ArcRuntime:
+            run = await sup.start(Mode.V1)
+            await sup.stop()
+            return run
+
+        run = asyncio.run(go())
+        assert run.supervisor_ready is False
+        assert run.supervisor_detail
+        assert run.state.execution_armed is False
+
+    def test_the_replacement_runtime_is_not_ready_either(self, tmp_path: Any) -> None:
+        sup = _supervisor(tmp_path)
+
+        async def go() -> None:
+            await sup.start(Mode.V1)
+            await sup.stop()
+
+        asyncio.run(go())
+        assert sup.runtime.supervisor_ready is False
+
+    def test_a_runtime_nobody_supervises_defaults_ready(self, tmp_path: Any) -> None:
+        """`arc run` before the supervisor attaches, and every unit test. Defaulting
+        the other way would refuse them all with a reason about a supervisor that
+        does not exist."""
+        store = Store(f"{tmp_path}/direct.db")
+        store.migrate(_NOW)
+        clock = FrozenClock(_NOW)
+        runtime = RuntimeState(store, clock)
+        runtime.load()
+        run = ArcRuntime(
+            settings=_settings(),
+            store=store,
+            clock=clock,
+            runtime=runtime,
+            discovery=build_discovery(),
+            feed=RtdsFeed(clock),
+            executor=PaperExecutor(),
+            out=io.StringIO(),
+        )
+        assert run.supervisor_ready is True
 
 
 class TestStopLeavesNothingRunning:

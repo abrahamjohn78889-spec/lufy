@@ -29,6 +29,7 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only
     from polymarket import AsyncSecureClient
 
 __all__ = [
+    "STATUS_DISCONNECTED",
     "LedgerStats",
     "LiveWallet",
     "PaperWallet",
@@ -49,7 +50,10 @@ _DAY_SECONDS: Final[float] = 86400.0
 
 _STATUS_CONNECTED: Final[str] = "CONNECTED"
 _STATUS_PAPER: Final[str] = "PAPER (no venue account)"
-_STATUS_ERROR: Final[str] = "DISCONNECTED"
+# Public because the risk engine's wallet gate compares against it. One spelling,
+# in one place: a second literal elsewhere would silently stop matching the day
+# this string changed, and the gate would pass on a disconnected wallet.
+STATUS_DISCONNECTED: Final[str] = "DISCONNECTED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,14 +232,14 @@ class LiveWallet:
             allowance = await self._client.get_balance_allowance(asset_type="COLLATERAL")
             collateral = Decimal(allowance.balance) / _COLLATERAL_DECIMALS
         except Exception:
-            status = _STATUS_ERROR
+            status = STATUS_DISCONNECTED
 
         account_value: Decimal | None = None
         try:
             values = await self._client.get_portfolio_values(user=address)
             account_value = next((v.value for v in values if v.value is not None), None)
         except Exception:
-            status = _STATUS_ERROR
+            status = STATUS_DISCONNECTED
 
         positions_value: Decimal | None = None
         unrealized: Decimal | None = None
@@ -246,7 +250,7 @@ class LiveWallet:
             unrealized = sum((p.cash_pnl or _ZERO for p in page.items), _ZERO)
             position_count = len(page.items)
         except Exception:
-            status = _STATUS_ERROR
+            status = STATUS_DISCONNECTED
 
         return WalletSnapshot(
             address=address,

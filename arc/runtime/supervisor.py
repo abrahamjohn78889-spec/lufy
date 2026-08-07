@@ -179,6 +179,11 @@ class RuntimeSupervisor:
             self._task = asyncio.create_task(
                 self.runtime.run(market_target=market_target), name=f"arc-runtime-{mode.value}"
             )
+            # Gate 16's input, pushed down rather than pulled: the runtime must not
+            # hold a reference back to the object that owns it. Set after the task
+            # exists, so a runtime that was built but never scheduled is never READY.
+            self.runtime.supervisor_ready = True
+            self.runtime.supervisor_detail = ""
             # Hand the loop one turn so `run()` reaches STARTING and binds the event
             # hub before the caller renders a status frame. Without it the first
             # frame after START reports STOPPED, which reads as a failed start.
@@ -247,7 +252,7 @@ class RuntimeSupervisor:
         # client here would leak one connection pool per stop, and a process an
         # operator start/stopped all day would accumulate them silently.
         self._discovery = build_discovery(logger=self._logger)
-        return ArcRuntime(
+        inert = ArcRuntime(
             settings=self._settings,
             store=self._store,
             clock=self._clock,
@@ -258,6 +263,12 @@ class RuntimeSupervisor:
             out=self._out,
             logger=self._logger,
         )
+        # Gate 16 denies on this one. It is nobody's running system — no loop is
+        # scheduled on it — so an intent reaching it at all means something is
+        # holding a runtime the supervisor already replaced.
+        inert.supervisor_ready = False
+        inert.supervisor_detail = "no runtime is running"
+        return inert
 
     async def _build_live(self, mode: Mode) -> ArcRuntime:
         """The real thing, for one mode, with its own connections."""
@@ -324,6 +335,8 @@ class RuntimeSupervisor:
             # still reach `_submit_pending`, and an intent submitted during the
             # teardown is an order placed by the act of stopping.
             self.runtime.disarm()
+            self.runtime.supervisor_ready = False
+            self.runtime.supervisor_detail = "the runtime is being stopped"
             self.runtime.status = RuntimeStatus.STOPPING
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, ArcError):

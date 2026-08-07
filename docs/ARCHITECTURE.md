@@ -141,6 +141,31 @@ one outage can produce many attempts.
 | `execution_armed` | the operator | never — a restart comes back disarmed |
 | `_paused` | the operator | no |
 
+## The live-money preconditions
+
+Gates 16 to 19 of the Risk Engine. They live in the Risk Engine, and not in the
+execution adapter, because that is the single admission point before any
+submission — a check the adapter owned would be a second decision layer that V1
+never exercises, so the paper run would stop being evidence about the live one.
+
+| Gate | Denial reason | Denies when |
+|---|---|---|
+| `supervisor_ready` | `RUNTIME_SUPERVISOR_NOT_READY` | no runtime is running, or one is being torn down |
+| `wallet_connected` | `WALLET_DISCONNECTED` | the venue account could not be read |
+| `orphan_orders` | `ORPHAN_ORDERS_UNRECONCILED` | reconciliation left an order at the venue unaccounted for |
+| `available_balance` | `INSUFFICIENT_BALANCE` | `limit_price × size` exceeds the published collateral |
+
+All four default permissive, unlike the arming gate. V1, the inert runtime and
+every test genuinely have no venue account, and an unknown balance is `None`
+rather than zero — zero is a real, denying figure and must not be usable as a
+stand-in for "not published".
+
+The supervisor's verdict is pushed down onto the runtime rather than pulled
+through a back-reference: a runtime holding its supervisor would keep it alive
+after being stopped and replaced. The balance is refreshed on the main loop,
+like the CLOB book, because the decision pass is synchronous and a gate that
+awaited a venue call would put a round trip inside the freeze.
+
 ## Access control is the network boundary
 
 The API binds loopback and refuses to start on any other interface. There is no

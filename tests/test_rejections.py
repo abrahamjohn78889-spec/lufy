@@ -5,7 +5,7 @@ asserts that each condition an operator can actually create reaches the log with
 own reason — because a gate that is correct in isolation and unreachable in practice
 protects nothing.
 
-Three of the fifteen gates are defence in depth and cannot be reached through the
+Seven of the nineteen gates are defence in depth and cannot be reached through the
 engine at all; the last class documents why, and asserts it, rather than leaving the
 absence of a test to look like an oversight.
 """
@@ -571,9 +571,9 @@ class TestTheGatesThatCannotBeReachedFromHere:
 
 class TestEveryGateIsAccountedFor:
     def test_the_inventory_matches_the_engine(self) -> None:
-        """Union of the frozen specifications: fifteen distinct gates, no merges."""
-        assert len(GATE_ORDER) == 15
-        assert len(set(GATE_ORDER)) == 15
+        """Union of the frozen specifications: nineteen distinct gates, no merges."""
+        assert len(GATE_ORDER) == 19
+        assert len(set(GATE_ORDER)) == 19
 
     def test_every_gate_is_either_exercised_here_or_documented_unreachable(self) -> None:
         exercised = {
@@ -590,7 +590,17 @@ class TestEveryGateIsAccountedFor:
             "feed_freshness",
             "runtime_health",
         }
-        unreachable = {"window_triggered", "price_to_beat", "strategy_enabled"}
+        unreachable = {
+            "window_triggered",
+            "price_to_beat",
+            "strategy_enabled",
+            # Gates 16-19 need a venue the paper engine does not have. Reached
+            # directly in test_risk.py, where the context is built by hand.
+            "supervisor_ready",
+            "wallet_connected",
+            "orphan_orders",
+            "available_balance",
+        }
         assert exercised | unreachable == set(GATE_ORDER)
         assert exercised.isdisjoint(unreachable)
 
