@@ -52,6 +52,11 @@ from arc.market.feed import BackoffPolicy
 from arc.market.providers import build_provider
 from arc.runtime.engine import (
     EXPECTED_SYMBOL,
+    SUPERVISOR_FAILED,
+    SUPERVISOR_READY,
+    SUPERVISOR_STARTING,
+    SUPERVISOR_STOPPED,
+    SUPERVISOR_STOPPING,
     ArcRuntime,
     RuntimeStatus,
     TokenCache,
@@ -176,14 +181,25 @@ class RuntimeSupervisor:
                     logger=self._logger,
                 )
             self.runtime = await self._build_live(mode)
-            self._task = asyncio.create_task(
-                self.runtime.run(market_target=market_target), name=f"arc-runtime-{mode.value}"
-            )
+            self.runtime.supervisor_state = SUPERVISOR_STARTING
+            try:
+                self._task = asyncio.create_task(
+                    self.runtime.run(market_target=market_target),
+                    name=f"arc-runtime-{mode.value}",
+                )
+            except BaseException:
+                # A start that never produced a task leaves a runtime object that
+                # nobody drives. FAILED rather than STOPPED: the difference is
+                # whether the operator has something to investigate.
+                self.runtime.supervisor_state = SUPERVISOR_FAILED
+                self.runtime.supervisor_detail = "the runtime task could not be started"
+                raise
             # Gate 16's input, pushed down rather than pulled: the runtime must not
             # hold a reference back to the object that owns it. Set after the task
             # exists, so a runtime that was built but never scheduled is never READY.
             self.runtime.supervisor_ready = True
             self.runtime.supervisor_detail = ""
+            self.runtime.supervisor_state = SUPERVISOR_READY
             # Hand the loop one turn so `run()` reaches STARTING and binds the event
             # hub before the caller renders a status frame. Without it the first
             # frame after START reports STOPPED, which reads as a failed start.
@@ -268,6 +284,7 @@ class RuntimeSupervisor:
         # holding a runtime the supervisor already replaced.
         inert.supervisor_ready = False
         inert.supervisor_detail = "no runtime is running"
+        inert.supervisor_state = SUPERVISOR_STOPPED
         return inert
 
     async def _build_live(self, mode: Mode) -> ArcRuntime:
@@ -337,6 +354,7 @@ class RuntimeSupervisor:
             self.runtime.disarm()
             self.runtime.supervisor_ready = False
             self.runtime.supervisor_detail = "the runtime is being stopped"
+            self.runtime.supervisor_state = SUPERVISOR_STOPPING
             self.runtime.status = RuntimeStatus.STOPPING
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, ArcError):
@@ -345,6 +363,8 @@ class RuntimeSupervisor:
                 # Reported, not hidden. A task that outlived its cancellation is
                 # still holding a socket, and an operator told "stopped" would then
                 # start the other mode alongside it.
+                self.runtime.supervisor_state = SUPERVISOR_FAILED
+                self.runtime.supervisor_detail = "the runtime did not stop when cancelled"
                 log_event(
                     logging.ERROR,
                     "Runtime Shutdown Incomplete",

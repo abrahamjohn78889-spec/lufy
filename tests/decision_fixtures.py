@@ -24,6 +24,7 @@ from arc.decision.engine import DecisionEngine, QuoteSource, RuntimeHealth
 from arc.decision.quota import QuotaLedger
 from arc.domain.enums import Direction, MarketPhase, SettlementSpecStatus
 from arc.domain.models import Fill, MarketInstance, Order
+from arc.risk.engine import RiskEngine
 from arc.risk.limits import RiskLimits, limits_from_trading
 from arc.storage.store import Store
 from arc.strategy.config import StrategyConfig, config_from_trading
@@ -97,6 +98,7 @@ def make_engine(
     quote_price: Decimal | None = DEFAULT_QUOTE,
     health: RuntimeHealth | None = None,
     health_source: Callable[[], RuntimeHealth] | None = None,
+    risk: RiskEngine | None = None,
     logger: logging.Logger | None = None,
 ) -> DecisionEngine:
     """The real engine, wired to the real risk engine, registry and strategy.
@@ -119,6 +121,7 @@ def make_engine(
         ),
         quote_source=quote(quote_price),
         health_source=source,
+        risk=risk,
         logger=logger,
     )
 

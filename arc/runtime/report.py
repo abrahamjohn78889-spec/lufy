@@ -14,6 +14,7 @@ each one needs, immediately under the verdict rather than in an appendix.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from arc.runtime.validation import (
@@ -78,6 +79,8 @@ def render_report(
     mode: str,
     provider: str,
     generated_at: float | None = None,
+    gates: Mapping[str, Any] | None = None,
+    verification: Sequence[tuple[str, str, str]] = (),
 ) -> str:
     """One text block. Verdict first, then the evidence."""
     lines = [
@@ -161,6 +164,16 @@ def render_report(
         values = metrics.as_json()
         for label, field in _METRIC_ROWS:
             lines.append(_row(label, values[field]))
+
+    if verification:
+        lines.append(_section("RUNTIME VERIFICATION"))
+        for name, state, detail in verification:
+            lines.append(f"  {state:<5} {name:<14} {detail}\n")
+
+    if gates:
+        lines.append(_section(f"RISK GATES — {gates['summary']}"))
+        for row in gates["rows"]:
+            lines.append(f"  {row['state']:<10} {row['id']} {row['gate']}: {row['detail']}\n")
 
     lines.append(_section("NOT MEASURED BY ARC"))
     lines.append(

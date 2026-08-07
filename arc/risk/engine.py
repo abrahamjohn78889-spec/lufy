@@ -43,7 +43,7 @@ from typing import Final
 from arc.domain.enums import DenialReason, Direction, MarketPhase, SettlementSpecStatus
 from arc.domain.money import dec_str
 
-__all__ = ["GATE_ORDER", "RiskContext", "RiskEngine", "RiskVerdict"]
+__all__ = ["GATE_IDS", "GATE_ORDER", "RiskContext", "RiskEngine", "RiskVerdict", "gate_id"]
 
 _ZERO: Final[Decimal] = Decimal("0")
 
@@ -71,6 +71,19 @@ GATE_ORDER: Final[tuple[str, ...]] = (
     "orphan_orders",
     "available_balance",
 )
+
+# Permanent, stable identifiers: G01..G19, derived from the order above rather
+# than kept as a second hand-maintained table that could drift from it. Inserting
+# a gate in the middle renumbers the ones after it, which is why a gate is only
+# ever appended.
+GATE_IDS: Final[dict[str, str]] = {
+    name: f"G{index:02d}" for index, name in enumerate(GATE_ORDER, start=1)
+}
+
+
+def gate_id(name: str) -> str:
+    """The permanent ID for a gate name. Empty for anything not a gate."""
+    return GATE_IDS.get(name, "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +211,11 @@ class RiskVerdict:
     @property
     def denied(self) -> bool:
         return not self.allowed
+
+    @property
+    def gate_id(self) -> str:
+        """G01..G19. Derived from the gate name, never stored twice."""
+        return GATE_IDS.get(self.gate, "")
 
 
 _ALLOWED: Final[RiskVerdict] = RiskVerdict(allowed=True)
@@ -653,7 +671,8 @@ class RiskEngine:
                 allowed=False,
                 gate="orphan_orders",
                 reason=DenialReason.ORPHAN_ORDERS_UNRECONCILED,
-                detail=f"unreconciled at the venue: {', '.join(c.orphan_orders)}",
+                detail=f"{len(c.orphan_orders)} unreconciled at the venue: "
+                f"{', '.join(c.orphan_orders)}",
             )
         return _ALLOWED
 

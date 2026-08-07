@@ -106,6 +106,13 @@ class RuntimeHealth:
     # zero is a real, denying figure and "unknown" must not be able to look like
     # an empty account.
     available_balance: Decimal | None = None
+    # Which runtime produced this pass. Carried so a denial line says whether the
+    # refusal happened in V1 or V2 — the same denial means different things in a
+    # paper run and a live one.
+    mode: str = ""
+    # Bumped by the runtime whenever any field above changes. The dashboard
+    # redraws on a change of this number rather than on every frame.
+    health_revision: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +228,16 @@ class DecisionEngine:
         self.intents_denied = 0
         self.intents_skipped = 0
 
+    @property
+    def limits(self) -> RiskLimits:
+        """The limits snapshotted at construction. Read-only."""
+        return self._limits
+
+    @property
+    def strategy_count(self) -> int:
+        """How many strategies are registered. Gate 6's standing input."""
+        return len(self._registry)
+
     # ── the pass ─────────────────────────────────────────────────────────────
 
     def decide(self, market: MarketInstance, now: float) -> DecisionOutcome:
@@ -315,6 +332,10 @@ class DecisionEngine:
         # 3. Risk gates. Evaluated against the strategy's PROPOSED price and size,
         #    which is why the strategy is consulted first — a proposal is not an
         #    authorisation, and the gates are what turn one into the other.
+        #
+        #    The duration of this call is measured, but not here: A0 forbids this
+        #    layer a clock of any kind. The runtime injects a stopwatch-wrapped
+        #    engine, so the measurement lives where time is already allowed.
         verdict = self._risk.evaluate(
             self._risk_context(market, snapshot, health, proposal.limit_price, proposal.size)
         )
@@ -323,9 +344,12 @@ class DecisionEngine:
             log_event(
                 logging.WARNING,
                 "Intent Denied",
-                f"{snapshot.market_slug} {offset}s  {verdict.reason.value}  {verdict.detail}",
+                f"{verdict.gate_id} {verdict.gate}  {verdict.reason.value}  "
+                f"{snapshot.market_slug}  {offset}s  {health.mode or 'UNKNOWN'}  "
+                f"{verdict.detail}",
                 logger=self._logger,
             )
+
             return WindowDecision(
                 offset_seconds=offset,
                 denial=verdict.reason,

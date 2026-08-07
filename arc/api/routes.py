@@ -368,6 +368,8 @@ async def history(
                     mode=run.mode.value,
                     provider=run.settings.env.twap_provider,
                     generated_at=now,
+                    gates=run.gate_summary(),
+                    verification=run.verification(),
                 ),
                 media_type="text/plain; charset=utf-8",
             )

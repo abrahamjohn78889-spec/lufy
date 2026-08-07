@@ -38,6 +38,7 @@ from arc.domain.timing import (
 )
 from arc.execution.wallet import WalletSnapshot
 from arc.notify.telegram import CATEGORIES, CATEGORY_LABELS
+from arc.risk.engine import GATE_ORDER
 from arc.runtime.ledger import ledger_records, ledger_totals
 from arc.strategy.registry import DEFAULT_STRATEGY_ID
 from arc.timefmt import clocks, stamps
@@ -609,6 +610,7 @@ async def status_payload(run: ArcRuntime, now: float) -> dict[str, Any]:
     gate = run.state.gate
     health = run.health()
     report = run.recovery_report
+    gates = run.gate_summary()
     return {
         "ts": now,
         # The OPS Deck's wall clocks. Rendered on the backend from the same `now`
@@ -634,7 +636,33 @@ async def status_payload(run: ArcRuntime, now: float) -> dict[str, Any]:
             "spec_status": run.state.spec_status.value,
             "feed_age_ms": health.feed_age_ms,
             "clock_drift_ms": health.clock_drift_ms,
+            # Bumped only when a health field actually changes, so the dashboard can
+            # redraw on a change rather than on every frame.
+            "health_revision": health.health_revision,
+            # Supervisor LIFECYCLE, not trading state. Distinct from `status` above:
+            # that is the runtime describing itself, this is the layer that owns it.
+            # Systems page only.
+            "supervisor_state": run.supervisor_state,
+            "supervisor_ready": health.supervisor_ready,
+            "supervisor_detail": health.supervisor_detail,
+            # Diagnostics. Nothing reads these to decide anything; a gate that
+            # suddenly costs milliseconds is a fault to find.
+            "risk_eval_ms": run.risk_eval_ms,
+            "risk_eval_max_ms": run.risk_eval_max_ms,
+            "gates_total": len(GATE_ORDER),
+            "gates_passing": gates["passing"],
+            "gates_summary": gates["summary"],
+            "gate_failures": gates["failures"],
         },
+        # Every gate's standing state, expandable on the Systems page. Rows the
+        # summary above counts, so the two cannot disagree.
+        "gates": gates["rows"],
+        # The last health transitions, oldest first. Debugging an intermittent
+        # fault that is gone by the time anybody looks.
+        "health_history": [
+            {"ts": ts, "revision": revision, "detail": detail, **stamps(ts)}
+            for ts, revision, detail in run.health_history
+        ],
         "engines": engine_status(run),
         "market": market_payload(run, now),
         # Resolved on the backend, like everything else. The LOE stage and the active
@@ -646,6 +674,10 @@ async def status_payload(run: ArcRuntime, now: float) -> dict[str, Any]:
         # CONNECTED -> DISCONNECTED transition and logs it once. Reading the reader
         # here would render the change and report it to nobody.
         "wallet": wallet_payload(await run.wallet_snapshot(now)),
+        # Gate 19's arithmetic and the age of the reading behind it. Beside the
+        # wallet rather than inside it: those figures come from the venue, these
+        # are what ARC did with them.
+        "balance": run.balance_detail(now),
         "recovery": {
             "running": report is None,
             "stage": "COMPLETE" if report is not None else "PENDING",
@@ -655,6 +687,7 @@ async def status_payload(run: ArcRuntime, now: float) -> dict[str, Any]:
             "markets_recovered": 0 if report is None else len(report.resumed_markets),
             "unresolved_orders": [] if report is None else list(report.unresolved_orders),
             "orphans": [] if report is None else list(report.orphans),
+            "orphan_count": 0 if report is None else len(report.orphans),
             "safe_to_trade": report is not None and report.safe_to_trade,
         },
         "stats": {

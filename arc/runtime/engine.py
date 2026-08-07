@@ -44,9 +44,11 @@ import asyncio
 import contextlib
 import json
 import logging
+from collections import deque
 from collections.abc import Awaitable
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
+from time import perf_counter
 from typing import Any, Final, Protocol, TextIO
 
 import polymarket
@@ -59,6 +61,7 @@ from arc.decision.engine import DecisionEngine, RuntimeHealth
 from arc.decision.quota import QuotaLedger
 from arc.domain.enums import Direction, MarketPhase, Mode
 from arc.domain.models import MarketInstance, Order
+from arc.domain.money import dec_str
 from arc.domain.timing import MARKET_DURATION_SECONDS, slug_for
 from arc.errors import ArcError, ConfigInvariantError, FeedError, ObservationRejectedError
 from arc.execution.fill_engine import FillEngine
@@ -90,6 +93,7 @@ from arc.market.spec_check import SpecChecker
 from arc.market.validation import ObservationValidator
 from arc.market.watchdog import FeedWatchdog
 from arc.notify.telegram import TelegramNotifier, category_settings
+from arc.risk.engine import GATE_IDS, GATE_ORDER, RiskContext, RiskEngine, RiskVerdict
 from arc.risk.limits import limits_from_trading
 from arc.runtime.events import EventHub, attach
 from arc.runtime.recovery import RecoveryReport, RecoveryRunner
@@ -101,6 +105,12 @@ from arc.windows.engine import WindowEngine
 
 __all__ = [
     "EXPECTED_SYMBOL",
+    "SUPERVISOR_FAILED",
+    "SUPERVISOR_READY",
+    "SUPERVISOR_STARTING",
+    "SUPERVISOR_STATES",
+    "SUPERVISOR_STOPPED",
+    "SUPERVISOR_STOPPING",
     "ArcRuntime",
     "BookClient",
     "RuntimeStats",
@@ -146,6 +156,32 @@ _BOOK_MAX_AGE_SECONDS: Final[float] = 2.0
 # a venue account call per tick would spend the rate limit that submissions need.
 _WALLET_REFRESH_SECONDS: Final[float] = 15.0
 
+# How many health transitions are kept for debugging. Bounded for the same reason
+# the Signal Tank is: a 24x7 process with an unbounded list is a process that grows
+# all week. Two hundred transitions is far more than one intermittent fault needs
+# and still nothing in memory terms.
+_HEALTH_HISTORY: Final[int] = 200
+
+# Supervisor LIFECYCLE states. Deliberately not RuntimeStatus values: that enum is
+# the trading runtime's own status and is a closed set of five. These describe the
+# object that owns the runtime, and belong only on the Systems page.
+SUPERVISOR_READY: Final[str] = "READY"
+SUPERVISOR_STARTING: Final[str] = "STARTING"
+SUPERVISOR_STOPPING: Final[str] = "STOPPING"
+SUPERVISOR_FAILED: Final[str] = "FAILED"
+# The idle state, between runs. Named rather than folded into one of the four
+# above because an inert runtime is neither being torn down nor broken, and
+# labelling it STOPPING or FAILED would put a fault on the Systems page every
+# time the operator stopped cleanly.
+SUPERVISOR_STOPPED: Final[str] = "STOPPED"
+SUPERVISOR_STATES: Final[tuple[str, ...]] = (
+    SUPERVISOR_STOPPED,
+    SUPERVISOR_STARTING,
+    SUPERVISOR_READY,
+    SUPERVISOR_STOPPING,
+    SUPERVISOR_FAILED,
+)
+
 _ZERO: Final[Decimal] = Decimal("0")
 
 # Outcome labels the venue uses for these markets, lowercased. Matched rather than
@@ -154,6 +190,54 @@ _ZERO: Final[Decimal] = Decimal("0")
 # healthy. An unmatched label resolves to nothing and refuses the submission.
 _UP_LABELS: Final[frozenset[str]] = frozenset({"up", "yes"})
 _DOWN_LABELS: Final[frozenset[str]] = frozenset({"down", "no"})
+
+# The two providers. One or the other, never both (A3).
+_PROVIDERS: Final[frozenset[str]] = frozenset({"RTDS", "CHAINLINK"})
+
+
+class TimedRiskEngine(RiskEngine):
+    """The risk engine, with a stopwatch around it. Verdicts are unchanged.
+
+    The measurement lives here and not in the Decision Engine because A0 forbids
+    that layer a clock of any kind, and a diagnostic is not worth a hole in the
+    rule that keeps decisions reproducible. Nothing reads these numbers to decide
+    anything: a gate that suddenly costs milliseconds is a fault to find, and the
+    alternative to measuring it is guessing at it afterwards.
+    """
+
+    __slots__ = ("last_ms", "max_ms")
+
+    def __init__(self) -> None:
+        self.last_ms = 0.0
+        self.max_ms = 0.0
+
+    def evaluate(self, context: RiskContext) -> RiskVerdict:
+        started = perf_counter()
+        try:
+            return super().evaluate(context)
+        finally:
+            self.last_ms = (perf_counter() - started) * 1000.0
+            self.max_ms = max(self.max_ms, self.last_ms)
+
+
+def _verdict(ok: bool) -> str:
+    return "PASS" if ok else "FAIL"
+
+
+def _health_line(health: RuntimeHealth) -> str:
+    """One line describing a health snapshot, for the transition history.
+
+    Only the fields an operator debugs an intermittent fault with. The full object
+    is not kept: two hundred whole snapshots is a memory profile, and the fields
+    left out are the ones that never move within one run.
+    """
+    return (
+        f"enabled={health.trading_enabled} armed={health.execution_armed} "
+        f"paused={health.paused} healthy={health.healthy} "
+        f"feed_blocked={health.feed_blocked} drift={health.clock_drift_ms:.0f}ms "
+        f"supervisor={health.supervisor_ready} wallet={health.wallet_status or '-'} "
+        f"orphans={len(health.orphan_orders)} positions={health.open_positions}"
+    )
 
 
 class BookClient(Protocol):
@@ -280,6 +364,9 @@ class ArcRuntime:
         "_executor",
         "_feed",
         "_fills",
+        "_health_history",
+        "_health_prev",
+        "_health_revision",
         "_hub",
         "_logger",
         "_next_book_read",
@@ -292,6 +379,7 @@ class ArcRuntime:
         "_reconciler",
         "_recovery",
         "_repricer",
+        "_risk",
         "_runtime",
         "_settings",
         "_settlement",
@@ -303,6 +391,7 @@ class ArcRuntime:
         "_venue_client",
         "_wallet",
         "_wallet_available",
+        "_wallet_refreshed_at",
         "_wallet_status",
         "_watchdog",
         "mode",
@@ -313,6 +402,7 @@ class ArcRuntime:
         "status",
         "supervisor_detail",
         "supervisor_ready",
+        "supervisor_state",
         "tokens",
         "windows",
     )
@@ -398,6 +488,9 @@ class ArcRuntime:
         # state and gate 19 treats as "no opinion" rather than as zero.
         self._wallet_available: Decimal | None = None
         self._next_wallet_read: float = 0.0
+        # 0.0 = never read. Distinct from "read and found nothing", which is a
+        # completed read with available_balance None.
+        self._wallet_refreshed_at: float = 0.0
         # The supervisor's own verdict on this runtime, pushed down rather than
         # pulled: the runtime must not hold a reference to the object that owns it,
         # or a stopped runtime keeps its supervisor alive. Defaults READY so a
@@ -405,6 +498,14 @@ class ArcRuntime:
         # supervisor attaches — is not refused by a gate about the supervisor.
         self.supervisor_ready = True
         self.supervisor_detail = ""
+        self.supervisor_state = SUPERVISOR_READY
+        # Health revision and its history. The revision is bumped only when a field
+        # actually changes, so the dashboard can redraw on a change rather than on
+        # every frame; the history is the last _HEALTH_HISTORY transitions, kept for
+        # the intermittent fault that is gone by the time anybody looks.
+        self._health_revision = 0
+        self._health_prev: tuple[object, ...] = ()
+        self._health_history: deque[tuple[float, int, str]] = deque(maxlen=_HEALTH_HISTORY)
         # Notification only. Constructed unconditionally and inert without a token, so
         # there is no code path that exists only when Telegram is configured — the
         # untested path is the one that breaks the night it is first needed.
@@ -446,6 +547,9 @@ class ArcRuntime:
         self._reconciler = Reconciler(store, executor, logger=logger)
 
         # ── decision half ────────────────────────────────────────────────────
+        # Owned here so the Systems page can read the timings without reaching
+        # through the Decision Engine into a gate it is not allowed to time.
+        self._risk = TimedRiskEngine()
         self._decisions = DecisionEngine(
             store,
             strategy_config=config_from_trading(trading),
@@ -457,6 +561,7 @@ class ArcRuntime:
             ),
             quote_source=self._quote,
             health_source=self.health,
+            risk=self._risk,
             logger=logger,
         )
 
@@ -521,6 +626,131 @@ class ArcRuntime:
     def recovery_report(self) -> RecoveryReport | None:
         """What the last recovery pass found. None until recovery has run."""
         return self._recovery
+
+    # ── gate readiness ───────────────────────────────────────────────────────
+
+    def gate_readiness(self) -> tuple[dict[str, str], ...]:
+        """Every gate's STANDING state: is there a process-wide reason it refuses?
+
+        This is a readiness summary, not an evaluation. Nine of the nineteen gates
+        answer questions about the process — trading enabled, armed, feed fresh,
+        supervisor ready, wallet connected, balance sufficient — and those are
+        answered here against the same health snapshot the real evaluation uses.
+
+        The rest need a window: a trigger, a price, a size, a direction. They are
+        reported PER WINDOW rather than assumed to pass, because a gate reported
+        PASS on a window that does not exist is a pass ARC invented. They are
+        counted as not-blocking in the summary, which is what "ready" means: the
+        runtime is not standing in the way, the window decides the rest.
+        """
+        health = self.health()
+        gate = self._runtime.gate
+        report = self._recovery
+        orphans = () if report is None else report.orphans
+        standing: dict[str, tuple[bool, str]] = {
+            "trading_enabled": (gate.enabled, gate.reason or "enabled"),
+            "execution_armed": (gate.armed, "armed" if gate.armed else "not armed"),
+            "strategy_enabled": (
+                self._decisions.strategy_count > 0,
+                f"{self._decisions.strategy_count} registered",
+            ),
+            "loss_limits": (
+                health.daily_loss_usd <= self._decisions.limits.max_daily_loss_usd
+                and health.consecutive_losses < self._decisions.limits.max_consecutive_losses,
+                f"{dec_str(health.daily_loss_usd)} today, "
+                f"{health.consecutive_losses} consecutive",
+            ),
+            "feed_freshness": (not health.feed_blocked, self._watchdog.status),
+            "runtime_health": (
+                health.healthy and not health.clock_drift_critical,
+                health.detail or f"drift {health.clock_drift_ms:.0f}ms",
+            ),
+            "supervisor_ready": (
+                health.supervisor_ready,
+                health.supervisor_detail or self.supervisor_state,
+            ),
+            "wallet_connected": (health.wallet_connected, health.wallet_status or "not polled"),
+            "orphan_orders": (not orphans, f"{len(orphans)} orphans"),
+            "available_balance": (
+                True,
+                "no published balance"
+                if health.available_balance is None
+                else f"{dec_str(health.available_balance)} available",
+            ),
+        }
+        rows: list[dict[str, str]] = []
+        for name in GATE_ORDER:
+            if name not in standing:
+                rows.append(
+                    {"id": GATE_IDS[name], "gate": name, "state": "PER WINDOW", "detail": ""}
+                )
+                continue
+            ok, detail = standing[name]
+            rows.append(
+                {
+                    "id": GATE_IDS[name],
+                    "gate": name,
+                    "state": "PASS" if ok else "BLOCKED",
+                    "detail": detail,
+                }
+            )
+        return tuple(rows)
+
+    def balance_detail(self, now: float) -> dict[str, Any]:
+        """Gate 19's arithmetic, shown rather than only enforced.
+
+        Required is the configured position notional — what one order will cost —
+        rather than a live intent's price times size, because the deck must be able
+        to answer "can the next order pay" before there is an intent to price.
+
+        Available None means no official source published a figure. It is reported
+        as None all the way to the browser rather than as zero: gate 19 treats an
+        absent balance as "no opinion", and a zero on the deck would read as an
+        empty account.
+        """
+        available = self._wallet_available
+        required = self._settings.trading.position_notional_usd
+        return {
+            "available": None if available is None else dec_str(available),
+            "required": dec_str(required),
+            "difference": None if available is None else dec_str(available - required),
+            "sufficient": available is None or available >= required,
+            "last_refresh": self._wallet_refreshed_at or None,
+            "refresh_age_ms": self.wallet_refresh_age_ms(now),
+        }
+
+    def gate_summary(self) -> dict[str, Any]:
+        """`19 / 19 Gates PASS`, plus the rows behind it.
+
+        Resolved here rather than in the payload builder, which is serialization
+        only: a serializer that counted these would be a second implementation of
+        what "ready" means.
+        """
+        rows = self.gate_readiness()
+        blocked = [row for row in rows if row["state"] == "BLOCKED"]
+        passing = len(rows) - len(blocked)
+        return {
+            "rows": list(rows),
+            "total": len(rows),
+            "passing": passing,
+            "summary": f"{passing} / {len(rows)} Gates PASS",
+            "failures": blocked,
+        }
+
+    @property
+    def decisions(self) -> DecisionEngine:
+        """The Decision Engine. Read-only from here; the loop is what drives it."""
+        return self._decisions
+
+    @property
+    def risk_eval_ms(self) -> float:
+        """How long the last risk evaluation took. Diagnostics only."""
+        return self._risk.last_ms
+
+    @property
+    def risk_eval_max_ms(self) -> float:
+        """The worst risk evaluation of this run. Diagnostics only."""
+        return self._risk.max_ms
 
     @property
     def venue_client(self) -> polymarket.AsyncSecureClient | None:
@@ -628,7 +858,7 @@ class ArcRuntime:
         drift = self._drift.last
         realised = self._realised_losses()
         report = self._recovery
-        return RuntimeHealth(
+        health = RuntimeHealth(
             trading_enabled=self._runtime.trading_enabled,
             spec_status=self._runtime.spec_status,
             execution_armed=self._runtime.execution_armed,
@@ -652,7 +882,52 @@ class ArcRuntime:
             wallet_status=self._wallet_status,
             orphan_orders=() if report is None else report.orphans,
             available_balance=self._wallet_available,
+            mode=self.mode.value,
         )
+        return self._revise(health)
+
+    def _revise(self, health: RuntimeHealth) -> RuntimeHealth:
+        """Stamp the revision, bumping it only when something actually changed.
+
+        Compared field by field rather than by object identity: RuntimeHealth is
+        rebuilt on every pass, so identity would report a change every time and the
+        revision would be a tick counter — which is exactly the redraw-per-frame the
+        revision exists to avoid. The revision itself is excluded from the
+        comparison, or every bump would justify the next one.
+        """
+        fields = tuple(
+            getattr(health, name)
+            for name in health.__slots__
+            if name != "health_revision"
+        )
+        if fields != self._health_prev:
+            self._health_prev = fields
+            self._health_revision += 1
+            self._health_history.append(
+                (self._clock.now(), self._health_revision, _health_line(health))
+            )
+        return replace(health, health_revision=self._health_revision)
+
+    @property
+    def health_revision(self) -> int:
+        """The current revision. Bumped on change, never on a repeated frame."""
+        return self._health_revision
+
+    @property
+    def health_history(self) -> tuple[tuple[float, int, str], ...]:
+        """The last transitions, oldest first. Debugging only; nothing reads it."""
+        return tuple(self._health_history)
+
+    @property
+    def wallet_refreshed_at(self) -> float:
+        """When the balance was last read. 0.0 means never."""
+        return self._wallet_refreshed_at
+
+    def wallet_refresh_age_ms(self, now: float) -> float | None:
+        """Age of the balance reading, or None when there has never been one."""
+        if self._wallet_refreshed_at <= 0.0:
+            return None
+        return max(0.0, (now - self._wallet_refreshed_at) * 1000.0)
 
     def _realised_losses(self) -> tuple[Decimal, int]:
         """Today's loss magnitude and the current losing streak, from settlements.
@@ -756,6 +1031,9 @@ class ArcRuntime:
         self._next_wallet_read = now + _WALLET_REFRESH_SECONDS
         snapshot = await self.wallet_snapshot(now)
         self._wallet_available = snapshot.available_balance
+        # The instant the figure above was obtained, so the deck can say how old it
+        # is. A balance with no age reads as current no matter when it was read.
+        self._wallet_refreshed_at = now
 
     def _forget_book(self, slug: str) -> None:
         for direction in Direction:
@@ -1136,6 +1414,7 @@ class ArcRuntime:
             f"{self.status}  feed {self._feed.url}",
             logger=self._logger,
         )
+        self._print_verification()
         try:
             await self._main_loop(market_target)
         finally:
@@ -1156,6 +1435,56 @@ class ArcRuntime:
         self._spec.apply(self._runtime)
         self._print_summary(self._clock.now() - self.started_at)
         return self.stats
+
+    # ── startup verification ─────────────────────────────────────────────────
+
+    def verification(self) -> tuple[tuple[str, str, str], ...]:
+        """The startup verification rows: (name, state, detail).
+
+        Every row is a real reading taken at the moment it is called. Nothing here
+        is assumed PASS because the process got this far — a row that cannot be
+        checked reports what it is, not a pass.
+        """
+        provider = self._settings.env.twap_provider.upper()
+        report = self._recovery
+        rows: list[tuple[str, str, str]] = [
+            ("Risk Gates", f"{len(GATE_ORDER)} / {len(GATE_ORDER)}", "G01-G19 registered"),
+            (
+                "Wallet",
+                _verdict(self._wallet_status != _WALLET_DISCONNECTED),
+                self._wallet_status or "not polled yet",
+            ),
+            ("Provider", _verdict(provider in _PROVIDERS), provider or "unset"),
+            (
+                "RTDS",
+                _verdict(bool(self._feed.url)) if provider == "RTDS" else "NOT IN USE",
+                self._feed.url if provider == "RTDS" else f"provider is {provider}",
+            ),
+            (
+                "CLOB",
+                _verdict(self._book_client is not None),
+                "book client attached" if self._book_client is not None else "no book client",
+            ),
+            (
+                "Database",
+                _verdict(self._store.integrity_check() == "ok"),
+                self._store.integrity_check(),
+            ),
+            (
+                "Recovery",
+                "PASS" if report is not None and report.safe_to_trade else "FAIL",
+                "not run" if report is None else f"{len(report.orphans)} orphans",
+            ),
+            ("Supervisor", _verdict(self.supervisor_ready), self.supervisor_detail or "READY"),
+        ]
+        ready = all(state in ("PASS", "NOT IN USE") for _, state, _ in rows[1:])
+        rows.append(("Ready", "YES" if ready else "NO", ""))
+        return tuple(rows)
+
+    def _print_verification(self) -> None:
+        """Print the verification block exactly once, at the moment the loop starts."""
+        lines = "".join(f"  {name:<12}{state}\n" for name, state, _ in self.verification())
+        self._out.write(f"\nRuntime Verification\n{lines}\n")
 
     # ── output ───────────────────────────────────────────────────────────────
 

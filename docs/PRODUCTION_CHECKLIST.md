@@ -86,7 +86,15 @@ simulated. A long V1 run is therefore evidence about the production runtime.
 ## 5. First live start
 
 - [ ] Wallet funded, and the balance shown on the deck matches the wallet.
-- [ ] Recovery panel shows no unreconciled orphan orders. Gate 18 refuses every
+- [ ] Balance Check (G19) on the deck: Available, Required and Difference agree
+      with the wallet, and Refresh Age is seconds rather than minutes. A blank
+      Available means nothing was published — it is not zero.
+- [ ] Systems page reads `19 / 19 Gates PASS`, or the expandable list names every
+      gate that does not. Gates marked `PER WINDOW` are not failures; they need a
+      live window to mean anything and are never reported as passed.
+- [ ] Supervisor state on the Systems page is `READY`. `FAILED` names its reason
+      in Detail; do not arm over it.
+- [ ] Recovery panel shows Orphan Count 0. Gate 18 refuses every
       submission while one exists — clear it by hand at the venue, not by
       restarting.
 - [ ] Select V2. Press START V2 RUNTIME. Preflight must pass; a FAIL refuses the

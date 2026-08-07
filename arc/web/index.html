@@ -234,6 +234,7 @@
         <dt>Markets Recovered</dt><dd data-f="recovery.markets_recovered">—</dd>
         <dt>Unresolved Orders</dt><dd data-f="recovery.unresolved_orders" data-list>—</dd>
         <dt>Unknown / Orphans</dt><dd data-f="recovery.orphans" data-list>—</dd>
+        <dt>Orphan Count</dt><dd data-f="recovery.orphan_count">—</dd>
         <dt>Reconciliation Safe</dt><dd data-f="recovery.safe_to_trade" data-flag>—</dd>
       </dl>
       <div id="recovery-steps" class="checks"></div>
@@ -298,6 +299,22 @@
           <dt>Markets Settled</dt><dd data-f="wallet.markets_settled">—</dd>
         </dl>
       </div>
+    </section>
+
+    <!-- Gate 19's own arithmetic, beside the wallet it reads. Available comes
+         from the venue; Required is what one order costs; Difference is what the
+         gate compares. A blank Available means no official source published one,
+         which is not zero. -->
+    <section class="panel span2">
+      <h2>Balance Check (G19)</h2>
+      <dl class="kv">
+        <dt>Available</dt><dd data-f="balance.available">—</dd>
+        <dt>Required</dt><dd data-f="balance.required">—</dd>
+        <dt>Difference</dt><dd data-f="balance.difference">—</dd>
+        <dt>Sufficient</dt><dd data-f="balance.sufficient" data-flag>—</dd>
+        <dt>Last Refresh</dt><dd data-f="balance.last_refresh" data-time>—</dd>
+        <dt>Refresh Age</dt><dd data-f="balance.refresh_age_ms" data-ms>—</dd>
+      </dl>
     </section>
   </div>
 </main>
@@ -448,6 +465,34 @@
     <section class="panel span2">
       <h2>Configuration Warnings</h2>
       <ul id="warnings" class="plain"></ul>
+    </section>
+    <!-- Supervisor LIFECYCLE, not trading status. The runtime's own status is the
+         closed five-value set shown on the OPS Deck; this is the state of the
+         object that owns it, and it belongs here and nowhere else. -->
+    <section class="panel span2">
+      <h2>Supervisor</h2>
+      <dl class="kv">
+        <dt>State</dt><dd data-f="runtime.supervisor_state">—</dd>
+        <dt>Ready</dt><dd data-f="runtime.supervisor_ready" data-flag>—</dd>
+        <dt>Detail</dt><dd data-f="runtime.supervisor_detail">—</dd>
+        <dt>Health Revision</dt><dd data-f="runtime.health_revision">—</dd>
+        <dt>Risk Eval</dt><dd data-f="runtime.risk_eval_ms" data-ms>—</dd>
+        <dt>Risk Eval (max)</dt><dd data-f="runtime.risk_eval_max_ms" data-ms>—</dd>
+      </dl>
+    </section>
+    <!-- Every risk gate, by permanent ID. Gates that need a live window to mean
+         anything read PER WINDOW rather than a PASS nobody measured. -->
+    <section class="panel span4">
+      <h2>Risk Gates <small data-f="runtime.gates_summary">—</small></h2>
+      <details id="gates-detail">
+        <summary>Per-gate detail</summary>
+        <div id="gates" class="checks"></div>
+      </details>
+    </section>
+    <section class="panel span4">
+      <h2>Health Transitions</h2>
+      <p class="note">The last 200 changes to the health snapshot, newest first.</p>
+      <div id="health-history" class="checks"></div>
     </section>
   </div>
 </main>

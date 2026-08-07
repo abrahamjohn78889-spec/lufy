@@ -94,6 +94,7 @@ function paint() {
   paintWindows();
   paintChips();
   paintRecoverySteps();
+  paintHealth();
   paintModes();
   paintAnalytics();
   paintSettings();
@@ -196,7 +197,35 @@ function paintRecoverySteps() {
   }));
 }
 
-// The runtime the operator has SELECTED, which is not necessarily the one that is
+// Gates and health transitions. Both are Systems-page tables that only change
+// when the health snapshot does, so both are skipped while the revision holds —
+// the timer path above still runs every frame, only this redraw is elided.
+let paintedRevision = -1;
+
+function paintHealth() {
+  const revision = state.runtime.health_revision;
+  if (revision === paintedRevision) return;
+  paintedRevision = revision;
+
+  $('#gates').replaceChildren(...(state.gates || []).map((g) => {
+    const row = document.createElement('div');
+    row.className = `check ${g.state === 'PASS' ? 'pass' : g.state === 'FAIL' ? 'fail' : ''}`;
+    row.innerHTML =
+      `<b>${g.state}</b> <span>${g.id} ${g.gate}</span> <i>${g.detail || ''}</i>`;
+    return row;
+  }));
+
+  $('#health-history').replaceChildren(...(state.health_history || []).slice().reverse()
+    .map((h) => {
+      const row = document.createElement('div');
+      row.className = 'check';
+      row.innerHTML =
+        `<b>#${h.revision}</b> <span>${h.utc_display}</span> <i>${h.detail}</i>`;
+      return row;
+    }));
+}
+
+
 // running: between choosing V2 and pressing START RUNTIME the process is still on
 // V1. Cleared on the first frame so a reload shows what is actually running.
 let selectedMode = null;

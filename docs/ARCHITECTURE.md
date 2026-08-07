@@ -166,6 +166,46 @@ after being stopped and replaced. The balance is refreshed on the main loop,
 like the CLOB book, because the decision pass is synchronous and a gate that
 awaited a venue call would put a round trip inside the freeze.
 
+## Reading the gates without reading the code
+
+Every gate has a permanent identifier, `G01` through `G19`, derived from its
+position in `GATE_ORDER` rather than kept in a second table that could drift
+from it. A gate is therefore only ever appended, never inserted. One denial line
+carries all seven fields an operator needs — gate ID, gate name, denial reason,
+timestamp, market, window and runtime mode — and that single `log_event` call
+still feeds all five surfaces, so no surface can show a field the others lack.
+
+Three things are measured alongside the gates and feed nothing:
+
+- **Risk evaluation duration.** `risk_eval_ms` and its running maximum. A gate
+  that suddenly costs milliseconds is a fault to find; the alternative to
+  measuring it is guessing at it after the fact. The stopwatch is a subclass of
+  the Risk Engine owned by the runtime, not a timer inside the Decision Engine —
+  A0 forbids that layer a clock, and a diagnostic is not worth a hole in the rule
+  that keeps decisions reproducible.
+- **Wallet freshness.** `wallet_last_refresh` and `wallet_refresh_age_ms` beside
+  `wallet_connected`, because "connected" says nothing about *when*. Never read
+  is `None`, not zero — zero would read as "this instant".
+- **Health revision.** A counter bumped only when a field of the health snapshot
+  actually changes, compared field-by-field with `health_revision` itself
+  excluded. The dashboard redraws its gate and history tables on a change of
+  that number rather than on every frame. The last 200 transitions are kept.
+
+The Systems page shows `N / 19 Gates PASS`. Nine of the nineteen need a live
+window — a trigger, a price, a size, a direction — and are reported `PER WINDOW`
+rather than `PASS`: a green mark on a gate nobody evaluated is a fabricated
+measurement, which is the one thing this project will not print.
+
+Supervisor lifecycle (`STOPPED`, `STARTING`, `READY`, `STOPPING`, `FAILED`) is a
+separate string field and not a `RuntimeStatus`. `RuntimeStatus` is the closed
+five-value set describing the *trading* runtime; a sixth value would make the
+supervisor's own lifecycle look like a trading mode. It appears on the Systems
+page and nowhere else.
+
+On start, the runtime prints one verification block — risk gates, wallet,
+provider, RTDS, CLOB, database, recovery, supervisor, ready — exactly once, and
+the same rows are rendered into the production validation report.
+
 ## Access control is the network boundary
 
 The API binds loopback and refuses to start on any other interface. There is no

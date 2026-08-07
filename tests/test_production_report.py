@@ -304,7 +304,11 @@ class TestTheRouteReadsTheSameRowsTheValidatorDoes:
             market_limit=50,
         )
         expected = render_report(
-            direct, mode=run.mode.value, provider=run.settings.env.twap_provider
+            direct,
+            mode=run.mode.value,
+            provider=run.settings.env.twap_provider,
+            gates=run.gate_summary(),
+            verification=run.verification(),
         )
         assert _stable_text(client.get("/history?format=report").text) == _stable_text(
             expected
