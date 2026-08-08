@@ -341,6 +341,7 @@ class ExecutionIntent:
     locked_trigger: Decimal
     created_at: float
     intent_id: str = ""
+    trace_id: str = ""
     # ── the frozen snapshot execution acts on ────────────────────────────────
     opening_twap: Decimal = _ZERO
     ptb: Decimal = _ZERO
@@ -369,6 +370,7 @@ class ExecutionIntent:
         """
         parts = (
             f"intent_id={self.intent_id}",
+            f"trace_id={self.trace_id}",
             f"market_slug={self.market_slug}",
             f"offset_seconds={self.offset_seconds}",
             f"direction={self.direction.value}",
@@ -399,6 +401,7 @@ class Fill:
     size: Decimal
     price: Decimal
     ts: float
+    trace_id: str = ""
 
 
 @dataclass(slots=True)
@@ -418,6 +421,7 @@ class Order:
     venue_order_id: str = ""
     reprice_chain_id: str = ""
     rejection_reason: str = ""
+    trace_id: str = ""
 
     @property
     def is_live(self) -> bool:
@@ -452,6 +456,7 @@ class Settlement:
     settled_at: float
     pnl: Decimal = _ZERO
     divergence_logged: bool = False
+    trace_id: str = ""
 
 
 @dataclass(slots=True)

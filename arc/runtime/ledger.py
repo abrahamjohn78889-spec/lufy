@@ -90,6 +90,7 @@ class LedgerRecord:
     locked_trigger: Decimal | None
     buffer: Decimal | None
     intent_id: str
+    trace_id: str
     local_order_id: str
     venue_order_id: str
     submission_time: float | None
@@ -123,6 +124,7 @@ class LedgerRecord:
             "locked_trigger": _s(self.locked_trigger),
             "buffer": _s(self.buffer),
             "intent_id": self.intent_id,
+            "trace_id": self.trace_id,
             "local_order_id": self.local_order_id,
             "venue_order_id": self.venue_order_id,
             "submission_time": self.submission_time,
@@ -163,6 +165,7 @@ class LedgerRecord:
                 f"{self.offset_seconds}s",
                 self.direction,
                 self.intent_id,
+                self.trace_id,
                 self.local_order_id,
                 self.venue_order_id,
                 self.state,
@@ -205,6 +208,7 @@ def _record(
     orders: tuple[Order, ...],
     fills: tuple[Fill, ...],
     intent_id: str,
+    trace_id: str,
     settlement_time: float | None,
     outcome: Outcome | None,
     pnl: Decimal | None,
@@ -245,6 +249,7 @@ def _record(
         locked_trigger=_dec(window["locked_trigger"]),
         buffer=_dec(window["buffer"]),
         intent_id=intent_id,
+        trace_id=trace_id,
         local_order_id=leader.order_id if leader is not None else "",
         venue_order_id=leader.venue_order_id if leader is not None else "",
         submission_time=leader.created_at if leader is not None else None,
@@ -278,6 +283,7 @@ def ledger_records(store: Store, *, market_limit: int = 50) -> tuple[LedgerRecor
         orders = store.orders_for(slug)
         fills = store.fills_for(slug)
         intents = {i.offset_seconds: i.intent_id for i in store.intents_for(slug)}
+        traces = {i.offset_seconds: i.trace_id for i in store.intents_for(slug)}
         settlement = store.settlement_for(slug)
         for window in store.windows_for(slug):
             records.append(
@@ -287,6 +293,7 @@ def ledger_records(store: Store, *, market_limit: int = 50) -> tuple[LedgerRecor
                     orders,
                     fills,
                     intents.get(int(window["offset_seconds"]), ""),
+                    traces.get(int(window["offset_seconds"]), ""),
                     settlement.settled_at if settlement is not None else None,
                     settlement.outcome if settlement is not None else None,
                     settlement.pnl if settlement is not None else None,

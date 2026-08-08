@@ -9,6 +9,8 @@ from arc.logging_setup import (
     LOGGER_NAME,
     ArcLineFormatter,
     RedactionFilter,
+    SessionFilter,
+    attach_session_id,
     log_event,
     setup_logging,
 )
@@ -176,3 +178,98 @@ class TestLogEventEmitsOnePlainLine:
         log_event(logging.INFO, "Default Logger Path")
         text = (tmp_path / "arc.log").read_text(encoding="utf-8")
         assert "Default Logger Path" in text
+
+
+class TestSessionStampingNeverEatsTheDetail:
+    """Regression: a LoggerAdapter here silently blanked every reason string.
+
+    The first implementation of session stamping wrapped the runtime logger in a
+    logging.LoggerAdapter. An adapter's process() REPLACES the caller's `extra`
+    dict with its own, so `arc_detail` — the reason text on every denial, every
+    rejection and every PTB failure — was dropped from every line in the codebase.
+    The lines still looked complete; they just carried no reason. These tests fail
+    if anything reintroduces that shape.
+    """
+
+    def test_detail_survives_session_stamping(self, tmp_path: Path) -> None:
+        logger = setup_logging(tmp_path, console=False)
+        attach_session_id(logger, "0123456789abcdef")
+        log_event(logging.ERROR, "PTB Unavailable", "no trading this market", logger=logger)
+        text = (tmp_path / "arc.log").read_text(encoding="utf-8")
+        assert "no trading this market" in text
+
+    def test_the_record_still_carries_arc_detail(self, tmp_path: Path) -> None:
+        """Asserted on the record, not the rendered line: Signal Tank reads the field."""
+        logger = setup_logging(tmp_path, console=False)
+        attach_session_id(logger, "0123456789abcdef")
+        seen: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                seen.append(record)
+
+        handler = _Capture()
+        logger.addHandler(handler)
+        try:
+            log_event(logging.WARNING, "Rejected", "ENTRY_PRICE_LIMIT (0.87 > 0.85)", logger=logger)
+        finally:
+            logger.removeHandler(handler)
+
+        assert len(seen) == 1
+        assert getattr(seen[0], "arc_detail", "") == "ENTRY_PRICE_LIMIT (0.87 > 0.85)"
+        assert getattr(seen[0], "arc_session_id", "") == "0123456789abcdef"
+
+    def test_the_session_id_is_not_printed_into_the_line(self, tmp_path: Path) -> None:
+        """The plain-line format is frozen. The id travels on the record only."""
+        logger = setup_logging(tmp_path, console=False)
+        attach_session_id(logger, "0123456789abcdef")
+        log_event(logging.INFO, "PTB Frozen", "120,000.00", logger=logger)
+        text = (tmp_path / "arc.log").read_text(encoding="utf-8")
+        assert "0123456789abcdef" not in text
+        assert "120,000.00" in text
+
+    def test_the_column_alignment_is_unchanged_by_stamping(self, tmp_path: Path) -> None:
+        logger = setup_logging(tmp_path, console=False)
+        attach_session_id(logger, "0123456789abcdef")
+        log_event(logging.INFO, "PTB Frozen", "120,000.00", logger=logger)
+        log_event(logging.INFO, "Trigger Locked", "120,010.00", logger=logger)
+        lines = (tmp_path / "arc.log").read_text(encoding="utf-8").splitlines()
+        assert lines[0].index("120,000.00") == lines[1].index("120,010.00")
+
+    def test_reattaching_the_same_session_does_not_stack_filters(self, tmp_path: Path) -> None:
+        logger = setup_logging(tmp_path, console=False)
+        first = attach_session_id(logger, "aaaa")
+        again = attach_session_id(logger, "aaaa")
+        assert first is again
+        assert sum(isinstance(f, SessionFilter) for f in logger.filters) == 1
+
+    def test_a_new_session_replaces_the_old_id(self, tmp_path: Path) -> None:
+        """A restart must not keep attributing lines to the runtime that ended."""
+        logger = setup_logging(tmp_path, console=False)
+        attach_session_id(logger, "old-session")
+        attach_session_id(logger, "new-session")
+        assert sum(isinstance(f, SessionFilter) for f in logger.filters) == 1
+
+        seen: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                seen.append(record)
+
+        handler = _Capture()
+        logger.addHandler(handler)
+        try:
+            log_event(logging.INFO, "Runtime Ready", logger=logger)
+        finally:
+            logger.removeHandler(handler)
+
+        assert getattr(seen[0], "arc_session_id", "") == "new-session"
+
+    def test_redaction_still_reaches_the_detail_after_stamping(self, tmp_path: Path) -> None:
+        """Both filters must coexist: stamping must not displace redaction."""
+        logger = setup_logging(tmp_path, console=False, secrets=("supersecretvalue",))
+        attach_session_id(logger, "0123456789abcdef")
+        log_event(logging.INFO, "Wallet Connected", "key supersecretvalue", logger=logger)
+        text = (tmp_path / "arc.log").read_text(encoding="utf-8")
+        assert "supersecretvalue" not in text
+        assert "[REDACTED]" in text

@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Final
 
-from arc.decision.intent import build_intent
+from arc.decision.intent import build_intent, trace_id_for
 from arc.decision.quota import QuotaLedger
 from arc.decision.reasons import SkipReason
 from arc.decision.snapshot import DecisionSnapshot, snapshot_for
@@ -466,4 +466,5 @@ class DecisionEngine:
             wallet_status=health.wallet_status,
             orphan_orders=health.orphan_orders,
             available_balance=health.available_balance,
+            trace_id=trace_id_for(snapshot.market_slug, snapshot.offset_seconds),
         )

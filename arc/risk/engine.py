@@ -36,7 +36,7 @@ decide whether an action is "too late".
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Final
 
@@ -191,6 +191,7 @@ class RiskContext:
     # limit_price * size, both already frozen into this context above, and a
     # second copy could disagree with the order actually submitted.
     available_balance: Decimal | None = None
+    trace_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +208,7 @@ class RiskVerdict:
     gate: str = ""
     reason: DenialReason | None = None
     detail: str = ""
+    trace_id: str = ""
 
     @property
     def denied(self) -> bool:
@@ -242,8 +244,8 @@ class RiskEngine:
             gate: Callable[[RiskContext], RiskVerdict] = getattr(self, f"_gate_{name}")
             verdict = gate(context)
             if verdict.denied:
-                return verdict
-        return _ALLOWED
+                return replace(verdict, trace_id=context.trace_id)
+        return replace(_ALLOWED, trace_id=context.trace_id)
 
     # ── 1 ────────────────────────────────────────────────────────────────────
 

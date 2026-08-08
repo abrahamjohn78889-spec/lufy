@@ -18,6 +18,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from arc.buildinfo import UNAVAILABLE as BUILD_UNAVAILABLE
+from arc.buildinfo import git_commit
 from arc.domain.enums import (
     DISPLAYED_ORDER_STATES,
     LIVE_ORDER_STATES,
@@ -426,15 +428,15 @@ def _memory() -> str:
 
 
 def _git_commit() -> str:
-    """HEAD, read from .git. No subprocess: `arc run` must not shell out."""
-    git = Path(__file__).resolve().parent.parent.parent / ".git"
-    try:
-        head = (git / "HEAD").read_text(encoding="utf-8").strip()
-        if head.startswith("ref: "):
-            return (git / head[5:]).read_text(encoding="utf-8").strip()[:12]
-        return head[:12]
-    except OSError:
-        return _UNAVAILABLE
+    """HEAD, read from .git. No subprocess: `arc run` must not shell out.
+
+    Delegates to arc.buildinfo so the Systems page and the runtime session row
+    report the same commit from one reader. The dashboard's longer UNAVAILABLE
+    wording is preserved here, because this page's other cells use it and a second
+    spelling in one panel reads as two different kinds of missing.
+    """
+    commit = git_commit()
+    return _UNAVAILABLE if commit == BUILD_UNAVAILABLE else commit
 
 
 def system_payload(run: ArcRuntime, now: float) -> dict[str, Any]:
@@ -619,6 +621,10 @@ async def status_payload(run: ArcRuntime, now: float) -> dict[str, Any]:
         # Date() would drift from the runtime it is reporting on.
         "clocks": clocks(now),
         "runtime": {
+            # Immutable per runtime start. Every event, order, ledger row and report
+            # carries it, so after a restart the operator can tell which runtime
+            # produced which events instead of inferring it from timestamps.
+            "runtime_session_id": run.runtime_session_id,
             "status": run.status,
             "mode": run.mode.value,
             "started_at": run.started_at,

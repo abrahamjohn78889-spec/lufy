@@ -93,6 +93,9 @@ class FillEngine:
                     )
                 continue
 
+            # The local order is the authoritative bridge to the logical trade.
+            fill.trace_id = order.trace_id
+
             # The database arbitrates novelty, not an in-memory set: a set is empty
             # again after a restart and every historical fill would re-apply,
             # doubling the recorded position.

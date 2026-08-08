@@ -164,6 +164,7 @@ class Submitter:
                 price=intent.limit_price,
                 size=size,
                 now=now,
+                trace_id=intent.trace_id,
             )
             for index, size in enumerate(sizes)
         )

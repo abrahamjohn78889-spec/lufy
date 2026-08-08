@@ -56,6 +56,7 @@ class SignalEvent:
     severity: str
     event: str
     detail: str
+    runtime_session_id: str = ""
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -70,6 +71,7 @@ class SignalEvent:
             "severity": self.severity,
             "event": self.event,
             "detail": self.detail,
+            "runtime_session_id": self.runtime_session_id,
         }
 
 
@@ -116,13 +118,27 @@ class EventHub:
     otherwise a plain queue put.
     """
 
-    __slots__ = ("_events", "_loop", "_seq", "_subscribers")
+    __slots__ = (
+        "_errors",
+        "_events",
+        "_loop",
+        "_seq",
+        "_subscribers",
+        "_warnings",
+        "runtime_session_id",
+    )
 
     def __init__(self) -> None:
         self._events: deque[SignalEvent] = deque(maxlen=MAX_EVENTS)
         self._subscribers: list[asyncio.Queue[dict[str, Any]]] = []
         self._seq = 0
         self._loop: asyncio.AbstractEventLoop | None = None
+        self.runtime_session_id = ""
+        # Counted at emit, not by scanning `_events`: that deque is bounded at
+        # MAX_EVENTS, so a long run would silently under-report every warning that
+        # had already aged out of the buffer.
+        self._warnings = 0
+        self._errors = 0
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -143,16 +159,39 @@ class EventHub:
     def sequence(self) -> int:
         return self._seq
 
+    @property
+    def warning_count(self) -> int:
+        """Monotonic count of WARNING lines since this hub was created."""
+        return self._warnings
+
+    @property
+    def error_count(self) -> int:
+        """Monotonic count of ERROR and CRITICAL lines since this hub was created."""
+        return self._errors
+
     # ── writing ──────────────────────────────────────────────────────────────
 
     def publish_event(self, event: SignalEvent) -> None:
         self._events.append(event)
         self.broadcast({"type": "signal", "data": event.as_json()})
 
-    def emit(self, engine: str, severity: str, event: str, detail: str, ts: float) -> SignalEvent:
+    def emit(
+        self,
+        engine: str,
+        severity: str,
+        event: str,
+        detail: str,
+        ts: float,
+        runtime_session_id: str = "",
+    ) -> SignalEvent:
         self._seq += 1
+        if severity == "WARNING":
+            self._warnings += 1
+        elif severity in ("ERROR", "CRITICAL"):
+            self._errors += 1
         signal = SignalEvent(
-            seq=self._seq, ts=ts, engine=engine, severity=severity, event=event, detail=detail
+            seq=self._seq, ts=ts, engine=engine, severity=severity, event=event, detail=detail,
+            runtime_session_id=runtime_session_id or self.runtime_session_id,
         )
         self.publish_event(signal)
         return signal
@@ -218,6 +257,7 @@ class SignalTankHandler(logging.Handler):
                 event=record.getMessage(),
                 detail=str(getattr(record, "arc_detail", "")),
                 ts=record.created,
+                runtime_session_id=str(getattr(record, "arc_session_id", "")),
             )
         except Exception:  # pragma: no cover - handleError is the logging contract
             self.handleError(record)

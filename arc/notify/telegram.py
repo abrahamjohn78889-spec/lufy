@@ -312,6 +312,8 @@ class TelegramNotifier:
                 f"\nIST: {data['ist']}\nET : {data['et']}"
             )
         body = f"[ARC] {CATEGORY_LABELS[category]}{when}\n{data.get('event', '')}"
+        if data.get("runtime_session_id"):
+            body += f"\nSession: {data['runtime_session_id']}"
         return f"{body}\n{detail}" if detail else body
 
     # ── daily summary ────────────────────────────────────────────────────────

@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import uuid
 from typing import Any, Final, TextIO
 
 import polymarket
@@ -315,6 +316,8 @@ class RuntimeSupervisor:
             venue_client=client,
             book_client=self._book_client,
             logger=self._logger,
+            runtime_session_id=uuid.uuid4().hex,
+            start_reason="manual",
         )
         # The runtime's own cache, so the resolver the executor holds is the one the
         # market loop fills. Two caches would let the executor resolve from an empty

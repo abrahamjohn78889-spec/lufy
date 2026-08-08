@@ -135,6 +135,7 @@ class Repricer:
             price=target,
             size=remainder,
             now=now,
+            trace_id=order.trace_id,
         )
         self._store.save_order(successor)
 

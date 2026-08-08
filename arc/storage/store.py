@@ -509,12 +509,13 @@ class Store:
             with self._conn:
                 cur = self._conn.execute(
                     "INSERT OR IGNORE INTO intents "
-                    "(intent_id, market_slug, offset_seconds, direction, signal_twap, "
+                    "(intent_id, trace_id, market_slug, offset_seconds, direction, signal_twap, "
                     " locked_trigger, created_at, opening_twap, ptb, buffer, "
                     " limit_price, size, strategy_id, close_ts) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         intent.intent_id or f"{intent.market_slug}:{intent.offset_seconds}",
+                        intent.trace_id,
                         intent.market_slug,
                         intent.offset_seconds,
                         intent.direction.value,
@@ -547,6 +548,7 @@ class Store:
                 locked_trigger=to_decimal(r["locked_trigger"]),
                 created_at=float(r["created_at"]),
                 intent_id=str(r["intent_id"]),
+                trace_id=str(r["trace_id"]),
                 opening_twap=to_decimal(r["opening_twap"]),
                 ptb=to_decimal(r["ptb"]),
                 buffer=to_decimal(r["buffer"]),
@@ -574,8 +576,8 @@ class Store:
                 self._conn.execute(
                     "INSERT INTO orders (order_id, market_slug, offset_seconds, direction, "
                     " price, size, state, filled_size, venue_order_id, reprice_chain_id, "
-                    " rejection_reason, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    " rejection_reason, trace_id, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(order_id) DO UPDATE SET state=excluded.state, "
                     " filled_size=excluded.filled_size, venue_order_id=excluded.venue_order_id, "
                     " rejection_reason=excluded.rejection_reason, updated_at=excluded.updated_at",
@@ -591,6 +593,7 @@ class Store:
                         order.venue_order_id,
                         order.reprice_chain_id,
                         order.rejection_reason,
+                        order.trace_id,
                         order.created_at,
                         order.updated_at,
                     ),
@@ -665,6 +668,7 @@ class Store:
             venue_order_id=str(row["venue_order_id"]),
             reprice_chain_id=str(row["reprice_chain_id"]),
             rejection_reason=str(row["rejection_reason"]),
+            trace_id=str(row["trace_id"]),
         )
 
     # ── fills ────────────────────────────────────────────────────────────────
@@ -680,11 +684,13 @@ class Store:
             with self._conn:
                 cur = self._conn.execute(
                     "INSERT OR IGNORE INTO fills "
-                    "(fill_id, order_id, market_slug, size, price, ts) VALUES (?, ?, ?, ?, ?, ?)",
+                    "(fill_id, order_id, market_slug, trace_id, size, price, ts) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         fill.fill_id,
                         fill.order_id,
                         fill.market_slug,
+                        fill.trace_id,
                         dec_str(fill.size),
                         dec_str(fill.price),
                         fill.ts,
@@ -706,6 +712,7 @@ class Store:
                 size=to_decimal(r["size"]),
                 price=to_decimal(r["price"]),
                 ts=float(r["ts"]),
+                trace_id=str(r["trace_id"]),
             )
             for r in rows
         )
@@ -741,10 +748,11 @@ class Store:
             with self._conn:
                 cur = self._conn.execute(
                     "INSERT OR IGNORE INTO settlements "
-                    "(market_slug, outcome, settlement_twap, ptb, pnl, divergence_logged, "
-                    " settled_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "(market_slug, trace_id, outcome, settlement_twap, ptb, pnl, "
+                    "divergence_logged, settled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         settlement.market_slug,
+                        settlement.trace_id,
                         settlement.outcome.value,
                         _opt_str(settlement.settlement_twap),
                         _opt_str(settlement.ptb),
@@ -771,6 +779,7 @@ class Store:
             settled_at=float(row["settled_at"]),
             pnl=to_decimal(row["pnl"]),
             divergence_logged=bool(row["divergence_logged"]),
+            trace_id=str(row["trace_id"]),
         )
 
     def settlement_history(self, limit: int = 100) -> tuple[Settlement, ...]:
@@ -786,6 +795,7 @@ class Store:
                 settled_at=float(r["settled_at"]),
                 pnl=to_decimal(r["pnl"]),
                 divergence_logged=bool(r["divergence_logged"]),
+                trace_id=str(r["trace_id"]),
             )
             for r in rows
         )
@@ -818,6 +828,58 @@ class Store:
     def candle_count(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) AS n FROM candles").fetchone()
         return int(row["n"])
+
+    def row_counts(self) -> dict[str, int]:
+        """Cumulative row counts, for the Systems page. NOT session-scoped.
+
+        These are whole-database totals and say nothing about one run. The
+        end-of-session summary must not use them: after any restart they include
+        every earlier session's rows, and a summary built from them would credit
+        this run with work a previous one did.
+        """
+        return {
+            table: int(self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in ("observations", "intents", "orders", "fills")
+        }
+
+    def order_tally_since(self, since_ts: float) -> dict[str, int]:
+        """Orders created at or after `since_ts`, split into total and fully filled.
+
+        Session-scoped by `created_at`, which is what makes it answer "what did THIS
+        run do" rather than "what is in the database".
+
+        Both numbers come from ONE query so the fill rate can never disagree with
+        its own numerator: two separate counts could straddle a fill landing between
+        them and report more filled orders than submitted.
+
+        "Filled" means filled_size >= size — the order is complete. A partial is
+        counted in `submitted` and not in `filled`, because a half-filled resting
+        order is not a completed trade and reporting it as one would overstate the
+        fill rate. Compared as REAL: sizes are stored as decimal strings, and a
+        string comparison would rank '10' below '9'.
+        """
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS submitted, "
+            " COALESCE(SUM(CAST(filled_size AS REAL) >= CAST(size AS REAL)), 0) AS filled "
+            "FROM orders WHERE created_at >= ?",
+            (since_ts,),
+        ).fetchone()
+        return {"submitted": int(row["submitted"]), "filled": int(row["filled"])}
+
+    def save_runtime_session(self, values: dict[str, object]) -> None:
+        columns = tuple(values)
+        names = ", ".join(columns)
+        placeholders = ", ".join("?" for _ in columns)
+        with self._conn:
+            self._conn.execute(
+                f"INSERT OR REPLACE INTO runtime_sessions ({names}) VALUES ({placeholders})",
+                tuple(values[name] for name in columns),
+            )
+
+    def runtime_sessions(self, limit: int = 50) -> tuple[sqlite3.Row, ...]:
+        return tuple(self._conn.execute(
+            "SELECT * FROM runtime_sessions ORDER BY started_at DESC LIMIT ?", (limit,)
+        ).fetchall())
 
     # ── integrity ────────────────────────────────────────────────────────────
 

@@ -44,6 +44,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import uuid
 from collections import deque
 from collections.abc import Awaitable
 from dataclasses import dataclass, field, replace
@@ -55,6 +56,7 @@ import polymarket
 
 from arc.api.app import check_bind
 from arc.api.app import serve as serve_dashboard
+from arc.buildinfo import git_commit
 from arc.clock import Clock, DriftMonitor, DriftStatus
 from arc.config import Settings
 from arc.decision.engine import DecisionEngine, RuntimeHealth
@@ -77,7 +79,7 @@ from arc.execution.wallet import (
     STATUS_DISCONNECTED as _WALLET_DISCONNECTED,
 )
 from arc.execution.wallet import WalletReader, WalletSnapshot, build_wallet
-from arc.logging_setup import log_event
+from arc.logging_setup import attach_session_id, log_event
 from arc.market.discovery import MarketDiscovery
 from arc.market.providers import TwapProvider
 from arc.market.ptb import (
@@ -397,6 +399,8 @@ class ArcRuntime:
         "mode",
         "restart_count",
         "rotator",
+        "runtime_session_id",
+        "start_reason",
         "started_at",
         "stats",
         "status",
@@ -421,6 +425,8 @@ class ArcRuntime:
         venue_client: polymarket.AsyncSecureClient | None = None,
         book_client: BookClient | None = None,
         logger: logging.Logger | None = None,
+        runtime_session_id: str = "",
+        start_reason: str = "manual",
     ) -> None:
         trading = settings.trading
         self._settings = settings
@@ -439,12 +445,23 @@ class ArcRuntime:
         self._book: dict[tuple[str, Direction], tuple[Decimal, float]] = {}
         self._next_book_read: float = 0.0
         self._out = out
+        # Supervisor supplies this for live runtimes; the fallback keeps direct test
+        # construction traceable without creating a second lifecycle owner.
+        self.runtime_session_id = runtime_session_id or uuid.uuid4().hex
+        self.start_reason = start_reason
         self._logger = logger
+        # A filter, deliberately not a LoggerAdapter. An adapter's process() replaces
+        # the caller's `extra` wholesale, which would drop `arc_detail` from every
+        # log_event in the codebase — silently blanking the reason text on every
+        # denial and every PTB failure. A filter adds the field and touches nothing.
+        if logger is not None:
+            attach_session_id(logger, self.runtime_session_id)
         # Pause is the operator's "hold new submissions" and is deliberately
         # separate from disarming: pausing must not clear the arm state, or resuming
         # would silently require a second confirmation the operator did not expect.
         self._paused = False
         self._hub = EventHub()
+        self._hub.runtime_session_id = self.runtime_session_id
         self.mode = executor.mode
         self.status = RuntimeStatus.STOPPED
         self.started_at = 0.0
@@ -1415,8 +1432,15 @@ class ArcRuntime:
             logger=self._logger,
         )
         self._print_verification()
+        stop_reason = "normal"
         try:
             await self._main_loop(market_target)
+        except asyncio.CancelledError:
+            stop_reason = "shutdown"
+            raise
+        except Exception:
+            stop_reason = "error"
+            raise
         finally:
             self.status = RuntimeStatus.STOPPING
             log_event(
@@ -1431,10 +1455,66 @@ class ArcRuntime:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
             self.status = RuntimeStatus.STOPPED
+            ended_at = self._clock.now()
+            self._save_session_row(stop_reason, ended_at)
 
         self._spec.apply(self._runtime)
         self._print_summary(self._clock.now() - self.started_at)
         return self.stats
+
+    # ── end-of-session summary ───────────────────────────────────────────────
+
+    def _save_session_row(self, stop_reason: str, ended_at: float) -> None:
+        """Persist what THIS run did. Every field has an authoritative source.
+
+        No field is derived from an assumption about how the system is supposed to
+        behave. `windows_frozen / fired / expired` come from the Window Engine's own
+        transition counters rather than from markets x configured windows: that
+        product assumes every window of every market froze, which is false whenever
+        PTB was unavailable or a direction was indeterminable, and it would report
+        activity that never happened.
+
+        Order counts are read back from SQLite filtered on this session's start,
+        because `stats.orders_submitted` counts submission calls while the fill rate
+        must be a statement about rows that exist. Warnings and errors come from the
+        event hub's monotonic counters.
+
+        A field with no real source is written as NULL, never as a zero: zero is a
+        measurement, and an unmeasured field claiming zero warnings reads as a clean
+        run.
+        """
+        orders = self._store.order_tally_since(self.started_at)
+        submitted = orders["submitted"]
+        filled = orders["filled"]
+        self._store.save_runtime_session(
+            {
+                "runtime_session_id": self.runtime_session_id,
+                "mode": self.mode.value,
+                "provider": self._settings.env.twap_provider,
+                "git_commit": git_commit(),
+                "start_reason": self.start_reason,
+                "stop_reason": stop_reason,
+                "started_at": self.started_at,
+                "ended_at": ended_at,
+                "duration_seconds": str(max(ended_at - self.started_at, 0.0)),
+                "markets_seen": self.stats.markets_processed,
+                "windows_frozen": self.windows.windows_frozen,
+                "windows_fired": self.windows.windows_fired,
+                "windows_expired": self.windows.windows_expired,
+                "orders_submitted": submitted,
+                "orders_filled": filled,
+                # NULL, not 0.0, when nothing was submitted: a run that placed no
+                # orders has no fill rate, and "0%" would read as a run that placed
+                # orders and filled none of them.
+                "fill_rate": f"{filled / submitted:.4f}" if submitted else None,
+                "reconnects": self.stats.reconnects,
+                "disconnects": self.stats.disconnects,
+                "recoveries": self.stats.recoveries,
+                "warnings": self._hub.warning_count,
+                "errors": self._hub.error_count,
+                "final_status": self.status,
+            }
+        )
 
     # ── startup verification ─────────────────────────────────────────────────
 

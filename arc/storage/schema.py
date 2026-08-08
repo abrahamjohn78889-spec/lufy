@@ -26,7 +26,7 @@ from arc.errors import SchemaMigrationError
 
 __all__ = ["EXPECTED_TABLES", "SCHEMA_VERSION", "apply_pragmas", "migrate", "schema_version"]
 
-SCHEMA_VERSION: Final[int] = 2
+SCHEMA_VERSION: Final[int] = 3
 
 EXPECTED_TABLES: Final[tuple[str, ...]] = (
     "schema_migrations",
@@ -40,6 +40,7 @@ EXPECTED_TABLES: Final[tuple[str, ...]] = (
     "settlements",
     "candles",
     "runtime_state",
+    "runtime_sessions",
 )
 
 # Tables that must NEVER exist. Asserted by the test suite: their reappearance
@@ -236,7 +237,46 @@ ALTER TABLE intents ADD COLUMN strategy_id    TEXT NOT NULL DEFAULT '';
 ALTER TABLE intents ADD COLUMN close_ts       INTEGER NOT NULL DEFAULT 0;
 """
 
-_MIGRATIONS: Final[dict[int, str]] = {1: _MIGRATION_1, 2: _MIGRATION_2}
+_MIGRATION_3: Final[str] = """
+ALTER TABLE intents ADD COLUMN trace_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE orders ADD COLUMN trace_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE fills ADD COLUMN trace_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE settlements ADD COLUMN trace_id TEXT NOT NULL DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS runtime_sessions (
+    runtime_session_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    git_commit TEXT NOT NULL,
+    start_reason TEXT NOT NULL,
+    stop_reason TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    ended_at REAL NOT NULL,
+    duration_seconds TEXT NOT NULL,
+    markets_seen INTEGER NOT NULL,
+    -- Three separate counters, straight off the Window Engine. There is no
+    -- "windows opened" number in this system: a window is frozen, then fires or
+    -- expires, and each of those is counted at its own transition. There is also
+    -- deliberately no buffer_misses column -- windows_expired conflates "the
+    -- buffer was too wide" with "the window never froze at all", so it cannot
+    -- answer that question and a column named for it would be a guess.
+    windows_frozen INTEGER NOT NULL,
+    windows_fired INTEGER NOT NULL,
+    windows_expired INTEGER NOT NULL,
+    orders_submitted INTEGER NOT NULL,
+    orders_filled INTEGER NOT NULL,
+    fill_rate TEXT,
+    reconnects INTEGER NOT NULL,
+    disconnects INTEGER NOT NULL,
+    recoveries INTEGER NOT NULL,
+    warnings INTEGER NOT NULL,
+    errors INTEGER NOT NULL,
+    final_status TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_sessions_started ON runtime_sessions(started_at);
+"""
+
+_MIGRATIONS: Final[dict[int, str]] = {1: _MIGRATION_1, 2: _MIGRATION_2, 3: _MIGRATION_3}
 
 
 def schema_version(conn: sqlite3.Connection) -> int:

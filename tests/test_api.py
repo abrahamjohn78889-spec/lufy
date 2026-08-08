@@ -37,6 +37,17 @@ from arc.storage.store import Store
 
 _NOW = 1_754_400_000.0
 
+# A3 is enforced as a grep, so the pattern and its single exemption live here as
+# one definition. Two tests read them: the sweep over the package, and the test
+# that pins the exemption narrow. Duplicating the regexes would let someone widen
+# the sweep's copy while the narrowness test kept passing against its own.
+_FORBIDDEN = re.compile(r"auth|jwt|login|session|rbac", re.IGNORECASE)
+_EXEMPT = re.compile(r"runtime[_ ]session(?:[_ ]id)?", re.IGNORECASE)
+
+
+def _forbidden_words_in(line: str) -> bool:
+    return bool(_FORBIDDEN.search(_EXEMPT.sub("", line)))
+
 
 class _Discovery:
     """Metadata that never publishes. The API must render UNAVAILABLE, not guess."""
@@ -129,16 +140,41 @@ class TestNoAccessControlCode:
         Prose counts: a docstring explaining why there is no sign-in is how the
         pattern gets copied back in, and the audit that greps this package cannot
         tell a comment from a code path.
+
+        One exemption, named explicitly rather than bought by loosening the
+        pattern: the runtime session id. It identifies which *run* of the process
+        emitted an event, so a restart cannot be mistaken for one long run. It is
+        not a browser session — no cookie, no credential, no store, no expiry,
+        nothing to sign in to. It is stripped before the grep, which leaves the
+        bare word `session` forbidden everywhere else, prose included.
         """
-        pattern = re.compile(r"auth|jwt|login|session|rbac", re.IGNORECASE)
         package = Path(arc.api.__file__).parent
         for path in sorted(package.glob("*.py")):
             hits = [
                 f"{path.name}:{n}"
                 for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
-                if pattern.search(line)
+                if _forbidden_words_in(line)
             ]
             assert hits == [], hits
+
+    def test_the_session_exemption_is_narrow(self) -> None:
+        """The exemption must not become a way to smuggle sign-in code back in.
+
+        Checked directly, because an exemption nobody tests is an exemption that
+        widens quietly: the next reader who needs `session` to pass reaches for
+        this regex rather than for the reason it exists.
+        """
+        assert not _forbidden_words_in('"runtime_session_id": run.runtime_session_id,')
+        assert not _forbidden_words_in("the runtime session row reports one commit")
+        # Everything the rule is actually for is still caught.
+        assert _forbidden_words_in("session = request.cookies.get('sid')")
+        assert _forbidden_words_in("from starlette.middleware.sessions import SessionMiddleware")
+        assert _forbidden_words_in("def login(user, password):")
+        assert _forbidden_words_in("Authorization: Bearer")
+        assert _forbidden_words_in("jwt.decode(token)")
+        assert _forbidden_words_in("rbac_check(role)")
+        # Including a session word that merely sits next to the exempt phrase.
+        assert _forbidden_words_in("runtime_session_id plus a login form")
 
 
 class TestLoopbackOnly:

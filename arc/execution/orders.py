@@ -138,6 +138,7 @@ def new_order(
     price: Decimal,
     size: Decimal,
     now: float,
+    trace_id: str = "",
 ) -> Order:
     """Build the pre-submission row. State PENDING; nothing has been sent yet."""
     return Order(
@@ -151,6 +152,7 @@ def new_order(
         created_at=now,
         updated_at=now,
         reprice_chain_id=chain_id_for(market_slug, offset_seconds, index),
+        trace_id=trace_id,
     )
 
 
