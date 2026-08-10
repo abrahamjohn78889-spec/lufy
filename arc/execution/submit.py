@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Final
 
-from arc.domain.enums import Direction, MarketPhase, OrderState
+from arc.domain.enums import DEFAULT_ENGINE, Direction, MarketPhase, OrderState
 from arc.domain.models import ExecutionIntent, Order
 from arc.domain.money import dec_str, quantize_size
 from arc.errors import ArcError, MarketPhaseError, PostOnlyWouldCrossError
@@ -126,7 +126,15 @@ class SubmissionPlan:
 class Submitter:
     """Turns one intent into resting passive orders. Idempotent by construction."""
 
-    __slots__ = ("_bucket", "_executor", "_logger", "_minimum", "_size_step", "_store")
+    __slots__ = (
+        "_bucket",
+        "_engine",
+        "_executor",
+        "_logger",
+        "_minimum",
+        "_size_step",
+        "_store",
+    )
 
     def __init__(
         self,
@@ -136,6 +144,7 @@ class Submitter:
         bucket: TokenBucket,
         minimum: Decimal,
         size_step: Decimal = Decimal("1"),
+        engine: str = DEFAULT_ENGINE,
         logger: logging.Logger | None = None,
     ) -> None:
         self._store = store
@@ -143,6 +152,12 @@ class Submitter:
         self._bucket = bucket
         self._minimum = minimum
         self._size_step = size_step
+        # Which engine's orders this submitter creates. Keyword-only and defaulted,
+        # so every existing construction site builds exactly the submitter it built
+        # before this parameter existed. A second engine passes its own name, and
+        # that single value is what makes every order it derives carry an id the
+        # default engine's orders can never collide with.
+        self._engine = engine
         self._logger = logger
 
     def plan(self, intent: ExecutionIntent, count: int, now: float) -> SubmissionPlan:
@@ -165,6 +180,7 @@ class Submitter:
                 size=size,
                 now=now,
                 trace_id=intent.trace_id,
+                engine=self._engine,
             )
             for index, size in enumerate(sizes)
         )
@@ -220,7 +236,7 @@ class Submitter:
 
     async def _place_one(self, order: Order, now: float) -> Order:
         """Persist, then send. Never blind-retries a request of unknown outcome."""
-        existing = self._existing(order.order_id)
+        existing = self._existing(order)
         if existing is not None:
             # Recomputed ids make replay safe: the same submission after a restart
             # resolves to the row already written rather than to a second order.
@@ -276,8 +292,17 @@ class Submitter:
             self._store.save_order(order)
             return order
 
-    def _existing(self, order_id: str) -> Order | None:
-        for row in self._store.orders_for(order_id.split(":", 1)[0]):
-            if row.order_id == order_id:
+    def _existing(self, order: Order) -> Order | None:
+        """The already-persisted row for this order, or None.
+
+        Takes the Order and reads `order.market_slug` directly rather than
+        recovering the slug by splitting `order_id` on its first colon. The engine
+        prefix on a MAJORITY id (`MAJORITY:slug:...`) would make that split yield
+        the engine name, not a market, so the replay guard would silently never
+        find its own row and re-submit an order already placed. The Order already
+        carries the slug; there is no reason to reverse-engineer it from the id.
+        """
+        for row in self._store.orders_for(order.market_slug):
+            if row.order_id == order.order_id:
                 return row
         return None

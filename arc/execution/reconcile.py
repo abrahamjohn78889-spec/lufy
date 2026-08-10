@@ -63,12 +63,30 @@ class Reconciler:
         self._executor = executor
         self._logger = logger
 
-    async def reconcile(self, market_slug: str, now: float) -> ReconcileResult:
-        """Resolve every unknown order for this market against the venue."""
+    async def reconcile(
+        self, market_slug: str, now: float, *, engine: str | None = None
+    ) -> ReconcileResult:
+        """Resolve every unknown order for this market against the venue.
+
+        `engine` scopes the pass to one engine's orders. None means every engine,
+        which is what recovery and the restart path want: a process that just came
+        back holds no in-memory state for EITHER engine, and reconciling only one of
+        them would leave the other's unknown orders unresolved and unwatched.
+
+        An engine-scoped pass filters the local rows AND the orphan set. The orphan
+        filter matters as much as the first: `known` is built from the rows this pass
+        looked at, so without it every order belonging to the other engine would be
+        absent from `known` and reported as an orphan resting at the venue with no
+        local record — a loud, permanent, entirely false alarm that also blocks
+        trading through the orphan gate.
+        """
         venue = await self._executor.open_orders(market_slug)
         by_client = {v.client_order_id: v for v in venue}
-        local = self._store.orders_for(market_slug)
-        known = {o.order_id for o in local}
+        rows = self._store.orders_for(market_slug)
+        local = tuple(o for o in rows if engine is None or o.engine == engine)
+        # Built from every row, never from the filtered subset, so an engine-scoped
+        # pass cannot mistake the other engine's legitimate order for an orphan.
+        known = {o.order_id for o in rows}
 
         resolved: list[str] = []
         still_live: list[str] = []

@@ -136,6 +136,11 @@ class Repricer:
             size=remainder,
             now=now,
             trace_id=order.trace_id,
+            # Carried from the order being replaced, never defaulted. A successor
+            # that lost its owner would be derived under the default owner instead,
+            # so it would take an id belonging to a different chain — colliding with
+            # that chain and escaping every owner-scoped sweep thereafter.
+            engine=order.engine,
         )
         self._store.save_order(successor)
 

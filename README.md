@@ -147,6 +147,55 @@ trade and the system is refusing."
 - **PTB** — the official Price To Beat, fetched from market metadata, frozen once
   per market. Never calculated, estimated, interpolated or refreshed.
 
+## Two engines
+
+TWAP is the engine described above and the only one that trades unless MAJORITY is
+switched on deliberately. **MAJORITY** is a second engine in the same process. It
+shares infrastructure — discovery, the market grid, the book refresh, the Executor
+protocol, the Risk Engine, the wallet, the database, reconciliation, fills,
+repricing, sweeping, the event hub, Telegram, the ledger and recovery — and shares
+no decision state at all: trigger state, selected side, order ownership and every
+configured number are per-engine.
+
+MAJORITY reads **Polymarket outcome-share prices only** — the best resting bid on
+each side. Not BTC/USD, not the PTB, not either TWAP, not the midpoint. It runs on
+a two-step rule:
+
+1. the trigger fires when `max(best_bid(UP), best_bid(DOWN)) >= trigger_price`
+2. the side to buy is determined **afterwards**, from a fresh book read
+
+The side that crossed the trigger is not necessarily the side that gets bought. A
+trigger is an instruction to go and look, not an answer.
+
+MAJORITY is not a strategy and does not touch `arc_twap_locked_buffer`. The
+`Strategy` protocol takes `direction` as an input, which cannot express an engine
+that picks its own side after a trigger, so MAJORITY sits beside the Decision
+Engine rather than inside it.
+
+Both engines write to one `orders` table, one `intents` table, one `fills` table
+and one `settlements` table, separated by an `engine` column. TWAP's identifiers
+are unprefixed and unchanged; MAJORITY's carry a `MAJORITY:` prefix, so no
+historical id was rewritten to make room for the second engine.
+
+**MAJORITY ships OFF.** Every value is blank, `enabled` is false, and the eight
+`ARC_MAJORITY_*` keys in `.env.example` are commented out. Because stored settings
+win over `.env`, turning it on means writing the settings table — the Settings page
+or a database backfill — not adding a line to `.env`. Two guards are worth knowing:
+
+- An execution window longer than **30 s** combined with a **non-zero** buffer
+  fails closed. The engine keeps its configuration, submits nothing, and prints the
+  reason on the deck, because no approved live-price buffer formula exists above
+  that window. A 45 s window with a buffer of 0 is a valid configuration.
+- `MAJORITY_SHARES` below the exchange minimum is **refused, never rounded up.** A
+  share count ARC raised is a position size the operator never chose.
+
+MAJORITY added no route. It surfaces on the existing `/status` and `/settings`
+payloads under a `majority` key — read-only on `/settings`, so the dashboard cannot
+write it — and as an eleventh row on the engine panel. Three outcomes there, never
+folded together: OFF reads Waiting (an engine switched off is not a fault),
+fail-closed reads Warning with its reason, and only a tradable engine reads
+Running.
+
 ## API
 
 Exactly twelve routes plus one WebSocket. No hidden, admin, diagnostic, export or

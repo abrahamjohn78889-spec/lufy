@@ -11,6 +11,7 @@ from enum import StrEnum
 from typing import Final
 
 __all__ = [
+    "DEFAULT_ENGINE",
     "DISPLAYED_ORDER_STATES",
     "LIVE_ORDER_STATES",
     "ORDER_STATE_DISPLAY",
@@ -26,6 +27,20 @@ __all__ = [
     "SettlementSpecStatus",
     "WindowState",
 ]
+
+# The engine that owns a record when nothing says otherwise.
+#
+# It lives HERE, in the domain layer, and deliberately not in arc/execution/. The
+# execution package is forbidden from naming a strategy at all (A17): it places and
+# cancels orders and must not know what any engine's numbers mean, or a strategy
+# change would have to be made in two places. Execution therefore imports this name
+# and compares against it without ever spelling the value.
+#
+# The value is the FIRST engine because it is the only one that has ever written a
+# record: every row in every pre-migration database belongs to it, so reading an old
+# row back as this engine is a statement of fact rather than a default. It is also
+# what keeps derived order ids byte-identical for that engine — see `engine_prefix`.
+DEFAULT_ENGINE: Final[str] = "TWAP"
 
 
 class Mode(StrEnum):

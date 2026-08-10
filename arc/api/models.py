@@ -39,6 +39,7 @@ from arc.domain.timing import (
     slug_for,
 )
 from arc.execution.wallet import WalletSnapshot
+from arc.majority.state import MajorityState
 from arc.notify.telegram import CATEGORIES, CATEGORY_LABELS
 from arc.risk.engine import GATE_ORDER
 from arc.runtime.ledger import ledger_records, ledger_totals
@@ -46,6 +47,9 @@ from arc.strategy.registry import DEFAULT_STRATEGY_ID
 from arc.timefmt import clocks, stamps
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
+    from arc.majority.config import MajorityConfig
+    from arc.majority.state import MajorityMarketState
+    from arc.majority.trigger import BookSnapshot, MajorityVerdict
     from arc.runtime.engine import ArcRuntime
 
 __all__ = [
@@ -53,6 +57,8 @@ __all__ = [
     "derived_payload",
     "engine_status",
     "ledger_payload",
+    "majority_config_payload",
+    "majority_payload",
     "market_payload",
     "preflight",
     "settings_payload",
@@ -87,10 +93,14 @@ def _row(name: str, state: str, detail: str = "") -> dict[str, str]:
 
 
 def engine_status(run: ArcRuntime) -> list[dict[str, str]]:
-    """The ten engine rows. Each is Running / Waiting / Reconnecting / Warning / Error.
+    """The ten named engine rows, then MAJORITY. Each is one of the five states.
 
-    Waiting is a distinct state from Running on purpose: an engine with nothing to
-    do is healthy, and colouring it red would train the operator to ignore red.
+    Running / Waiting / Reconnecting / Warning / Error, and no sixth. Waiting is a
+    distinct state from Running on purpose: an engine with nothing to do is healthy,
+    and colouring it red would train the operator to ignore red.
+
+    The ten come first and in a fixed order because a contract test names them in
+    that order. MAJORITY is appended rather than inserted for the same reason.
     """
     health = run.health()
     market = run.rotator.current
@@ -117,7 +127,33 @@ def engine_status(run: ArcRuntime) -> list[dict[str, str]]:
         _row("RPC", "Running" if run.venue_client is not None else "Waiting",
              "" if run.venue_client is not None else "V1 uses no RPC"),
         _row("Wallet", "Running" if run.venue_client is not None else "Waiting"),
+        # The eleventh row, AFTER the ten named engines rather than among them.
+        # MAJORITY is a second engine in the same process, not a rename of one of
+        # theirs, and inserting it into the named ten would make the deck's engine
+        # list disagree with the contract that fixes those ten by name.
+        _majority_row(run),
     ] + ([] if health.healthy else [_row("Runtime", "Warning", health.detail)])
+
+
+def _majority_row(run: ArcRuntime) -> dict[str, str]:
+    """MAJORITY's one line on the engine panel.
+
+    Three outcomes, never folded together. OFF is Waiting, because an engine the
+    operator switched off is not a fault and painting it red would train them to
+    ignore red. Fail-closed is Warning and prints the reason, because that engine
+    WAS asked to run and refused. Only a tradable engine reads Running.
+    """
+    config = run.majority.config
+    if config.disable_reason:
+        return _row("MAJORITY Engine", "Warning", config.disable_reason)
+    if not config.enabled:
+        return _row("MAJORITY Engine", "Waiting", "engine off")
+    state = run.majority_state_for(run.rotator.current.slug) if run.rotator.current else None
+    return _row(
+        "MAJORITY Engine",
+        "Running",
+        "no market open" if state is None else state.state.value,
+    )
 
 
 # ── preflight ────────────────────────────────────────────────────────────────
@@ -378,6 +414,12 @@ def settings_payload(run: ArcRuntime) -> dict[str, Any]:
         "strategy": DEFAULT_STRATEGY_ID,
         "strategy_editable": False,
         "provider": run.settings.env.twap_provider,
+        # MAJORITY's configuration, read-only on this page. `_EDITABLE` in the routes
+        # bounds what POST /settings may change and none of the eight majority_* keys
+        # are in it, so shipping them here reports the running configuration without
+        # implying the page can edit it. Read off the engine, not `settings.majority`:
+        # the engine holds the config that is actually in force.
+        "majority": majority_config_payload(run.majority.config),
         # Presentation, shipped rather than hardcoded in the markup so a theme or a
         # repaint cadence set in .env is the one the browser actually uses.
         "theme": run.settings.env.theme,
@@ -598,6 +640,188 @@ def derived_payload(run: ArcRuntime, market: MarketInstance | None) -> dict[str,
     }
 
 
+# ── MAJORITY ─────────────────────────────────────────────────────────────────
+
+
+def _book_payload(snapshot: BookSnapshot | None) -> dict[str, Any] | None:
+    """One book read, or None when that read never happened.
+
+    None rather than a row of dashes: a market whose trigger never fired has no
+    trigger snapshot, and printing an empty one would claim a read was taken.
+
+    A missing side stays None and is never rendered as zero. An outcome nobody is
+    bidding on and an outcome bid at zero compare identically once both are 0, and
+    the whole majority determination is a comparison of these two numbers.
+    """
+    if snapshot is None:
+        return None
+    return {
+        "best_bid_up": _s(snapshot.best_bid_up),
+        "best_bid_down": _s(snapshot.best_bid_down),
+        "read_at": snapshot.read_at,
+        "fresh": snapshot.fresh,
+        "complete": snapshot.complete,
+        "usable": snapshot.usable,
+        "describe": snapshot.describe(),
+    }
+
+
+def _verdict_payload(verdict: MajorityVerdict | None) -> dict[str, Any] | None:
+    """The determination and the exact bids it was made from, or None.
+
+    The bids ride along on the verdict rather than being re-read here for the same
+    reason the engine carries them: a later read sees a book that has moved, so a
+    recomputed pair would not be the pair the side was chosen from.
+    """
+    if verdict is None:
+        return None
+    direction = verdict.direction
+    return {
+        "outcome": verdict.outcome.value,
+        "best_bid_up": _s(verdict.best_bid_up),
+        "best_bid_down": _s(verdict.best_bid_down),
+        "tradable": verdict.tradable,
+        # INDETERMINATE has no direction and is never tie-broken into one.
+        "direction": None if direction is None else direction.value,
+        "reason": verdict.reason,
+    }
+
+
+def majority_config_payload(config: MajorityConfig) -> dict[str, Any]:
+    """MAJORITY's configuration as the operator set it.
+
+    `enabled` and `tradable` are both shipped because they are different facts. An
+    operator who never switched MAJORITY on and an operator whose configuration was
+    rejected must not read the same on the deck, and `disable_reason` is the channel
+    that says which.
+
+    Multi-window: every configured window is rendered as its own entry. The legacy
+    `execution_window_seconds` / `buffer` / `trigger_price` fields are NOT shipped
+    — a multi-window configuration has no single value for them, and shipping a
+    synthesised one would be inventing a number the operator never chose.
+    """
+    windows = []
+    for window in config.windows_by_offset:
+        windows.append(
+            {
+                "execution_window_seconds": window.execution_window_seconds,
+                "buffer": dec_str(window.buffer),
+                "trigger_price": dec_str(window.trigger_price),
+                "target_limit_price": dec_str(window.target_limit_price),
+                "shares": dec_str(window.shares),
+                "entry_price_min": dec_str(window.entry_price_min),
+                "entry_price_max": dec_str(window.entry_price_max),
+                "disable_reason": window.disable_reason,
+                "tradable": window.tradable,
+                "warnings": list(window.warnings),
+            }
+        )
+    return {
+        "enabled": config.enabled,
+        "tradable": config.tradable,
+        "disable_reason": config.disable_reason,
+        "windows": windows,
+        "warnings": list(config.warnings),
+    }
+
+
+def majority_window_state_payload(state: MajorityMarketState) -> dict[str, Any]:
+    """One window's per-market state, ready to render."""
+    return {
+        "state": state.state.value,
+        "terminal": state.terminal,
+        "triggered": state.triggered,
+        "triggered_at": state.triggered_at,
+        "side_locked": state.side_locked,
+        "selected_side": (
+            None if state.selected_side is None else state.selected_side.value
+        ),
+        "side_selected_at": state.side_selected_at,
+        "trigger_snapshot": _book_payload(state.trigger_snapshot),
+        "decision_snapshot": _book_payload(state.decision_snapshot),
+        "verdict": _verdict_payload(state.verdict),
+        "no_trade_reason": state.no_trade_reason,
+        "close_ts": state.close_ts,
+        "describe": state.describe(),
+    }
+
+
+def majority_payload(run: ArcRuntime, market: MarketInstance | None) -> dict[str, Any]:
+    """MAJORITY's own configuration and its state for the current market.
+
+    Read off the one engine the runtime owns, never a copy. A dashboard holding its
+    own MajorityMarketState would be a second answer to "which side is locked", and
+    the side lock exists precisely because there must only ever be one.
+
+    `state` is None when MAJORITY is not tracking this market at all — a market it
+    never opened and a market it opened with the engine off are different facts, and
+    a synthesised OFF row would print the second when the first is true.
+
+    Multi-window: state is keyed by window. The single-`state` field above is the
+    state of the first configured window (or None when there are none), kept so a
+    single-window dashboard keeps working unchanged; `states_by_window` is the full
+    per-window map.
+    """
+    config = run.majority.config
+    states_by_window: dict[str, dict[str, Any]] = {}
+    first_state = None
+    if market is not None:
+        for state in run.majority.states_for_market(market.slug):
+            states_by_window[str(state.execution_window_seconds)] = (
+                majority_window_state_payload(state)
+            )
+        windows = config.windows_by_offset
+        if windows:
+            first_state = run.majority.state_for(market.slug, windows[0].execution_window_seconds)
+    # When MAJORITY is OFF (config disabled or fail-closed) and a market is open
+    # but has no tracked state, the deck's single-`state` field still reports OFF
+    # rather than None — a None would render as a blank that looks like "no data",
+    # while OFF is the engine admitting it has decided not to trade this market.
+    # When no market is open, state is None so the dashboard can render its idle
+    # panel.
+    flat_state: str | None
+    if first_state is not None:
+        flat_state = first_state.state.value
+    elif market is not None and not config.tradable:
+        flat_state = "OFF"
+    else:
+        flat_state = None
+    return {
+        "config": majority_config_payload(config),
+        "market_slug": None if market is None else market.slug,
+        # The engine's own sequence, verbatim. Nothing here is derived from the
+        # order rows: MAJORITY's state machine already folded them in, and a second
+        # reading would eventually disagree with the engine that acts on the first.
+        "state": flat_state,
+        "states": [s.value for s in MajorityState],
+        "terminal": None if first_state is None else first_state.terminal,
+        "triggered": None if first_state is None else first_state.triggered,
+        "triggered_at": None if first_state is None else first_state.triggered_at,
+        "side_locked": None if first_state is None else first_state.side_locked,
+        "selected_side": (
+            None
+            if first_state is None or first_state.selected_side is None
+            else first_state.selected_side.value
+        ),
+        "side_selected_at": None if first_state is None else first_state.side_selected_at,
+        # Both books, because they are different evidence: the first explains why the
+        # sequence started, the second explains which side was bought. One field
+        # would make the two-step rule unauditable after the fact.
+        "trigger_snapshot": (
+            None if first_state is None else _book_payload(first_state.trigger_snapshot)
+        ),
+        "decision_snapshot": (
+            None if first_state is None else _book_payload(first_state.decision_snapshot)
+        ),
+        "verdict": None if first_state is None else _verdict_payload(first_state.verdict),
+        "no_trade_reason": "" if first_state is None else first_state.no_trade_reason,
+        "close_ts": None if first_state is None else first_state.close_ts,
+        "describe": None if first_state is None else first_state.describe(),
+        # Multi-window: every window's state for this market, keyed by offset string.
+        "states_by_window": states_by_window,
+    }
+
+
 # ── the one status document ──────────────────────────────────────────────────
 
 
@@ -676,6 +900,11 @@ async def status_payload(run: ArcRuntime, now: float) -> dict[str, Any]:
         # inferred them would be a second lifecycle implementation.
         "derived": derived_payload(run, run.rotator.current),
         "execution": execution_payload(run),
+        # MAJORITY's own section, beside TWAP's rather than merged into it. The two
+        # engines share nothing of trigger state, selected side or configuration, and
+        # a single combined "current side" field would be a place they could appear
+        # to agree while holding different answers.
+        "majority": majority_payload(run, run.rotator.current),
         # Through the runtime, not the reader directly: the runtime is what notices a
         # CONNECTED -> DISCONNECTED transition and logs it once. Reading the reader
         # here would render the change and report it to nobody.

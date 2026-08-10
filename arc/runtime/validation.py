@@ -151,27 +151,41 @@ def _duplicate_intents(store: Store, slugs: tuple[str, ...]) -> list[str]:
     """
     duplicates = []
     for slug in slugs:
-        seen: set[int] = set()
-        for intent in store.intents_for(slug):
-            if intent.offset_seconds in seen:
-                duplicates.append(f"{slug}@{intent.offset_seconds}s")
-            seen.add(intent.offset_seconds)
+        # Keyed by (engine, offset), not by offset alone. Two engines are permitted
+        # one intent each on the same window — that is the whole point of widening
+        # the database constraint — so keying on the offset by itself would report
+        # correct two-engine operation as a double submission on every single
+        # window, and a criterion that is always red stops being read at all.
+        seen: set[tuple[str, int]] = set()
+        for engine, offset in store.intent_keys(slug):
+            if (engine, offset) in seen:
+                duplicates.append(f"{slug}@{offset}s [{engine}]")
+            seen.add((engine, offset))
     return duplicates
 
 
 def _duplicate_live_orders(store: Store, slugs: tuple[str, ...]) -> list[str]:
-    """Two simultaneously live orders on one window.
+    """Two simultaneously live orders on one window, FOR ONE ENGINE.
 
     A reprice is cancel-then-place, so several order rows per window are correct;
     two of them LIVE at once is the double-submission this criterion forbids.
+
+    Counted per engine for the same reason the intents above are: one TWAP order
+    and one MAJORITY order resting on the same window are two engines each holding
+    their own single approved position, not one engine holding two.
     """
     offenders: list[str] = []
     for slug in slugs:
-        live: dict[int, int] = {}
+        live: dict[tuple[str, int], int] = {}
         for order in store.orders_for(slug):
             if order.is_live:
-                live[order.offset_seconds] = live.get(order.offset_seconds, 0) + 1
-        offenders.extend(f"{slug}@{k}s x{v}" for k, v in live.items() if v > 1)
+                key = (order.engine, order.offset_seconds)
+                live[key] = live.get(key, 0) + 1
+        offenders.extend(
+            f"{slug}@{offset}s [{engine}] x{count}"
+            for (engine, offset), count in live.items()
+            if count > 1
+        )
     return offenders
 
 
@@ -193,12 +207,18 @@ def _duplicate_fills(store: Store, slugs: tuple[str, ...]) -> list[str]:
 
 
 def _orphan_orders(store: Store, slugs: tuple[str, ...]) -> list[str]:
-    """An order for a window that has no intent. The write-before-act violation."""
+    """An order for a window that has no intent. The write-before-act violation.
+
+    Authorisation is matched per ENGINE. A TWAP intent does not authorise a MAJORITY
+    order and never did: matching on the offset alone would let one engine's
+    persisted intent silently vouch for the other engine's order, which is exactly
+    the unauthorised submission this criterion exists to catch.
+    """
     offenders = []
     for slug in slugs:
-        authorised = {i.offset_seconds for i in store.intents_for(slug)}
+        authorised = set(store.intent_keys(slug))
         for order in store.orders_for(slug):
-            if order.offset_seconds not in authorised:
+            if (order.engine, order.offset_seconds) not in authorised:
                 offenders.append(order.order_id)
     return offenders
 

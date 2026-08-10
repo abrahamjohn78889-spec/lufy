@@ -22,6 +22,7 @@ from decimal import Decimal
 from typing import Final
 
 from arc.domain.enums import (
+    DEFAULT_ENGINE,
     LIVE_ORDER_STATES,
     TERMINAL_ORDER_STATES,
     Direction,
@@ -31,6 +32,7 @@ from arc.domain.models import Order
 from arc.errors import ArcError
 
 __all__ = [
+    "DEFAULT_ENGINE",
     "LEGAL_ORDER_TRANSITIONS",
     "OrderTransitionError",
     "apply_fill",
@@ -99,19 +101,49 @@ def is_terminal(state: OrderState) -> bool:
     return state in TERMINAL_ORDER_STATES
 
 
-def chain_id_for(market_slug: str, offset_seconds: int, index: int) -> str:
+def _engine_prefix(engine: str) -> str:
+    """The identity prefix for an engine. EMPTY for the default engine, always.
+
+    The default engine gets no prefix so every id it has ever derived stays
+    byte-identical: the ids are the primary key of the orders table and the reprice
+    chains inside it, so a prefix added to them would orphan every historical row
+    from the chain it belongs to. A second engine cannot share that silence — two
+    engines deriving `slug:45:0:0` would collide on the primary key, and the later
+    save would overwrite the earlier engine's order.
+    """
+    return "" if engine == DEFAULT_ENGINE else f"{engine}:"
+
+
+def chain_id_for(
+    market_slug: str, offset_seconds: int, index: int, engine: str = DEFAULT_ENGINE
+) -> str:
     """Stable identity of one submission slot across its whole reprice chain.
 
     A cancel-then-place reprice produces several venue orders for one logical
     submission. They share this id so filled quantity can be summed across the
     chain rather than per order (hazard H4).
+
+    `engine` is LAST and defaults to the default engine, so every existing call —
+    positional or keyword — produces exactly the string it produced before this
+    parameter existed.
     """
-    return f"{market_slug}:{offset_seconds}:{index}"
+    return f"{_engine_prefix(engine)}{market_slug}:{offset_seconds}:{index}"
 
 
-def order_id_for(market_slug: str, offset_seconds: int, index: int, generation: int) -> str:
-    """The client order id. Pure function of its inputs, stable across restarts."""
-    return f"{chain_id_for(market_slug, offset_seconds, index)}:{generation}"
+def order_id_for(
+    market_slug: str,
+    offset_seconds: int,
+    index: int,
+    generation: int,
+    engine: str = DEFAULT_ENGINE,
+) -> str:
+    """The client order id. Pure function of its inputs, stable across restarts.
+
+    The generation stays the RIGHTMOST component for both engines. `next_generation_id`
+    and the repricer's index lookup both read from the right, so prefixing the engine
+    on the left leaves the whole reprice chain working untouched.
+    """
+    return f"{chain_id_for(market_slug, offset_seconds, index, engine)}:{generation}"
 
 
 def next_generation_id(order: Order) -> str:
@@ -139,10 +171,18 @@ def new_order(
     size: Decimal,
     now: float,
     trace_id: str = "",
+    engine: str = DEFAULT_ENGINE,
 ) -> Order:
-    """Build the pre-submission row. State PENDING; nothing has been sent yet."""
+    """Build the pre-submission row. State PENDING; nothing has been sent yet.
+
+    `engine` is written onto the row AND into both derived ids, so ownership is
+    recorded in two independent places: the column every shared execution operation
+    filters on, and the primary key itself. Either alone would be enough to tell the
+    two engines apart; both together mean a row cannot be misattributed by a query
+    that forgot the filter, because its id already says which engine derived it.
+    """
     return Order(
-        order_id=order_id_for(market_slug, offset_seconds, index, generation),
+        order_id=order_id_for(market_slug, offset_seconds, index, generation, engine),
         market_slug=market_slug,
         offset_seconds=offset_seconds,
         direction=direction,
@@ -151,8 +191,9 @@ def new_order(
         state=OrderState.PENDING,
         created_at=now,
         updated_at=now,
-        reprice_chain_id=chain_id_for(market_slug, offset_seconds, index),
+        reprice_chain_id=chain_id_for(market_slug, offset_seconds, index, engine),
         trace_id=trace_id,
+        engine=engine,
     )
 
 

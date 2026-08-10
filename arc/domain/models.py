@@ -402,6 +402,10 @@ class Fill:
     price: Decimal
     ts: float
     trace_id: str = ""
+    # The engine whose order this fill executed against. Carried on the fill itself
+    # rather than looked up through the order every time, so a ledger row or a
+    # Telegram line can name the engine without a second query that could miss.
+    engine: str = "TWAP"
 
 
 @dataclass(slots=True)
@@ -422,6 +426,11 @@ class Order:
     reprice_chain_id: str = ""
     rejection_reason: str = ""
     trace_id: str = ""
+    # Which engine owns this order. THE ownership field for every shared execution
+    # operation: an engine-scoped sweep or reconciliation filters on it, so a
+    # MAJORITY pass can never retract a TWAP order and vice versa. Defaults to TWAP
+    # because nothing but TWAP has ever written an order row.
+    engine: str = "TWAP"
 
     @property
     def is_live(self) -> bool:
@@ -457,6 +466,10 @@ class Settlement:
     pnl: Decimal = _ZERO
     divergence_logged: bool = False
     trace_id: str = ""
+    # Which engine's position this settlement resolves. A market can hold both a
+    # TWAP and a MAJORITY position simultaneously, so the P/L attributed to each
+    # engine must be separable — one row per engine, not one row per market.
+    engine: str = "TWAP"
 
 
 @dataclass(slots=True)

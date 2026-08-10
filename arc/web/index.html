@@ -192,6 +192,44 @@
       </dl>
     </section>
 
+    <!-- The SECOND engine. Its own panel rather than extra rows on the TWAP panels:
+         MAJORITY shares this process and nothing else with TWAP — not its trigger,
+         not its selected side, not its orders — and interleaving the two would
+         invite reading one engine's number as the other's.
+
+         Both books are shown because the two-step rule is the whole point. The
+         trigger read is why the sequence started; the DECISION read is what the
+         side was chosen from, and it is a different read taken at a later instant.
+         A panel showing one book would make the operator believe the side came
+         from the bids that crossed the threshold. -->
+    <section class="panel span2">
+      <h2>MAJORITY Engine <span class="pill" data-f="majority.state">—</span></h2>
+      <dl class="kv">
+        <dt>Enabled</dt><dd data-f="majority.config.enabled">—</dd>
+        <dt>Tradable</dt><dd data-f="majority.config.tradable">—</dd>
+        <dt>Disable Reason</dt><dd data-f="majority.config.disable_reason">—</dd>
+        <dt>Market</dt><dd data-f="majority.market_slug">—</dd>
+      </dl>
+      <table class="stream" id="majority-windows">
+        <thead><tr>
+          <th>Window</th><th>Trigger</th><th>Target</th><th>Shares</th>
+          <th>Band</th><th>State</th><th>Side</th><th>Verdict</th>
+          <th>Trigger UP</th><th>Trigger DOWN</th>
+          <th>Decision UP</th><th>Decision DOWN</th>
+        </tr></thead>
+        <tbody>
+          <!-- one row per configured MAJORITY window, populated from
+               majority.config.windows (the configuration) and
+               majority.states_by_window (the live state). An empty table means
+               MAJORITY has no windows configured; the panel still reads as
+               honest OFF rather than a blank error. -->
+        </tbody>
+      </table>
+      <p class="note">The side is chosen from the DECISION book, which is a second
+        read taken after the trigger fired. The side that crossed the trigger is not
+        necessarily the side bought. INDETERMINATE is never tie-broken.</p>
+    </section>
+
     <section class="panel span2">
       <h2>Provider</h2>
       <dl class="kv">

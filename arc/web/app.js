@@ -92,6 +92,7 @@ function paint() {
   paintPreflight();
   paintLoe();
   paintWindows();
+  paintMajorityWindows();
   paintChips();
   paintRecoverySteps();
   paintHealth();
@@ -142,6 +143,36 @@ function paintPreflight() {
   }));
   const pill = $('.pill[data-f="preflight.result"]');
   if (pill) pill.className = `pill ${state.preflight.result.toLowerCase()}`;
+}
+
+// One row per configured MAJORITY window. Renders the configuration side by side
+// with the live state for the current market. A market with no MAJORITY windows
+// gets an empty body — the table headers are still there as a reminder that the
+// engine exists and is currently configured to do nothing.
+function paintMajorityWindows() {
+  const tbody = $('#majority-windows tbody');
+  if (!tbody) return;
+  const cfg = state.majority?.config;
+  const states = state.majority?.states_by_window ?? {};
+  const windows = cfg?.windows ?? [];
+  tbody.replaceChildren(...windows.map((w) => {
+    const live = states[String(w.execution_window_seconds)] ?? {};
+    const row = document.createElement('tr');
+    row.innerHTML =
+      `<td>${w.execution_window_seconds}s</td>` +
+      `<td>${w.trigger_price}</td>` +
+      `<td>${w.target_limit_price}</td>` +
+      `<td>${w.shares}</td>` +
+      `<td>${w.entry_price_min}–${w.entry_price_max}</td>` +
+      `<td>${live.state ?? '—'}</td>` +
+      `<td>${live.selected_side ?? '—'}</td>` +
+      `<td>${live.verdict?.outcome ?? '—'}</td>` +
+      `<td>${live.trigger_snapshot?.best_bid_up ?? '—'}</td>` +
+      `<td>${live.trigger_snapshot?.best_bid_down ?? '—'}</td>` +
+      `<td>${live.decision_snapshot?.best_bid_up ?? '—'}</td>` +
+      `<td>${live.decision_snapshot?.best_bid_down ?? '—'}</td>`;
+    return row;
+  }));
 }
 
 // The stage comes from the backend. This only highlights it.
@@ -268,6 +299,24 @@ function paintAnalytics() {
 }
 
 let settingsBuilt = false;
+let majorityWindowsBuilt = false;
+
+const MAJORITY_PRESETS = [3, 5, 7, 10, 15, 25, 40, 60, 90, 120];
+const MAJORITY_WINDOW_KEYS = ['buffer', 'trigger_price', 'target_limit_price', 'shares', 'entry_price_min', 'entry_price_max'];
+
+function _majorityWindowRow(win, defaults) {
+  const wrap = document.createElement('div');
+  wrap.className = 'majority-window-row';
+  wrap.innerHTML = `<span class="mwin-label">${win}s</span>`;
+  MAJORITY_WINDOW_KEYS.forEach((key) => {
+    const val = defaults[key] ?? '';
+    const label = document.createElement('label');
+    label.className = 'field';
+    label.innerHTML = `<span>${key}</span><input name="majority_w_${win}_${key}" value="${val}">`;
+    wrap.appendChild(label);
+  });
+  return wrap;
+}
 
 function paintSettings() {
   const s = state.settings;
@@ -276,19 +325,144 @@ function paintSettings() {
 
   if (!settingsBuilt) {
     const host = $('#editable');
-    const fields = [
+
+    // ── TWAP ───────────────────────────────────────────────────────────────
+    const twapFields = [
       ['buffers', 'Buffers (offset=value, comma separated)',
         Object.entries(s.buffers).map(([k, v]) => `${k}=${v}`).join(',')],
       ['execution_windows', 'Enabled Windows', s.execution_windows.join(',')],
       ['submission_count', 'Submission Count', s.submission_count],
       ['position_notional_usd', 'Position Size (USD)', s.position_notional_usd],
     ];
-    host.replaceChildren(...fields.map(([key, label, value]) => {
-      const wrap = document.createElement('label');
-      wrap.className = 'field';
-      wrap.innerHTML = `<span>${label}</span><input name="${key}" value="${value}">`;
-      return wrap;
-    }));
+
+    // ── MAJORITY ───────────────────────────────────────────────────────────
+    const mcfg = s.majority_config || {};
+    const mwinKeys = MAJORITY_WINDOW_KEYS;
+
+    // scalar fields
+    const majorityScalarFields = [
+      ['majority_buffer',       'Buffer %',            mcfg.buffer ?? ''],
+      ['majority_trigger_price','Trigger Price',       mcfg.trigger_price ?? ''],
+      ['majority_target_limit_price', 'Target Limit Price', mcfg.target_limit_price ?? ''],
+      ['majority_shares',       'Shares',               mcfg.shares ?? ''],
+      ['majority_entry_price_min', 'Entry Price Min',  mcfg.entry_price_min ?? ''],
+      ['majority_entry_price_max', 'Entry Price Max',  mcfg.entry_price_max ?? ''],
+    ];
+
+    const windows = mcfg.windows || [];
+    // Build window-lookup: keyed by execution_window_seconds → window config object.
+    const wVals = {};
+    for (const w of windows) { wVals[w.window] = w; }
+    const enabledWins = windows.map((w) => w.window);
+    const winDefaults = windows[0] || {};
+
+    // preset bar
+    const presetsDiv = document.createElement('div');
+    presetsDiv.id = 'majority-presets';
+    presetsDiv.innerHTML = '<span class="preset-label">Windows</span>';
+    MAJORITY_PRESETS.forEach((w) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `preset-btn${enabledWins.includes(w) ? ' active' : ''}`;
+      btn.textContent = w;
+      btn.dataset.window = w;
+      btn.addEventListener('click', () => {
+        const cur = ($('#majority_windows_input') || {}).value
+          ? $('#majority_windows_input').value.split(',').map(Number).filter(Boolean)
+          : enabledWins;
+        if (cur.includes(w)) {
+          // remove
+          const next = cur.filter((x) => x !== w);
+          $('#majority_windows_input').value = next.join(',');
+          btn.classList.remove('active');
+        } else {
+          // add (insert sorted)
+          cur.push(w); cur.sort((a, b) => a - b);
+          $('#majority_windows_input').value = cur.join(',');
+          btn.classList.add('active');
+        }
+        // rebuild per-window rows
+        _rebuildMajorityWindowRows();
+      });
+      presetsDiv.appendChild(btn);
+    });
+    // custom input
+    const customInput = document.createElement('input');
+    customInput.id = 'majority_windows_input';
+    customInput.name = 'majority_execution_windows';
+    customInput.placeholder = '3,15,60…';
+    customInput.value = enabledWins.join(',') || '';
+    customInput.addEventListener('input', () => {
+      MAJORITY_PRESETS.forEach((w) => {
+        const btn = presetsDiv.querySelector(`[data-window="${w}"]`);
+        if (btn) btn.classList.toggle('active', customInput.value.split(',').map(Number).includes(w));
+      });
+      _rebuildMajorityWindowRows();
+    });
+    presetsDiv.appendChild(customInput);
+
+    // majority_enabled: checkbox + hidden so unchecked submits "false", not nothing
+    const enabledHidden = document.createElement('input');
+    enabledHidden.type = 'hidden';
+    enabledHidden.name = 'majority_enabled';
+    enabledHidden.value = mcfg.enabled ? 'true' : 'false';
+    const enabledCb = document.createElement('input');
+    enabledCb.type = 'checkbox';
+    enabledCb.name = 'majority_enabled';
+    enabledCb.value = 'true';
+    if (mcfg.enabled) enabledCb.checked = true;
+    enabledCb.addEventListener('change', () => {
+      enabledHidden.value = enabledCb.checked ? 'true' : 'false';
+    });
+    const enabledWrap = document.createElement('label');
+    enabledWrap.className = 'field';
+    enabledWrap.appendChild(enabledHidden);
+    enabledWrap.appendChild(enabledCb);
+    const enabledSpan = document.createElement('span');
+    enabledSpan.textContent = 'Enabled';
+    enabledWrap.appendChild(enabledSpan);
+
+    const scalarHost = document.createElement('div');
+    scalarHost.id = 'majority-scalars';
+    scalarHost.replaceChildren(
+      enabledWrap,
+      ...majorityScalarFields.map(([key, label, value]) => {
+        const wrap = document.createElement('label');
+        wrap.className = 'field';
+        wrap.innerHTML = `<span>${label}</span><input name="${key}" value="${value}">`;
+        return wrap;
+      }),
+      presetsDiv,
+    );
+
+    const windowRowsHost = document.createElement('div');
+    windowRowsHost.id = 'majority-window-rows';
+
+    function _rebuildMajorityWindowRows() {
+      const wins = (customInput.value || '').split(',').map(Number).filter(Boolean);
+      const wVals2 = {};
+      for (const w of wins) { wVals2[w] = wVals[w] || {}; }
+      windowRowsHost.replaceChildren(
+        ...wins.map((w) => _majorityWindowRow(w, wVals2[w] || {})),
+      );
+    }
+    _rebuildMajorityWindowRows();
+
+    // section headers
+    const twapHdr = document.createElement('h3'); twapHdr.textContent = 'TWAP';
+    const majorityHdr = document.createElement('h3'); majorityHdr.textContent = 'MAJORITY';
+    host.replaceChildren(
+      twapHdr,
+      ...twapFields.map(([key, label, value]) => {
+        const wrap = document.createElement('label');
+        wrap.className = 'field';
+        wrap.innerHTML = `<span>${label}</span><input name="${key}" value="${value}">`;
+        return wrap;
+      }),
+      majorityHdr,
+      scalarHost,
+      windowRowsHost,
+    );
 
     const notify = $('#notify');
     notify.replaceChildren(...Object.keys(s.notifications).map((name) => {

@@ -306,6 +306,28 @@ a { color: var(--accent); }
 .toggles { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 4px; }
 .toggle { display: flex; align-items: center; gap: 6px; }
 
+/* ── MAJORITY settings ─────────────────────────────────────────────────────── */
+
+#majority-presets { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-bottom: 8px; }
+.preset-label { color: var(--dim); font-size: 11px; margin-right: 4px; }
+.preset-btn {
+  padding: 2px 8px; font-size: 11px; border-radius: 3px;
+  border: 1px solid var(--line); background: transparent; color: var(--dim);
+  cursor: pointer;
+}
+.preset-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(0,210,255,0.08); }
+#majority_windows_input { width: 100px; margin-left: 6px; }
+
+#majority-scalars .field { margin-bottom: 6px; }
+#majority-scalars h3 { color: var(--accent); font-size: 12px; margin: 8px 0 4px; }
+
+.majority-window-row {
+  display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px;
+  padding: 8px 0; border-top: 1px solid var(--line); margin-top: 4px;
+}
+.mwin-label { font-size: 11px; color: var(--dim); min-width: 36px; padding-top: 6px; }
+.majority-window-row .field { flex: 1 1 120px; margin-bottom: 0; }
+
 /* ── backtest ─────────────────────────────────────────────────────────────── */
 
 /* Not a dialog and with no close control: the warning cannot be dismissed

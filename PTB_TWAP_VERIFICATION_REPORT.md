@@ -486,3 +486,52 @@ been verified, which is precisely why `CHAINLINK` raises instead of connecting.
 All six are enforced the same way: `trading_enabled = False` with reason
 `TRADING_DISABLED_SPEC_UNVERIFIED`, denied at the single order-submission boundary in the
 Risk Engine, with everything else in the process still running and still recording.
+
+---
+
+## 14. Video-review evidence (observational, CLOSED)
+
+Two screen recordings of the live Polymarket UI were reviewed frame by frame against a
+single BTC Up/Down 5-minute market (`btc-updown-5m-1786220100`, the 4:15–4:20 PM ET
+window on 2026-08-08). This section records what the **video** established. It is
+**evidence only**: nothing here changed, or is permitted to change, any trading, TWAP,
+settlement, PTB, direction, trigger, buffer, Window Engine, Decision Engine, Risk Engine
+or Limit Order Engine logic. No code was modified on the basis of this recording.
+
+### The distinction this section must not blur
+
+**`Current Price` ≠ `Settlement 30 s TWAP` ≠ `Final Price`.** These are three different
+quantities and the video only ever shows the first. The Polymarket UI's live "Current
+Price" ticker is a spot readout; the venue settles on a 30-second mean over the settlement
+window (`settlement_twap`, §7); the recorded outcome is a separate `finalPrice` field
+written to Gamma metadata ~25 s after close (§5, §12). A spot price sitting below PTB is
+consistent with a DOWN settlement but is **not** the settlement value and is **not** the
+final result.
+
+### Second review — final 30-second settlement window (directly observed)
+
+| Observation | Value | Basis |
+|---|---|---|
+| Settlement window (last 30 s before close) | Directly observed, frame by frame | Video |
+| Price To Beat (PTB) | `$65,032.01`, frozen for the entire window | Read from UI |
+| Current Price across the window | ≈ `$65,024.87`–`$65,024.92` (~`$7.1` below PTB) | Read from UI |
+| Visible CLOB pricing | Down favoured at ≈ `99¢`; Up collapsed to `1–2¢` | Read from UI |
+| Direction the video supports | **DOWN** (strongly) | Inferred from spot + book |
+
+**Marked `UNVERIFIED FROM VIDEO`:**
+
+- **The exact Chainlink 30-second settlement TWAP value.** The UI never renders it; the
+  `~$7.1`-below-PTB figure is the *spot* Current Price, not the settlement mean. The TWAP
+  value cannot be read off this recording.
+- **The explicit final settlement banner / resolved result.** The recording ends at the
+  close tick without displaying a settled outcome. A DOWN resolution is *inferred* from the
+  flat spot line and the persistent ~`$7` gap; it was **not** directly observed as a
+  settlement banner. Authoritative confirmation would be the Gamma `finalPrice` for this
+  market or the venue's own resolution.
+
+### Status
+
+**CLOSED / COMPLETE.** This review is no longer pending production verification. The only
+items from this particular recording that remain unverified are the two named above — the
+exact settlement TWAP value and the explicit final settlement result — and both are
+unverifiable *from video by construction*, not open work items against the code.

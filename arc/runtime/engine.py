@@ -61,7 +61,7 @@ from arc.clock import Clock, DriftMonitor, DriftStatus
 from arc.config import Settings
 from arc.decision.engine import DecisionEngine, RuntimeHealth
 from arc.decision.quota import QuotaLedger
-from arc.domain.enums import Direction, MarketPhase, Mode
+from arc.domain.enums import DEFAULT_ENGINE, Direction, MarketPhase, Mode
 from arc.domain.models import MarketInstance, Order
 from arc.domain.money import dec_str
 from arc.domain.timing import MARKET_DURATION_SECONDS, slug_for
@@ -80,6 +80,9 @@ from arc.execution.wallet import (
 )
 from arc.execution.wallet import WalletReader, WalletSnapshot, build_wallet
 from arc.logging_setup import attach_session_id, log_event
+from arc.majority.config import MAJORITY_ENGINE
+from arc.majority.engine import MajorityEngine
+from arc.majority.state import MajorityMarketState
 from arc.market.discovery import MarketDiscovery
 from arc.market.providers import TwapProvider
 from arc.market.ptb import (
@@ -371,6 +374,9 @@ class ArcRuntime:
         "_health_revision",
         "_hub",
         "_logger",
+        "_majority",
+        "_majority_repricers",
+        "_majority_submitter",
         "_next_book_read",
         "_next_ptb_attempt",
         "_next_wallet_read",
@@ -560,8 +566,67 @@ class ArcRuntime:
             bucket=self._bucket,
             logger=logger,
         )
+        # Per-window MAJORITY repricer. Each window has its own entry band, so the
+        # repricer must follow the band of the WINDOW the order belongs to — a
+        # TWAP-band repricer on a MAJORITY order would move the order to a price
+        # outside the band the operator set for MAJORITY, and the gates that
+        # approved the order would no longer cover the resting price. Built as a
+        # dict keyed by window so the engine looks up the policy by the order's
+        # offset in O(1).
+        self._majority_repricers: dict[int, Repricer] = {
+            window.execution_window_seconds: Repricer(
+                store,
+                executor,
+                RepricePolicy(
+                    band_min=window.entry_price_min,
+                    band_max=window.entry_price_max,
+                    tick=trading.tick_size,
+                ),
+                bucket=self._bucket,
+                logger=logger,
+            )
+            for window in settings.majority.tradable_windows
+        }
         self._sweeper = Sweeper(store, executor, logger=logger)
         self._reconciler = Reconciler(store, executor, logger=logger)
+
+        # ── MAJORITY half ────────────────────────────────────────────────────
+        # A SECOND Submitter, constructed with engine=MAJORITY so every order it
+        # derives carries the MAJORITY prefix and the MAJORITY engine column. The
+        # TWAP submitter above is untouched and keeps its empty prefix, so no
+        # existing order id changes.
+        #
+        # `minimum` is the MINIMUM share count across the configured windows. The
+        # split is over MAJORITY's size and a foreign minimum would either reject
+        # the configured size or split it into a ladder MAJORITY never asked for.
+        # Each window's own builder already refused any share count below the
+        # venue minimum, so this value is never under it; using the smallest
+        # configured value keeps the submitter's split arithmetic permissive
+        # without ever accepting a sub-minimum share count.
+        majority = settings.majority
+        if majority.windows_by_offset:
+            _majority_min = min(w.shares for w in majority.windows_by_offset)
+        else:
+            _majority_min = trading.min_tradable_size
+        self._majority_submitter = Submitter(
+            store,
+            executor,
+            bucket=self._bucket,
+            minimum=_majority_min,
+            engine=MAJORITY_ENGINE,
+            logger=logger,
+        )
+        # Constructed even when MAJORITY is OFF. Every entry point checks
+        # `config.tradable` and returns, so an OFF engine reads no book, evaluates no
+        # trigger and submits nothing — while the dashboard can still ask it for its
+        # state and get an honest OFF instead of an AttributeError.
+        self._majority = MajorityEngine(
+            majority,
+            store,
+            executor,
+            self._majority_submitter,
+            logger=logger,
+        )
 
         # ── decision half ────────────────────────────────────────────────────
         # Owned here so the Systems page can read the timings without reaching
@@ -643,6 +708,27 @@ class ArcRuntime:
     def recovery_report(self) -> RecoveryReport | None:
         """What the last recovery pass found. None until recovery has run."""
         return self._recovery
+
+    @property
+    def majority(self) -> MajorityEngine:
+        """The MAJORITY engine. Always present, even when the engine is OFF.
+
+        Exposed so the dashboard can render MAJORITY's own state without holding a
+        second copy of it. Read-only by the same rule as every property above: a
+        dashboard able to advance the sequence would be a second caller of
+        `select_side`, and the side lock exists precisely because there must only
+        ever be one.
+        """
+        return self._majority
+
+    def majority_state_for(self, slug: str) -> MajorityMarketState | None:
+        """MAJORITY's state for one market, or None when it is not tracked.
+
+        None is honest rather than a synthesised OFF row: a market MAJORITY never
+        opened and a market MAJORITY opened and switched off are different facts,
+        and the deck must not print the second when the first is true.
+        """
+        return self._majority.state_for(slug)
 
     # ── gate readiness ───────────────────────────────────────────────────────
 
@@ -1218,8 +1304,38 @@ class ArcRuntime:
         the process in between, which is what makes a restart resume instead of drop
         the window.
         """
+        # Gathered at most ONCE per pass, and only when MAJORITY can actually use
+        # it. `health()` runs two SQLite reads (live orders, realised losses) and
+        # this loop turns over every 200 ms, so building it unconditionally would
+        # add those queries five times a second to every run — including the runs
+        # where MAJORITY is OFF and nothing would ever read the result.
+        #
+        # One snapshot serves both live markets deliberately. Two snapshots taken a
+        # few milliseconds apart could disagree on open positions or the balance,
+        # and the two markets alive across a close boundary would then be gated
+        # against different views of the same process.
+        health: RuntimeHealth | None = None
         for market in self._live_markets():
             await self._submit_pending(market, now)
+            # MAJORITY runs BETWEEN submission and fill polling, on the same market,
+            # in the same pass. Its own trigger, its own fresh read, its own side and
+            # its own submitter — the only thing it shares with the two calls around
+            # it is the market object, which it reads and never mutates.
+            #
+            # Driven under the same operator gates as _submit_pending above, and for
+            # the same reason: an operator pressing Stop Trading must stop MAJORITY
+            # too, and the gate that can still see that change is this one. A paused
+            # runtime therefore does not evaluate the MAJORITY trigger at all, so a
+            # window crossed while paused is not traded when the pause lifts — the
+            # side would then be chosen from a book minutes newer than the trigger.
+            if (
+                self._settings.majority.tradable
+                and not self._paused
+                and self._runtime.gate.submitting
+            ):
+                if health is None:
+                    health = self.health()
+                await self._majority.tick(market, health, now)
             report = await self._fills.poll(market.slug, now)
             self.stats.fills_recorded += len(report.new_fills)
             await self._reprice_open(market.slug, now)
@@ -1238,8 +1354,20 @@ class ArcRuntime:
             return
         if self._paused or not self._runtime.gate.submitting:
             return
-        submitted_offsets = {o.offset_seconds for o in self._store.orders_for(market.slug)}
-        for intent in self._store.intents_for(market.slug):
+        # BOTH reads are scoped to this engine. `intents_for` with no engine returns
+        # every engine's intents, and this submitter stamps DEFAULT_ENGINE onto every
+        # order it derives — so an unscoped read would take MAJORITY's intent, submit
+        # it as a TWAP order, and MAJORITY would then find an order it never placed
+        # sitting on its window. The offsets are scoped for the mirror-image reason:
+        # a MAJORITY order resting on offset 45 would make this engine skip its own
+        # window 45 as already submitted, and the TWAP trade would silently never
+        # happen.
+        submitted_offsets = {
+            o.offset_seconds
+            for o in self._store.orders_for(market.slug)
+            if o.engine == DEFAULT_ENGINE
+        }
+        for intent in self._store.intents_for(market.slug, engine=DEFAULT_ENGINE):
             if intent.offset_seconds in submitted_offsets:
                 continue
             orders = await self._submitter.submit(
@@ -1251,10 +1379,33 @@ class ArcRuntime:
             self.stats.orders_submitted += len(orders)
 
     async def _reprice_open(self, market_slug: str, now: float) -> None:
+        """Follow the book for THIS engine's resting orders only.
+
+        MAJORITY orders are routed to their window's repricer. A MAJORITY order
+        repriced under TWAP's policy would be moved to a price inside TWAP's
+        band and outside MAJORITY's own — so the order would be submitted at a
+        price MAJORITY's configuration forbids, by a component that never read
+        MAJORITY's configuration at all. The window-keyed repricer dict makes
+        the per-window band lookup a single dict access.
+        """
         for order in self._fills.unfilled(market_slug):
-            moved: Order = await self._repricer.maybe_reprice(order, now)
-            if moved.order_id != order.order_id:
-                self.stats.orders_repriced += 1
+            if order.engine == DEFAULT_ENGINE:
+                moved: Order = await self._repricer.maybe_reprice(order, now)
+                if moved.order_id != order.order_id:
+                    self.stats.orders_repriced += 1
+                continue
+            if order.engine == MAJORITY_ENGINE:
+                repricer = self._majority_repricers.get(order.offset_seconds)
+                if repricer is None:
+                    # The window this order was placed under is no longer
+                    # configured (operator removed it). Leaving it untouched is
+                    # the safe default: it is still a valid order against the
+                    # window's frozen price, and cancelling it would close the
+                    # only remaining MAJORITY position this market holds.
+                    continue
+                moved = await repricer.maybe_reprice(order, now)
+                if moved.order_id != order.order_id:
+                    self.stats.orders_repriced += 1
 
     def _live_markets(self) -> tuple[MarketInstance, ...]:
         return tuple(m for m in (self.rotator.current, self.rotator.closing) if m is not None)
@@ -1312,6 +1463,23 @@ class ArcRuntime:
                     self._settlement[market.slug] = SettlementTwapCollector(
                         market_slug=market.slug, close_ts=market.close_ts
                     )
+                    # Fresh MAJORITY state for the new market. Created here rather
+                    # than lazily inside the engine's tick so that "this market has
+                    # no MAJORITY state" stays a real fault the engine can refuse on,
+                    # instead of a condition it silently repairs by inventing one
+                    # mid-window (A11).
+                    #
+                    # restore_from_intents runs on every open — including on a
+                    # market this process last saw in a previous lifetime. The
+                    # intent for that lifetime is still on disk under the engine
+                    # column; reconstruct_locked_side reads it back so the side
+                    # lock survives a restart, and the matching order row keeps
+                    # being the order the previous process placed (the UNIQUE
+                    # constraint on (engine, market_slug, offset_seconds) prevents
+                    # a second intent from being written). On a fresh market
+                    # there are no intents and the call is a no-op.
+                    self._majority.open_market(market.slug, market.close_ts)
+                    self._majority.restore_from_intents(market.slug, now)
                     await self._load_tokens(market.slug)
                 # Retry immediately on the new market rather than waiting out the
                 # interval left over from the previous one.
@@ -1326,6 +1494,12 @@ class ArcRuntime:
                 self._settlement.pop(event.archived, None)
                 self.tokens.drop(event.archived)
                 self._forget_book(event.archived)
+                # Dropped on ARCHIVE rather than on CLOSE, alongside every other
+                # per-market object. A close-time drop would discard the state while
+                # the sweep is still retracting that market's orders, and the deck
+                # would show nothing for a market whose orders were still being
+                # cancelled. Thrown away, never reset (A11).
+                self._majority.drop_market(event.archived)
 
             await self._attempt_ptb(now)
             await self._refresh_books(now)

@@ -101,7 +101,7 @@ def doctor(out: TextIO, clock: Clock) -> int:
     # that then becomes the source of truth on every later startup, and .env would
     # no longer be consulted to fix it.
     if settings.seeded_from_env:
-        store.save_settings(settings.trading.as_storage_dict(), clock.now())
+        store.save_settings(settings.as_storage_dict(), clock.now())
 
     _report(out, settings, store, version, clock)
     store.close()
@@ -240,7 +240,7 @@ def run(out: TextIO, clock: Clock, *, mode: Mode, market_target: int | None) -> 
         return 1
 
     if settings.seeded_from_env:
-        store.save_settings(settings.trading.as_storage_dict(), clock.now())
+        store.save_settings(settings.as_storage_dict(), clock.now())
 
     logger = setup_logging(
         settings.log_dir,

@@ -51,6 +51,13 @@ from arc.domain.enums import Mode
 from arc.domain.money import dec_str, to_decimal
 from arc.domain.timing import MARKET_DURATION_SECONDS
 from arc.errors import BindAddressError, ConfigInvariantError
+from arc.majority.config import (
+    MAJORITY_DISABLED,
+    MAJORITY_KEYS,
+    MajorityConfig,
+    build_majority_config,
+    env_majority_values,
+)
 from arc.market.providers import ProviderName
 
 __all__ = [
@@ -197,6 +204,22 @@ class ArcSettings(BaseSettings):
     outbound_rate_burst: int = 16
 
     allow_opposing_directions: bool = False
+
+    # MAJORITY, the second engine. Optional by construction: when disabled these are
+    # never validated and the process boots exactly as it did before the engine
+    # existed. Blank strings rather than numbers because there is NO default trading
+    # value — a MAJORITY number the operator did not choose must never reach the
+    # trading path, so an enabled engine with a blank field is a fatal error, not a
+    # substituted guess. They seed SQLite once, like every other trading value.
+    majority_enabled: bool = False
+    majority_execution_window_seconds: int = 0
+    majority_execution_windows: str = ""
+    majority_buffer: str = ""
+    majority_trigger_price: str = ""
+    majority_target_limit_price: str = ""
+    majority_shares: str = ""
+    majority_entry_price_min: str = ""
+    majority_entry_price_max: str = ""
 
     # Which price stream feeds the running TWAP. Bootstrap-only, deliberately NOT a
     # trading value: the source of the data is an infrastructure choice, and putting
@@ -918,6 +941,12 @@ class Settings:
     env: ArcSettings
     trading: TradingConfig
     seeded_from_env: bool
+    # The second engine. Defaults to the disabled singleton so every existing
+    # `Settings(...)` construction — tests included — stays valid without naming it,
+    # and a process that never configured MAJORITY carries the same OFF object as one
+    # that switched it off. Never None: "no MAJORITY" is a configuration, not an
+    # absence, so the runtime always has a `.tradable` to ask.
+    majority: MajorityConfig = MAJORITY_DISABLED
 
     @property
     def mode(self) -> Mode:
@@ -933,7 +962,27 @@ class Settings:
 
     @property
     def warnings(self) -> tuple[str, ...]:
-        return self.trading.warnings
+        """Every non-fatal advisory, both engines, in engine order.
+
+        MAJORITY's are included because they are shown wherever this property is
+        shown, and a MAJORITY warning that reached nobody would be a warning the
+        operator had no way to act on. TWAP first, so the existing report ordering
+        does not shift when MAJORITY is off and contributes nothing.
+        """
+        return (*self.trading.warnings, *self.majority.warnings)
+
+    def as_storage_dict(self) -> dict[str, str]:
+        """The COMPLETE settings row: both engines' values in one dict.
+
+        Every persistence site must go through here rather than through
+        `trading.as_storage_dict()`. Writing only TWAP's keys would truncate the
+        stored settings to the trading half, and because stored settings win over
+        `.env`, the next boot's backfill would find the MAJORITY keys absent, refill
+        them from `.env` — and quietly discard whatever the operator had last saved.
+        The two halves cannot collide: TRADING_KEYS and MAJORITY_KEYS are disjoint by
+        construction, since every MAJORITY key is prefixed.
+        """
+        return {**self.trading.as_storage_dict(), **self.majority.as_storage_dict()}
 
     def redacted_dump(self) -> dict[str, str]:
         return self.env.redacted_dump()
@@ -996,6 +1045,45 @@ def env_trading_values(env: ArcSettings) -> dict[str, str]:
     }
 
 
+def env_majority_config_values(env: ArcSettings) -> dict[str, str]:
+    """Project the MAJORITY bootstrap fields into the builder's raw-string form.
+
+    Routed through `env_majority_values` (keyword-only, in `arc.majority.config`) so
+    the key names live in one place — the package that owns them — and this file
+    never hard-codes a MAJORITY key it could then misspell.
+
+    The legacy single-window `majority_execution_window_seconds` is converted to a
+    one-element tuple. New .env files should write `majority_execution_windows`
+    directly; the legacy field is accepted so a database that was seeded before
+    the multi-window key existed continues to boot exactly as it did.
+    """
+    legacy = env.majority_execution_window_seconds
+    # The new multi-window field is comma-separated; the legacy scalar is a single
+    # integer. The legacy form takes precedence when the operator set it explicitly,
+    # because rewriting a single number as a list of one is the contract that lets a
+    # database seeded before multi-window boot correctly. When both are blank, no
+    # window is configured and MAJORITY is empty (an enabled-but-empty config is
+    # still legal — it just reports OFF).
+    raw_windows = env.majority_execution_windows.strip()
+    if raw_windows:
+        from arc.majority.config import _parse_window_list  # local import: keeps top-level clean
+        windows = _parse_window_list(raw_windows)
+    elif legacy > 0:
+        windows = (legacy,)
+    else:
+        windows = ()
+    return env_majority_values(
+        enabled=env.majority_enabled,
+        execution_windows=windows,
+        buffer=env.majority_buffer,
+        trigger_price=env.majority_trigger_price,
+        target_limit_price=env.majority_target_limit_price,
+        shares=env.majority_shares,
+        entry_price_min=env.majority_entry_price_min,
+        entry_price_max=env.majority_entry_price_max,
+    )
+
+
 def load_settings(
     env: ArcSettings | None = None,
     stored: dict[str, str] | None = None,
@@ -1022,6 +1110,27 @@ def load_settings(
 
     trading = build_trading_config(merged)
 
+    # BACKFILL, not a second precedence rung. The stored settings table wins for
+    # every key it HOLDS — but a database written before MAJORITY existed holds none
+    # of these eight, and reading an absent key as blank would make an operator's
+    # `.env` MAJORITY block silently inert on every upgraded install. So .env fills
+    # only the gaps: a key already in `stored` is never touched, which keeps the
+    # Settings page the source of truth the moment it has written one.
+    majority_env = env_majority_config_values(settings)
+    for key in MAJORITY_KEYS:
+        if key not in merged:
+            merged[key] = majority_env[key]
+
+    # Venue constraints are passed in from the already-validated TradingConfig rather
+    # than read out of it inside `arc.majority.config`, so that package holds no
+    # reference to TWAP's configuration. The minimum size and the tick are the
+    # exchange's, not TWAP's — the venue does not quote a separate tick per engine.
+    majority = build_majority_config(
+        merged,
+        min_tradable_size=trading.min_tradable_size,
+        tick_size=trading.tick_size,
+    )
+
     if settings.mode is Mode.V2 and not settings.has_credentials():
         missing = [
             n.upper()
@@ -1033,4 +1142,9 @@ def load_settings(
             "A live-mode bot without keys looks armed and rejects every submission."
         )
 
-    return Settings(env=settings, trading=trading, seeded_from_env=seeded)
+    return Settings(
+        env=settings,
+        trading=trading,
+        seeded_from_env=seeded,
+        majority=majority,
+    )

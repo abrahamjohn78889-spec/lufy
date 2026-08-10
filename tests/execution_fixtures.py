@@ -67,8 +67,13 @@ def intent_for(
     direction: Direction = Direction.UP,
     size: Decimal = Decimal("35"),
     limit_price: Decimal = LIMIT_PRICE,
+    intent_id: str | None = None,
 ) -> ExecutionIntent:
-    """A frozen intent as the Decision Engine would have produced it."""
+    """A frozen intent as the Decision Engine would have produced it.
+
+    `intent_id` may be overridden at construction — never after, because
+    ExecutionIntent is frozen by contract (a decision cannot be edited once made).
+    """
     slug = slug_for(window_ts)
     return ExecutionIntent(
         market_slug=slug,
@@ -77,7 +82,7 @@ def intent_for(
         signal_twap=Decimal("64010.00"),
         locked_trigger=Decimal("64011.00"),
         created_at=float(window_ts + 297),
-        intent_id=f"{slug}:{offset_seconds}",
+        intent_id=intent_id if intent_id is not None else f"{slug}:{offset_seconds}",
         opening_twap=Decimal("64005.00"),
         ptb=Decimal("64000.00"),
         buffer=Decimal("1.00"),

@@ -64,17 +64,33 @@ class Sweeper:
         self._executor = executor
         self._logger = logger
 
-    async def sweep(self, market_slug: str, now: float) -> SweepResult:
+    async def sweep(
+        self, market_slug: str, now: float, *, engine: str | None = None
+    ) -> SweepResult:
         """Retract everything still live. Safe to call repeatedly.
 
         Idempotent because it re-reads live orders from the store on each call: an
         order cancelled by an earlier sweep is no longer live and is not retried,
         and one left INDETERMINATE is still live and IS retried.
+
+        `engine` scopes the sweep to one engine's orders. THE DEFAULT IS None, AND
+        None MEANS EVERY ENGINE — that is not an oversight, it is the market-close
+        safety sweep. An order still resting when the market settles is an
+        uncontrolled position no matter which engine placed it, so the close sweep
+        must not be filtered; it is the one operation here that is deliberately
+        engine-agnostic.
+
+        An ENGINE-INITIATED sweep passes its own name and then touches nothing else:
+        a sweep that retracted another engine's order would be one engine cancelling
+        another's approved position, and nothing downstream would report that the
+        order it was managing had been taken away.
         """
         cancelled: list[str] = []
         unknown: list[str] = []
 
         for order in self._store.live_orders(market_slug):
+            if engine is not None and order.engine != engine:
+                continue
             if await self._cancel_one(order, now):
                 cancelled.append(order.order_id)
             else:

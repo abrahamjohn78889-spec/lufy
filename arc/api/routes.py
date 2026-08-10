@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 import shutil
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -37,7 +38,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response, WebSocke
 
 from arc.api import ws as ws_module
 from arc.api.models import ledger_payload, preflight, status_payload, strategy_payload
-from arc.config import build_trading_config, load_settings
+from arc.config import build_trading_config
 from arc.domain.enums import Direction, Mode
 from arc.domain.money import dec_str
 from arc.domain.timing import MARKET_DURATION_SECONDS, window_ts_for
@@ -75,7 +76,26 @@ ROUTE_PATHS: tuple[str, ...] = (
 router = APIRouter()
 
 _EDITABLE = frozenset(
-    {"buffers", "execution_windows", "submission_count", "position_notional_usd"}
+    {
+        # TWAP fields — original set
+        "buffers",
+        "execution_windows",
+        "submission_count",
+        "position_notional_usd",
+        # MAJORITY fields — added so the Settings page controls both engines.
+        # The save flow validates both halves: TWAP through build_trading_config,
+        # MAJORITY through build_majority_config. A bad MAJORITY value is rejected
+        # with a 400 before anything is written, and restart_required is True so
+        # the operator knows a restart is needed after any change.
+        "majority_enabled",
+        "majority_buffer",
+        "majority_trigger_price",
+        "majority_target_limit_price",
+        "majority_shares",
+        "majority_entry_price_min",
+        "majority_entry_price_max",
+        "majority_execution_windows",
+    }
 )
 
 
@@ -278,20 +298,36 @@ async def post_settings(
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="expected a JSON object")
-    unknown = set(body) - _EDITABLE
+    _PER_WINDOW_RE = re.compile(r"^majority_w_\d+_\w+$")
+    unknown = {k for k in body if k not in _EDITABLE and not _PER_WINDOW_RE.match(k)}
     if unknown:
         raise HTTPException(
             status_code=400,
             detail=f"not editable from the dashboard: {sorted(unknown)}",
         )
 
-    merged = run.store.load_settings() or run.settings.trading.as_storage_dict()
+    # The full stored row. Writing only the TWAP half would discard MAJORITY's, so
+    # this is always the complete dict both engines need — TWAP's half plus whatever
+    # MAJORITY keys survived the last save.
+    stored = run.store.load_settings() or run.settings.as_storage_dict()
+    merged = dict(stored)
     merged.update({k: str(v) for k, v in body.items()})
     try:
-        # Validated through the same builder the runtime boots with, so a value the
-        # dashboard accepts cannot be a value that refuses to start on next launch.
+        # TWAP half: validated through the same builder the runtime boots with.
         build_trading_config(merged)
-        load_settings(run.settings.env, merged)
+        # MAJORITY half: validated through the same builder so a value the
+        # dashboard accepts cannot be a value that refuses to start on next launch.
+        # MAJORITY keys that are absent (operator sent only TWAP fields) are
+        # handled inside build_majority_config: absent+enabled=false is OFF,
+        # absent+enabled=true is a ConfigInvariantError.
+        from arc.majority.config import build_majority_config
+
+        trading = run.settings.trading
+        build_majority_config(
+            merged,
+            min_tradable_size=trading.min_tradable_size,
+            tick_size=trading.tick_size,
+        )
     except (ArcError, ArcFatalError) as exc:
         # ConfigInvariantError is fatal at STARTUP, but a rejected dashboard edit is
         # not fatal to a running process — the old configuration is still in force.
@@ -300,9 +336,8 @@ async def post_settings(
     run.store.save_settings(merged, run.clock.now())
     return {
         "saved": True,
-        # Stated plainly rather than implied: the frozen TradingConfig is fanned out
-        # into seven engines at construction, and pretending an edit reached all of
-        # them would leave the operator trusting a buffer that is not in force.
+        # Both engines' configs are fanned out at construction; a save always requires
+        # a restart so the new MajorityEngine and its per-window Repricers are fresh.
         "restart_required": True,
         "values": merged,
     }
@@ -470,6 +505,9 @@ async def set_strategy_config(
     }
 
 
+# ── majority ────────────────────────────────────────────────────────────────
+
+
 # ── research ─────────────────────────────────────────────────────────────────
 
 
@@ -618,7 +656,7 @@ def _notifications(run: ArcRuntime, body: Any) -> dict[str, Any]:
     flags = run.notifier.flags
     flags.update({name: bool(value) for name, value in body.items()})
 
-    stored = run.store.load_settings() or run.settings.trading.as_storage_dict()
+    stored = run.store.load_settings() or run.settings.as_storage_dict()
     stored.update(notification_values(flags))
     run.store.save_settings(stored, run.clock.now())
     return {"saved": True, "notifications": dict(flags)}

@@ -133,20 +133,58 @@ class TestPrecedence:
 
         store = Store(path)
         store.migrate(clock.now())
-        env = ArcSettings(**{k: v for k, v in VALID_TRADING_VALUES.items()})
+        # MAJORITY is switched ON in the environment for this test. With it off, both
+        # halves of the round-trip would be MAJORITY_DISABLED and the comparison
+        # below would pass by comparing zeros to zeros — the test would assert
+        # nothing about the eight keys it exists to guard.
+        env = ArcSettings(
+            **{k: v for k, v in VALID_TRADING_VALUES.items()},
+            majority_enabled=True,
+            majority_execution_windows="30",
+            majority_buffer="0",
+            majority_trigger_price="0.70",
+            majority_target_limit_price="0.75",
+            majority_shares="5",
+            majority_entry_price_min="0.55",
+            majority_entry_price_max="0.85",
+        )
         first = load_settings(env, store.load_settings())
         assert first.seeded_from_env is True
-        store.save_settings(first.trading.as_storage_dict(), clock.now())
+        assert first.majority.enabled is True
+        # The WHOLE settings row, both engines. Writing only `trading` here would
+        # store a row with no majority_* keys, and the next boot would refill those
+        # eight from .env — which is the exact discard `post_settings` merges to
+        # avoid. Saving what the runtime actually saves is what makes this test a
+        # restart rather than a TWAP-only restart.
+        store.save_settings(first.as_storage_dict(), clock.now())
         # The operator edits one value in the UI and it is written through.
         store.save_settings({"position_notional_usd": "77.00"}, clock.now())
         store.close()
 
-        # The process dies. A .env that still says 25.00 is read on the way back up.
+        # The process dies. On the way back up .env now disagrees with the stored row
+        # on BOTH engines: it still says 25.00 for TWAP, and it has been edited to a
+        # different MAJORITY trigger and size. Neither may win.
+        env.majority_trigger_price = "0.90"
+        env.majority_shares = "50"
         reopened = Store(path)
         second = load_settings(env, reopened.load_settings())
         reopened.close()
         assert str(second.trading.position_notional_usd) == "77.00"
         assert second.seeded_from_env is False
+        # MAJORITY survived the restart on the stored row, not on .env. All eight keys
+        # round-trip: a partial write would leave some to be refilled from the
+        # environment, and the two halves would then describe different
+        # configurations while the Settings page showed only one of them.
+        assert second.majority.as_storage_dict() == first.majority.as_storage_dict()
+        # The whole MAJORITY configuration survives a restart on the stored row, not
+        # on .env — multi-window so the assertion is per-window.
+        first_windows = {w.execution_window_seconds: w for w in first.majority.windows_by_offset}
+        second_windows = {w.execution_window_seconds: w for w in second.majority.windows_by_offset}
+        assert set(second_windows) == set(first_windows)
+        for offset, win in first_windows.items():
+            other = second_windows[offset]
+            assert str(other.trigger_price) == str(win.trigger_price)
+            assert str(other.shares) == str(win.shares)
 
 
 class TestValidatedInfrastructure:
