@@ -11,9 +11,12 @@ from enum import StrEnum
 from typing import Final
 
 __all__ = [
+    "DEFAULT_ENGINE",
     "DISPLAYED_ORDER_STATES",
     "LIVE_ORDER_STATES",
     "ORDER_STATE_DISPLAY",
+    "POST_ONLY_WOULD_CROSS_REASON",
+    "REJECTION_REASON_DISPLAY",
     "TERMINAL_ORDER_STATES",
     "DenialReason",
     "Direction",
@@ -24,6 +27,20 @@ __all__ = [
     "SettlementSpecStatus",
     "WindowState",
 ]
+
+# The engine that owns a record when nothing says otherwise.
+#
+# It lives HERE, in the domain layer, and deliberately not in arc/execution/. The
+# execution package is forbidden from naming a strategy at all (A17): it places and
+# cancels orders and must not know what any engine's numbers mean, or a strategy
+# change would have to be made in two places. Execution therefore imports this name
+# and compares against it without ever spelling the value.
+#
+# The value is the FIRST engine because it is the only one that has ever written a
+# record: every row in every pre-migration database belongs to it, so reading an old
+# row back as this engine is a statement of fact rather than a default. It is also
+# what keeps derived order ids byte-identical for that engine — see `engine_prefix`.
+DEFAULT_ENGINE: Final[str] = "TWAP"
 
 
 class Mode(StrEnum):
@@ -70,16 +87,26 @@ class MarketPhase(StrEnum):
 class WindowState(StrEnum):
     """State of one execution window.
 
-    PENDING   not yet activated, or a freeze was rejected and left it untouched
-    FROZEN    all five values locked atomically; immutable, including across restart
-    FIRED     the direction-appropriate trigger comparison passed
-    EXPIRED   the market closed without the trigger passing
+    PENDING       not yet activated, or a freeze was rejected and left it untouched
+    FROZEN        all five values locked atomically; immutable, including across restart
+    FIRED         the direction-appropriate trigger comparison passed
+    EXPIRED       the market closed without the trigger passing
+    NO_DIRECTION  the frozen TWAP equalled the official PTB exactly
+
+    NO_DIRECTION is terminal and is NOT an error. Direction determination uses strict
+    comparison only: TWAP > PTB is UP, TWAP < PTB is DOWN, and equality resolves to
+    neither. The window freezes no direction, authorises no intent and submits no
+    order. It is a distinct state rather than folded into EXPIRED because EXPIRED
+    means "a real trigger existed and was never crossed" — a buffer that was too
+    wide — while this means "no direction was determinable". An operator tuning
+    buffers must be able to tell those apart.
     """
 
     PENDING = "PENDING"
     FROZEN = "FROZEN"
     FIRED = "FIRED"
     EXPIRED = "EXPIRED"
+    NO_DIRECTION = "NO_DIRECTION"
 
 
 class OrderState(StrEnum):
@@ -108,6 +135,21 @@ ORDER_STATE_DISPLAY: Final[dict[OrderState, str]] = {
     OrderState.EXPIRED: "Cancelled",
     OrderState.REJECTED: "Rejected",
     OrderState.INDETERMINATE: "Unknown ⚠",
+}
+
+# The dedicated rejection reason for a post-only order the venue refused because it
+# would have crossed. Stored verbatim in orders.rejection_reason and matched exactly
+# by the dashboard, so it reads as its own outcome rather than as one more opaque
+# venue string. The execution layer never acts on it beyond recording it: repricing
+# would mean rewriting a frozen decision.
+POST_ONLY_WOULD_CROSS_REASON: Final[str] = "POST_ONLY_WOULD_CROSS"
+
+# Operator-facing wording for that reason. A REASON label, shown beside the order's
+# state — deliberately NOT a seventh entry in ORDER_STATE_DISPLAY. A13 freezes the
+# displayed state list at six values, and the order's state here is genuinely
+# Rejected; what is new is why, and why belongs in the reason column.
+REJECTION_REASON_DISPLAY: Final[dict[str, str]] = {
+    POST_ONLY_WOULD_CROSS_REASON: "Would cross - not repriced",
 }
 
 DISPLAYED_ORDER_STATES: Final[tuple[str, ...]] = (
@@ -168,6 +210,11 @@ class DenialReason(StrEnum):
     """
 
     TRADING_DISABLED_SPEC_UNVERIFIED = "TRADING_DISABLED_SPEC_UNVERIFIED"
+    # The operator gate, distinct from the system gate above. A runtime that is
+    # perfectly healthy but never armed is the NORMAL post-startup state, and
+    # reporting it as TRADING_DISABLED_SPEC_UNVERIFIED would send the operator
+    # hunting a verification failure that never happened.
+    EXECUTION_NOT_ARMED = "EXECUTION_NOT_ARMED"
     TRADING_PAUSED = "TRADING_PAUSED"
     MARKET_CANCELLING = "MARKET_CANCELLING"
     MARKET_DEAD = "MARKET_DEAD"
@@ -183,7 +230,18 @@ class DenialReason(StrEnum):
     POSITION_LIMIT_REACHED = "POSITION_LIMIT_REACHED"
     LOSS_LIMIT_REACHED = "LOSS_LIMIT_REACHED"
     DUPLICATE_INTENT = "DUPLICATE_INTENT"
+    # The venue account is unreachable, so no balance on screen is current and no
+    # submission can be reasoned about. Distinct from INSUFFICIENT_BALANCE: an
+    # unknown balance and a known-too-small one call for opposite operator actions.
+    WALLET_DISCONNECTED = "WALLET_DISCONNECTED"
     INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
+    # An order at the venue that reconciliation could not account for. Submitting
+    # on top of one doubles a position while both orders look entirely genuine.
+    ORPHAN_ORDERS_UNRECONCILED = "ORPHAN_ORDERS_UNRECONCILED"
+    # The supervisor's own view of the run — is the task alive, does the attached
+    # runtime match the selected mode. Distinct from RUNTIME_UNHEALTHY, which is
+    # the runtime reporting on itself and cannot see that it has been detached.
+    RUNTIME_SUPERVISOR_NOT_READY = "RUNTIME_SUPERVISOR_NOT_READY"
     FEED_STALE = "FEED_STALE"
     CLOCK_DRIFT_CRITICAL = "CLOCK_DRIFT_CRITICAL"
     RUNTIME_UNHEALTHY = "RUNTIME_UNHEALTHY"

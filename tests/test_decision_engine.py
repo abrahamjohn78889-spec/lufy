@@ -360,7 +360,7 @@ class TestLogging:
 
 class TestTheHealthReadingIsTakenOnce:
     def test_one_reading_serves_the_whole_pass(self, store: Store) -> None:
-        """Fourteen gates each pulling live readings would evaluate fourteen slightly
+        """Nineteen gates each pulling live readings would evaluate nineteen slightly
         different worlds, and the verdict would depend on how long evaluation took."""
         calls = 0
 

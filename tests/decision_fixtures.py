@@ -24,6 +24,7 @@ from arc.decision.engine import DecisionEngine, QuoteSource, RuntimeHealth
 from arc.decision.quota import QuotaLedger
 from arc.domain.enums import Direction, MarketPhase, SettlementSpecStatus
 from arc.domain.models import Fill, MarketInstance, Order
+from arc.risk.engine import RiskEngine
 from arc.risk.limits import RiskLimits, limits_from_trading
 from arc.storage.store import Store
 from arc.strategy.config import StrategyConfig, config_from_trading
@@ -67,13 +68,15 @@ def limits(config: TradingConfig | None = None) -> RiskLimits:
 def healthy(**overrides: object) -> RuntimeHealth:
     """A runtime in which every gate that can pass, passes.
 
-    trading_enabled and VERIFIED are stated explicitly rather than defaulted,
-    because the shipped default is DISABLED (A8) and a helper that quietly enabled
-    trading would make the A8 boundary test pass for the wrong reason.
+    trading_enabled, VERIFIED and execution_armed are stated explicitly rather
+    than defaulted, because all three ship DISABLED (A8, and the operator gate
+    disarms on every startup) and a helper that quietly enabled trading would make
+    the A8 boundary test and the arming test pass for the wrong reason.
     """
     base: dict[str, object] = {
         "trading_enabled": True,
         "spec_status": SettlementSpecStatus.VERIFIED,
+        "execution_armed": True,
     }
     base.update(overrides)
     return RuntimeHealth(**base)  # type: ignore[arg-type]
@@ -95,6 +98,7 @@ def make_engine(
     quote_price: Decimal | None = DEFAULT_QUOTE,
     health: RuntimeHealth | None = None,
     health_source: Callable[[], RuntimeHealth] | None = None,
+    risk: RiskEngine | None = None,
     logger: logging.Logger | None = None,
 ) -> DecisionEngine:
     """The real engine, wired to the real risk engine, registry and strategy.
@@ -117,6 +121,7 @@ def make_engine(
         ),
         quote_source=quote(quote_price),
         health_source=source,
+        risk=risk,
         logger=logger,
     )
 
@@ -136,15 +141,17 @@ def fired_market(
     fields, so a test cannot construct a window state the production code would
     have refused — a frozen window with an inconsistent trigger, for instance.
 
-    The opening TWAP is placed on the correct side of the PTB for the requested
-    direction, because freeze() derives the direction itself and would otherwise
-    lock the opposite one.
+    The opening TWAP is placed STRICTLY on the correct side of the PTB for the
+    requested direction, because freeze() derives the direction itself with strict
+    comparison and refuses equality outright (NoDirectionError). An UP fixture built
+    on `opening == ptb` would raise rather than freeze.
     """
     cfg = config if config is not None else trading()
     market = MarketInstance.create(window_ts, offsets)
     market.phase = MarketPhase.ACTIVE
     market.freeze_ptb(ptb)
-    opening = ptb if direction is Direction.UP else ptb - Decimal("100")
+    gap = Decimal("100")
+    opening = ptb + gap if direction is Direction.UP else ptb - gap
     # The signal TWAP must satisfy every frozen trigger, so it is pushed one whole
     # buffer past the widest one in the firing direction.
     widest = max(cfg.buffer_for(o) for o in offsets)

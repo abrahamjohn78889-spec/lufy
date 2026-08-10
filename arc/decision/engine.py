@@ -4,7 +4,7 @@ One pipeline, and every intent goes through all six steps:
 
     1  Completed Window   a FIRED window, taken from the window pass
     2  Validate Window    frozen state is complete; snapshot it once
-    3  Apply Risk Gates   all fourteen, in order, first denial wins
+    3  Apply Risk Gates   all nineteen, in order, first denial wins
     4  Create Intent      immutable and self-sufficient
     5  Persist Intent     SQLite arbitrates exactly-one-per-window
     6  Return Intent
@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Final
 
-from arc.decision.intent import build_intent
+from arc.decision.intent import build_intent, trace_id_for
 from arc.decision.quota import QuotaLedger
 from arc.decision.reasons import SkipReason
 from arc.decision.snapshot import DecisionSnapshot, snapshot_for
@@ -69,13 +69,17 @@ class RuntimeHealth:
     """Process-wide state the risk gates need, read once per decision pass.
 
     Gathered by the caller into one frozen object rather than reached for gate by
-    gate. Fourteen gates each pulling live readings would evaluate fourteen
+    gate. Nineteen gates each pulling live readings would evaluate nineteen
     slightly different worlds, and the verdict would depend on how long evaluation
     took.
     """
 
     trading_enabled: bool
     spec_status: SettlementSpecStatus
+    # The operator's Start Trading switch. Defaults False for the same reason the
+    # risk gate does: a caller that forgets to gather it records the decision and
+    # submits nothing, rather than submitting because a field was missing.
+    execution_armed: bool = False
     paused: bool = False
     trading_disabled_reason: str = ""
     feed_blocked: bool = False
@@ -87,6 +91,28 @@ class RuntimeHealth:
     open_positions: int = 0
     daily_loss_usd: Decimal = _ZERO
     consecutive_losses: int = 0
+    # ── the live-money preconditions (gates 16-19) ───────────────────────────
+    # Each defaults to the value that means "nothing is wrong", because that is
+    # what is true of every caller that does not have a venue: V1, the inert
+    # runtime and every unit test. Gate 2's arming switch defaults the other way
+    # on purpose — it is the operator's intent, and absence of intent is not
+    # consent — but absence of an orphan is genuinely the absence of an orphan.
+    supervisor_ready: bool = True
+    supervisor_detail: str = ""
+    wallet_connected: bool = True
+    wallet_status: str = ""
+    orphan_orders: tuple[str, ...] = ()
+    # None = no official source published a balance. Never zero as a stand-in:
+    # zero is a real, denying figure and "unknown" must not be able to look like
+    # an empty account.
+    available_balance: Decimal | None = None
+    # Which runtime produced this pass. Carried so a denial line says whether the
+    # refusal happened in V1 or V2 — the same denial means different things in a
+    # paper run and a live one.
+    mode: str = ""
+    # Bumped by the runtime whenever any field above changes. The dashboard
+    # redraws on a change of this number rather than on every frame.
+    health_revision: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +154,25 @@ class DecisionOutcome:
     @property
     def acted(self) -> bool:
         return bool(self.intents)
+
+
+def _skip_for(state: WindowState) -> SkipReason:
+    """Why a window that is not FIRED produced nothing.
+
+    NO_DIRECTION is reported as itself rather than as NOT_FROZEN. Both are true of the
+    window, but they mean opposite things to an operator: NOT_FROZEN is a window still
+    waiting for its instant (or one whose freeze was rejected and will be retried),
+    while NO_DIRECTION is a final strategy verdict — the frozen TWAP equalled the
+    official PTB, so strict comparison yielded no side to trade. Collapsing them would
+    make a deliberate no-trade look like a stalled window.
+    """
+    if state is WindowState.NO_DIRECTION:
+        return SkipReason.NO_DIRECTION
+    if state is WindowState.PENDING:
+        return SkipReason.NOT_FIRED
+    if state in (WindowState.FROZEN, WindowState.FIRED):
+        return SkipReason.NOT_FIRED
+    return SkipReason.NOT_FROZEN
 
 
 class DecisionEngine:
@@ -183,6 +228,16 @@ class DecisionEngine:
         self.intents_denied = 0
         self.intents_skipped = 0
 
+    @property
+    def limits(self) -> RiskLimits:
+        """The limits snapshotted at construction. Read-only."""
+        return self._limits
+
+    @property
+    def strategy_count(self) -> int:
+        """How many strategies are registered. Gate 6's standing input."""
+        return len(self._registry)
+
     # ── the pass ─────────────────────────────────────────────────────────────
 
     def decide(self, market: MarketInstance, now: float) -> DecisionOutcome:
@@ -206,11 +261,7 @@ class DecisionEngine:
                 decisions.append(
                     WindowDecision(
                         offset_seconds=window.offset_seconds,
-                        skip=(
-                            SkipReason.NOT_FIRED
-                            if window.is_frozen or window.state is WindowState.PENDING
-                            else SkipReason.NOT_FROZEN
-                        ),
+                        skip=_skip_for(window.state),
                     )
                 )
                 continue
@@ -281,6 +332,10 @@ class DecisionEngine:
         # 3. Risk gates. Evaluated against the strategy's PROPOSED price and size,
         #    which is why the strategy is consulted first — a proposal is not an
         #    authorisation, and the gates are what turn one into the other.
+        #
+        #    The duration of this call is measured, but not here: A0 forbids this
+        #    layer a clock of any kind. The runtime injects a stopwatch-wrapped
+        #    engine, so the measurement lives where time is already allowed.
         verdict = self._risk.evaluate(
             self._risk_context(market, snapshot, health, proposal.limit_price, proposal.size)
         )
@@ -289,9 +344,12 @@ class DecisionEngine:
             log_event(
                 logging.WARNING,
                 "Intent Denied",
-                f"{snapshot.market_slug} {offset}s  {verdict.reason.value}  {verdict.detail}",
+                f"{verdict.gate_id} {verdict.gate}  {verdict.reason.value}  "
+                f"{snapshot.market_slug}  {offset}s  {health.mode or 'UNKNOWN'}  "
+                f"{verdict.detail}",
                 logger=self._logger,
             )
+
             return WindowDecision(
                 offset_seconds=offset,
                 denial=verdict.reason,
@@ -368,6 +426,7 @@ class DecisionEngine:
         return RiskContext(
             trading_enabled=health.trading_enabled,
             spec_status=health.spec_status,
+            execution_armed=health.execution_armed,
             paused=health.paused,
             trading_disabled_reason=health.trading_disabled_reason,
             phase=market.phase,
@@ -401,4 +460,11 @@ class DecisionEngine:
             clock_drift_ms=health.clock_drift_ms,
             runtime_healthy=health.healthy,
             runtime_detail=health.detail,
+            supervisor_ready=health.supervisor_ready,
+            supervisor_detail=health.supervisor_detail,
+            wallet_connected=health.wallet_connected,
+            wallet_status=health.wallet_status,
+            orphan_orders=health.orphan_orders,
+            available_balance=health.available_balance,
+            trace_id=trace_id_for(snapshot.market_slug, snapshot.offset_seconds),
         )

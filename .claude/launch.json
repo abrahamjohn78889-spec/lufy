@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "arc",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-c", "import time, sys; sys.stdout.write('ready'); sys.stdout.flush(); time.sleep(3600)"],
+      "autoPort": true,
+      "url": "http://127.0.0.1:0"
+    }
+  ]
+}

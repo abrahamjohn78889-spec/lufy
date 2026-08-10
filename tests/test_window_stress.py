@@ -49,8 +49,10 @@ LATE_DEVIATIONS = (Decimal("0"), Decimal("300"), Decimal("600"))
 LATE_WINDOW_SECONDS = 15
 
 # Markets alternate direction. A DOWN market's PTB sits above the flat price, so its
-# opening TWAP is below the PTB; an UP market's PTB equals it (equality resolves UP).
-DOWN_PTB_PREMIUM = Decimal("50")
+# opening TWAP is below the PTB; an UP market's PTB sits below it. Both are STRICTLY
+# offset: direction determination uses strict comparison, and a PTB equal to the flat
+# price would yield NO_DIRECTION for every UP market rather than an UP direction.
+PTB_OFFSET = Decimal("50")
 
 
 def _trading() -> TradingConfig:
@@ -62,7 +64,7 @@ def _is_down_market(index: int) -> bool:
 
 
 def _ptb_for(index: int) -> Decimal:
-    return BASE_PRICE + (DOWN_PTB_PREMIUM if _is_down_market(index) else Decimal("0"))
+    return BASE_PRICE + (PTB_OFFSET if _is_down_market(index) else -PTB_OFFSET)
 
 
 def _price_for(step: int) -> Decimal:
@@ -324,10 +326,15 @@ class TestNoMemoryGrowth:
         Counting live MarketInstance objects after a gc is the direct test. A rotator
         that kept every market would show ~120 here.
         """
+        before = {id(o) for o in gc.get_objects() if isinstance(o, MarketInstance)}
         run = _run(tmp_path)
         del run.state_paths, run.triggers
         gc.collect()
-        alive = [o for o in gc.get_objects() if isinstance(o, MarketInstance)]
+        alive = [
+            o
+            for o in gc.get_objects()
+            if isinstance(o, MarketInstance) and id(o) not in before
+        ]
         # At most the two the rotator legitimately holds, plus any the test frame
         # happens to reference.
         assert len(alive) <= 4, f"{len(alive)} MarketInstances alive after {MARKET_COUNT} markets"
@@ -350,10 +357,18 @@ class TestNoMemoryGrowth:
         """
         import asyncio
 
+        def _live(kind: type) -> set[int]:
+            return {id(o) for o in gc.get_objects() if isinstance(o, kind)}
+
+        # Scoped to objects this run creates. gc.get_objects() is process-wide, so
+        # an unscoped sweep also counts finished Tasks other test modules left
+        # reachable and fails on their leaks instead of this engine's.
+        before_handles = _live(asyncio.TimerHandle)
+        before_tasks = _live(asyncio.Task)
         run = _run(tmp_path, market_count=20)
         gc.collect()
-        handles = [o for o in gc.get_objects() if isinstance(o, asyncio.TimerHandle)]
-        tasks = [o for o in gc.get_objects() if isinstance(o, asyncio.Task)]
+        handles = _live(asyncio.TimerHandle) - before_handles
+        tasks = _live(asyncio.Task) - before_tasks
         run.close()
         assert not handles, f"{len(handles)} asyncio TimerHandles exist after the run"
         assert not tasks, f"{len(tasks)} asyncio Tasks exist after the run"

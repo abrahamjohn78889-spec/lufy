@@ -5,7 +5,7 @@ asserts that each condition an operator can actually create reaches the log with
 own reason — because a gate that is correct in isolation and unreachable in practice
 protects nothing.
 
-Three of the fourteen gates are defence in depth and cannot be reached through the
+Seven of the nineteen gates are defence in depth and cannot be reached through the
 engine at all; the last class documents why, and asserts it, rather than leaving the
 absence of a test to look like an oversight.
 """
@@ -85,7 +85,9 @@ class TestGate1TradingEnabled:
     def test_the_shipped_default_refuses(self, store: Store, market: MarketInstance) -> None:
         """UNVERIFIED is the startup value. A fresh install must not trade."""
         default = RuntimeHealth(
-            trading_enabled=True, spec_status=SettlementSpecStatus.UNVERIFIED
+            trading_enabled=True,
+            spec_status=SettlementSpecStatus.UNVERIFIED,
+            execution_armed=True,
         )
         reason, _, _ = _denial(store, market, health=default)
         assert reason is DenialReason.TRADING_DISABLED_SPEC_UNVERIFIED
@@ -122,7 +124,25 @@ class TestGate1TradingEnabled:
         assert market.intents == []
 
 
-class TestGate2MarketPhase:
+class TestGate2ExecutionArmed:
+    def test_a_disarmed_operator_refuses_every_trade(
+        self, store: Store, market: MarketInstance
+    ) -> None:
+        """The post-startup default. Everything else keeps running; only submission
+        stops, and the reason names the button rather than a fault."""
+        reason, gate, _ = _denial(store, market, health=healthy(execution_armed=False))
+        assert reason is DenialReason.EXECUTION_NOT_ARMED
+        assert gate == "execution_armed"
+
+    def test_nothing_is_persisted_while_disarmed(
+        self, store: Store, market: MarketInstance
+    ) -> None:
+        _denial(store, market, health=healthy(execution_armed=False))
+        assert not store.has_intent(market.slug, 3)
+        assert market.intents == []
+
+
+class TestGate3MarketPhase:
     def test_a_cancelling_market_refuses(self, store: Store, market: MarketInstance) -> None:
         """A10/D1: the phase is the ONLY execution boundary. There is no lead-time
         gate, and nothing here reads a clock to decide whether an action is too late."""
@@ -153,7 +173,7 @@ class TestGate2MarketPhase:
         assert phase.value in detail
 
 
-class TestGate6DuplicateIntent:
+class TestGate7DuplicateIntent:
     def test_a_window_that_already_decided_is_refused(
         self, store: Store, market: MarketInstance
     ) -> None:
@@ -173,7 +193,7 @@ class TestGate6DuplicateIntent:
         assert fresh_market.intents == []
 
 
-class TestGate7TradeQuota:
+class TestGate8TradeQuota:
     def test_an_exhausted_budget_refuses(self, store: Store) -> None:
         market = fired_market(fired=(5, 3))
         store.create_market(market, NOW)
@@ -213,7 +233,7 @@ class TestGate7TradeQuota:
         assert decision.detail == "1 used + 0 reserved of 1"
 
 
-class TestGate8OpposingDirection:
+class TestGate9OpposingDirection:
     def _split_market(self, store: Store) -> MarketInstance:
         """Windows that froze on opposite sides of the PTB — a real configuration.
 
@@ -267,7 +287,7 @@ class TestGate8OpposingDirection:
         assert outcome.denials == ()
 
 
-class TestGate9PositionLimit:
+class TestGate10PositionLimit:
     def test_the_process_wide_limit_refuses(
         self, store: Store, market: MarketInstance
     ) -> None:
@@ -284,7 +304,7 @@ class TestGate9PositionLimit:
         assert len(engine.decide(market, NOW).intents) == 1
 
 
-class TestGate10EntryBand:
+class TestGate11EntryBand:
     def test_a_price_above_the_band_is_refused(
         self, store: Store, market: MarketInstance
     ) -> None:
@@ -321,7 +341,7 @@ class TestGate10EntryBand:
         assert intent.limit_price == Decimal(price)
 
 
-class TestGate11ExchangeMinimum:
+class TestGate12ExchangeMinimum:
     """The reachable case is narrow, and that is the point.
 
     Config invariant 8 already refuses a budget that cannot buy the minimum at the top
@@ -370,7 +390,7 @@ class TestGate11ExchangeMinimum:
         assert intent.size == Decimal("35")
 
 
-class TestGate12LossLimits:
+class TestGate13LossLimits:
     def test_the_daily_loss_limit_refuses(self, store: Store, market: MarketInstance) -> None:
         reason, gate, detail = _denial(
             store, market, health=healthy(daily_loss_usd=Decimal("50.00"))
@@ -399,7 +419,7 @@ class TestGate12LossLimits:
         assert len(engine.decide(market, NOW).intents) == 1
 
 
-class TestGate13FeedFreshness:
+class TestGate14FeedFreshness:
     def test_a_blocked_feed_refuses(self, store: Store, market: MarketInstance) -> None:
         """The quiet failure: the socket is up, the process is healthy, the last
         observation is forty seconds old, and the TWAP describes a market that has
@@ -421,7 +441,7 @@ class TestGate13FeedFreshness:
         assert detail == "last observation never ago"
 
 
-class TestGate14RuntimeHealth:
+class TestGate15RuntimeHealth:
     def test_critical_clock_drift_refuses(self, store: Store, market: MarketInstance) -> None:
         """On a three-second window, drift near a one-second threshold consumes a
         third of the window: the process would compute a window_ts for the wrong
@@ -525,7 +545,7 @@ class TestTheGatesThatCannotBeReachedFromHere:
         instance.phase = MarketPhase.ACTIVE
         instance.accumulator.add(BASE_PTB)
         instance.window(3).freeze(
-            opening_twap=BASE_PTB,
+            opening_twap=BASE_PTB + Decimal("100"),
             ptb=BASE_PTB,
             buffer=Decimal("1.00"),
             frozen_at=float(1754400000),
@@ -551,13 +571,14 @@ class TestTheGatesThatCannotBeReachedFromHere:
 
 class TestEveryGateIsAccountedFor:
     def test_the_inventory_matches_the_engine(self) -> None:
-        """Union of the frozen specifications: fourteen distinct gates, no merges."""
-        assert len(GATE_ORDER) == 14
-        assert len(set(GATE_ORDER)) == 14
+        """Union of the frozen specifications: nineteen distinct gates, no merges."""
+        assert len(GATE_ORDER) == 19
+        assert len(set(GATE_ORDER)) == 19
 
     def test_every_gate_is_either_exercised_here_or_documented_unreachable(self) -> None:
         exercised = {
             "trading_enabled",
+            "execution_armed",
             "market_phase",
             "duplicate_intent",
             "trade_quota",
@@ -569,7 +590,17 @@ class TestEveryGateIsAccountedFor:
             "feed_freshness",
             "runtime_health",
         }
-        unreachable = {"window_triggered", "price_to_beat", "strategy_enabled"}
+        unreachable = {
+            "window_triggered",
+            "price_to_beat",
+            "strategy_enabled",
+            # Gates 16-19 need a venue the paper engine does not have. Reached
+            # directly in test_risk.py, where the context is built by hand.
+            "supervisor_ready",
+            "wallet_connected",
+            "orphan_orders",
+            "available_balance",
+        }
         assert exercised | unreachable == set(GATE_ORDER)
         assert exercised.isdisjoint(unreachable)
 

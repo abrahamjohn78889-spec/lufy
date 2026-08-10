@@ -51,7 +51,7 @@ QUOTE = Decimal("0.70")
 # and would report zero fires and prove nothing.
 LATE_DEVIATIONS = (Decimal("0"), Decimal("300"), Decimal("600"))
 LATE_WINDOW_SECONDS = 15
-DOWN_PTB_PREMIUM = Decimal("50")
+PTB_OFFSET = Decimal("50")
 
 
 def _is_down_market(index: int) -> bool:
@@ -59,11 +59,12 @@ def _is_down_market(index: int) -> bool:
 
 
 def _ptb_for(index: int) -> Decimal:
-    """A DOWN market's PTB sits above the flat price; an UP market's equals it.
+    """A DOWN market's PTB sits above the flat price; an UP market's sits below it.
 
-    Equality resolves UP (A12: `>=`), which is why the UP case needs no premium.
+    Both are STRICTLY offset. Direction determination compares with `>` and `<` only,
+    so a PTB equal to the flat price yields NO_DIRECTION, not UP.
     """
-    return BASE_PRICE + (DOWN_PTB_PREMIUM if _is_down_market(index) else Decimal("0"))
+    return BASE_PRICE + (PTB_OFFSET if _is_down_market(index) else -PTB_OFFSET)
 
 
 def _price_for(step: int) -> Decimal:
@@ -82,7 +83,11 @@ def _health() -> RuntimeHealth:
     Stated explicitly rather than defaulted, because the shipped default is DISABLED
     (A8) and a harness that quietly enabled trading would hide that.
     """
-    return RuntimeHealth(trading_enabled=True, spec_status=SettlementSpecStatus.VERIFIED)
+    return RuntimeHealth(
+        trading_enabled=True,
+        spec_status=SettlementSpecStatus.VERIFIED,
+        execution_armed=True,
+    )
 
 
 class _Run:

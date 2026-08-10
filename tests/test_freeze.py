@@ -27,7 +27,7 @@ from conftest import OFFSETS, WINDOW_TS
 from arc.config import TradingConfig, build_trading_config
 from arc.domain.enums import Direction, MarketPhase, WindowState
 from arc.domain.models import ExecutionWindow, MarketInstance, Observation
-from arc.errors import StorageError, WindowFreezeError
+from arc.errors import NoDirectionError, StorageError, WindowFreezeError
 from arc.storage.store import Store
 from arc.windows.freeze import freeze_due_window, freeze_window, restore_window
 
@@ -40,7 +40,7 @@ def _trading(values: dict[str, str] | None = None) -> TradingConfig:
     return build_trading_config(dict(values or VALID_TRADING_VALUES))
 
 
-def _market(store: Store, *, ptb: str = "64000.00", prices: tuple[str, ...] = ("64000.00",)) -> MarketInstance:
+def _market(store: Store, *, ptb: str = "64000.00", prices: tuple[str, ...] = ("64100.00",)) -> MarketInstance:
     market = MarketInstance.create(WINDOW_TS, OFFSETS)
     store.create_market(market, float(WINDOW_TS))
     market.phase = MarketPhase.ACTIVE
@@ -94,12 +94,15 @@ class TestSuccessfulFreeze:
         assert window.direction is Direction.DOWN
         assert window.locked_trigger == Decimal("63900.00") - Decimal("2.00")
 
-    def test_equality_resolves_up(self, store: Store) -> None:
-        """twap == ptb is UP. Stated in A12 and tested because it is a coin-flip otherwise."""
+    def test_equality_yields_no_direction_and_no_freeze(self, store: Store) -> None:
+        """The direction contract: twap == ptb is neither side, so nothing is frozen."""
         market = _market(store, ptb="64000.00", prices=("64000.00",))
         window = market.window(10)
-        freeze_window(market, window, trading=_trading(), store=store, now=float(WINDOW_TS))
-        assert window.direction is Direction.UP
+        with pytest.raises(NoDirectionError):
+            freeze_window(market, window, trading=_trading(), store=store, now=float(WINDOW_TS))
+        for name in FROZEN_VALUE_FIELDS:
+            assert getattr(window, name) is None, f"{name} was frozen on equality"
+        assert window.state is WindowState.PENDING
 
     def test_all_five_windows_share_one_ptb(self, store: Store) -> None:
         """A12: the PTB is captured once and every window freezes against that number."""
@@ -189,7 +192,7 @@ class TestPartialFreezeIsRejected:
         # Deliberately NOT created in the store.
         market.phase = MarketPhase.ACTIVE
         market.freeze_ptb("64000.00")
-        market.add_observation(Observation(ts=float(WINDOW_TS), price=Decimal("64000.00")))
+        market.add_observation(Observation(ts=float(WINDOW_TS), price=Decimal("64100.00")))
         window = market.window(10)
         with pytest.raises(WindowFreezeError, match="no row to update"):
             freeze_window(market, window, trading=_trading(), store=store, now=float(WINDOW_TS))
@@ -213,7 +216,7 @@ class TestPartialFreezeIsRejected:
             market, window, trading=trading, store=store, now=float(WINDOW_TS)
         )
         _assert_unfrozen(window)
-        market.add_observation(Observation(ts=float(WINDOW_TS), price=Decimal("64000.00")))
+        market.add_observation(Observation(ts=float(WINDOW_TS), price=Decimal("64100.00")))
         assert freeze_due_window(
             market, window, trading=trading, store=store, now=float(WINDOW_TS + 1)
         )
@@ -292,7 +295,7 @@ class TestFrozenValuesAreImmutable:
             market.freeze_window(10, buffer=Decimal("9.99"), frozen_at=float(WINDOW_TS + 1))
 
     def test_a_moving_twap_does_not_move_a_locked_trigger(self, store: Store) -> None:
-        market = _market(store, prices=("64000.00",))
+        market = _market(store, prices=("64100.00",))
         window = market.window(10)
         freeze_window(market, window, trading=_trading(), store=store, now=float(WINDOW_TS))
         locked = window.locked_trigger
@@ -336,8 +339,77 @@ class TestEveryQuantityIsDecimal:
 
     def test_the_trigger_is_exact_to_the_cent(self, store: Store) -> None:
         """A float would give 64001.999999999996 here. Decimal gives 64002.00 exactly."""
-        market = _market(store, ptb="64000.00", prices=("64000.00",))
+        market = _market(store, ptb="63900.00", prices=("64000.00",))
         window = market.window(10)
         freeze_window(market, window, trading=_trading(), store=store, now=float(WINDOW_TS))
         assert window.locked_trigger == Decimal("64002.00")
         assert str(window.locked_trigger) == "64002.00"
+
+
+class TestEqualityIsTerminalNotRetried:
+    """The direction contract: equality is a final verdict, not a rejected freeze.
+
+    A rejected freeze is retried on the next pass, which is correct when the cause is
+    "no observation yet". Equality must NOT be retried: direction is determined once,
+    at the opening instant, and a retry would freeze against a later TWAP.
+    """
+
+    def test_freeze_due_window_marks_no_direction(self, store: Store) -> None:
+        market = _market(store, ptb="64000.00", prices=("64000.00",))
+        window = market.window(10)
+        assert not freeze_due_window(
+            market, window, trading=_trading(), store=store, now=float(WINDOW_TS)
+        )
+        assert window.state is WindowState.NO_DIRECTION
+
+    def test_a_later_moved_twap_cannot_freeze_a_direction(self, store: Store) -> None:
+        market = _market(store, ptb="64000.00", prices=("64000.00",))
+        window = market.window(10)
+        trading = _trading()
+        freeze_due_window(market, window, trading=trading, store=store, now=float(WINDOW_TS))
+        for _ in range(20):
+            market.add_observation(Observation(ts=float(WINDOW_TS), price=Decimal("70000.00")))
+        assert not freeze_due_window(
+            market, window, trading=trading, store=store, now=float(WINDOW_TS + 1)
+        )
+        assert window.state is WindowState.NO_DIRECTION
+        assert window.direction is None
+
+    def test_it_is_not_logged_as_an_error(
+        self, store: Store, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        market = _market(store, ptb="64000.00", prices=("64000.00",))
+        with caplog.at_level(logging.DEBUG, logger="arc"):
+            freeze_due_window(
+                market,
+                market.window(10),
+                trading=_trading(),
+                store=store,
+                now=float(WINDOW_TS),
+                logger=logging.getLogger("arc.test.freeze"),
+            )
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    def test_it_survives_a_restart(self, store: Store) -> None:
+        """Without the persisted state a reload would come back PENDING and re-decide."""
+        market = _market(store, ptb="64000.00", prices=("64000.00",))
+        freeze_due_window(
+            market, market.window(10), trading=_trading(), store=store, now=float(WINDOW_TS)
+        )
+        fresh = MarketInstance.create(WINDOW_TS, OFFSETS)
+        assert restore_window(fresh, 10, store=store)
+        assert fresh.window(10).state is WindowState.NO_DIRECTION
+
+    def test_the_remaining_windows_are_still_monitored(self, store: Store) -> None:
+        """One window finding no direction must not end the market."""
+        market = _market(store, ptb="64000.00", prices=("64000.00",))
+        trading = _trading()
+        assert not freeze_due_window(
+            market, market.window(10), trading=trading, store=store, now=float(WINDOW_TS)
+        )
+        market.add_observation(Observation(ts=float(WINDOW_TS), price=Decimal("64200.00")))
+        assert freeze_due_window(
+            market, market.window(5), trading=trading, store=store, now=float(WINDOW_TS + 1)
+        )
+        assert market.window(5).state is WindowState.FROZEN
+        assert market.window(5).direction is Direction.UP

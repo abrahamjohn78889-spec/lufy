@@ -16,16 +16,24 @@ recomputed here.
 
 from __future__ import annotations
 
+import hashlib
+
 from arc.decision.snapshot import DecisionSnapshot
 from arc.domain.models import ExecutionIntent
 from arc.strategy.protocol import StrategyDecision
 
-__all__ = ["build_intent", "intent_id_for"]
+__all__ = ["build_intent", "intent_id_for", "trace_id_for"]
 
 
 def intent_id_for(market_slug: str, offset_seconds: int) -> str:
     """`slug:offset`. Deterministic, and unique by the same key SQLite enforces."""
     return f"{market_slug}:{offset_seconds}"
+
+
+def trace_id_for(market_slug: str, offset_seconds: int) -> str:
+    """Stable logical-trade identity, created once with the immutable intent."""
+    value = f"{market_slug}:{offset_seconds}".encode()
+    return hashlib.sha256(value).hexdigest()[:24]
 
 
 def build_intent(
@@ -55,6 +63,7 @@ def build_intent(
         locked_trigger=snapshot.locked_trigger,
         created_at=created_at,
         intent_id=intent_id_for(snapshot.market_slug, snapshot.offset_seconds),
+        trace_id=trace_id_for(snapshot.market_slug, snapshot.offset_seconds),
         opening_twap=snapshot.opening_twap,
         ptb=snapshot.ptb,
         buffer=snapshot.buffer,

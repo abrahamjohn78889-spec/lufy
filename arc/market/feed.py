@@ -50,6 +50,7 @@ __all__ = [
     "RTDS_URL",
     "SDK_STALE_THRESHOLD_MS",
     "BackoffPolicy",
+    "ReconnectingStream",
     "RtdsFeed",
     "subscribe_frame",
 ]
@@ -133,6 +134,73 @@ class BackoffPolicy:
         return min(delay, self.max_seconds)
 
 
+class ReconnectingStream:
+    """A frame iterator that reconnects forever with bounded backoff.
+
+    Extracted from RtdsFeed so the Chainlink provider reuses the identical ladder
+    rather than growing a second one. Two implementations of "reconnect" would
+    eventually disagree about when to give up, and the one that gave up would do
+    so on the provider nobody was watching.
+
+    The opener is a callable returning a connected socket, so what differs between
+    providers — a subscribe frame here, three signed headers there — stays in the
+    provider and never in the retry logic.
+    """
+
+    __slots__ = ("_backoff", "_logger", "_name", "_open", "_url", "connected", "disconnects")
+
+    def __init__(
+        self,
+        opener: Callable[[], Awaitable[Any]],
+        *,
+        name: str,
+        url: str,
+        backoff: BackoffPolicy | None = None,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self._open = opener
+        self._name = name
+        self._url = url
+        self._backoff = backoff if backoff is not None else BackoffPolicy()
+        self._logger = logger
+        self.connected = False
+        self.disconnects = 0
+
+    async def frames(self) -> AsyncIterator[str | bytes]:
+        attempt = 0
+        while True:
+            socket: Any = None
+            try:
+                socket = await self._open()
+                self.connected = True
+                attempt = 0
+                log_event(logging.INFO, f"{self._name} Connected", self._url, logger=self._logger)
+                async for frame in socket:
+                    yield frame
+                raise ConnectionLostError(f"{self._url} closed the stream")
+            except asyncio.CancelledError:
+                raise
+            except (ConnectionLostError, FeedError, OSError, websockets.WebSocketException) as exc:
+                # A drop is a socket that WAS up and went down. A failed connect
+                # attempt is not a drop; counting both would make one outage read
+                # as a dozen dropped sockets and hide the ladder that caused them.
+                self.disconnects += 1 if self.connected else 0
+                self.connected = False
+                attempt += 1
+                delay = self._backoff.delay_for(attempt)
+                log_event(
+                    logging.WARNING,
+                    f"{self._name} Disconnected",
+                    f"{exc}  reconnecting in {delay:.1f}s (attempt {attempt})",
+                    logger=self._logger,
+                )
+                await asyncio.sleep(delay)
+            finally:
+                if socket is not None:
+                    with contextlib.suppress(Exception):
+                        await socket.close()
+
+
 class RtdsFeed:
     """One RTDS connection. Yields raw payloads; validates nothing.
 
@@ -153,6 +221,7 @@ class RtdsFeed:
         "_url",
         "connect_attempts",
         "connected",
+        "disconnects",
         "keepalives_sent",
         "messages_received",
     )
@@ -175,9 +244,9 @@ class RtdsFeed:
         self._logger = logger
         self.connected = False
         self.connect_attempts = 0
+        self.disconnects = 0
         self.messages_received = 0
         self.keepalives_sent = 0
-
     @property
     def url(self) -> str:
         return self._url
@@ -239,6 +308,8 @@ class RtdsFeed:
             except asyncio.CancelledError:
                 raise
             except (ConnectionLostError, FeedError, OSError, websockets.WebSocketException) as exc:
+                # See ReconnectingStream: only a socket that was up counts as dropped.
+                self.disconnects += 1 if self.connected else 0
                 self.connected = False
                 attempt += 1
                 delay = self._backoff.delay_for(attempt)

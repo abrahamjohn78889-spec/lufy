@@ -31,7 +31,7 @@ from arc.domain.models import (
     Settlement,
     TwapAccumulator,
 )
-from arc.errors import ObservationRejectedError, WindowFreezeError
+from arc.errors import NoDirectionError, ObservationRejectedError, WindowFreezeError
 
 
 def _obs(ts: float, price: str) -> Observation:
@@ -200,13 +200,36 @@ class TestExecutionWindowFreezeIsAtomic:
         assert window.locked_trigger == Decimal("120012.00")
         assert window.frozen_at == 100.0
 
-    def test_up_direction_when_twap_at_or_above_ptb(self) -> None:
+    def test_up_direction_when_twap_is_strictly_above_ptb(self) -> None:
         window = ExecutionWindow(offset_seconds=3)
         window.freeze(
-            opening_twap=Decimal("100"), ptb=Decimal("100"), buffer=Decimal("1"), frozen_at=0.0
+            opening_twap=Decimal("100"), ptb=Decimal("99"), buffer=Decimal("1"), frozen_at=0.0
         )
         assert window.direction is Direction.UP
         assert window.locked_trigger == Decimal("101")
+
+    def test_equality_yields_no_direction_and_freezes_nothing(self) -> None:
+        """Strict comparison only. Equality is the absence of a direction, not a tie."""
+        window = ExecutionWindow(offset_seconds=3)
+        with pytest.raises(NoDirectionError):
+            window.freeze(
+                opening_twap=Decimal("100"), ptb=Decimal("100"), buffer=Decimal("1"),
+                frozen_at=0.0,
+            )
+        assert window.state is WindowState.PENDING
+        assert window.direction is None
+        assert window.locked_trigger is None
+        assert window.opening_twap is None
+        assert window.ptb is None
+        assert window.buffer is None
+        assert window.frozen_at is None
+
+    def test_no_direction_is_terminal(self) -> None:
+        """mark_expired must not overwrite it: the two mean different things."""
+        window = ExecutionWindow(offset_seconds=3)
+        window.state = WindowState.NO_DIRECTION
+        window.mark_expired()
+        assert window.state is WindowState.NO_DIRECTION
 
     def test_down_direction_when_twap_below_ptb(self) -> None:
         window = ExecutionWindow(offset_seconds=3)
@@ -219,17 +242,17 @@ class TestExecutionWindowFreezeIsAtomic:
     def test_second_freeze_is_refused(self) -> None:
         window = ExecutionWindow(offset_seconds=3)
         window.freeze(
-            opening_twap=Decimal("100"), ptb=Decimal("100"), buffer=Decimal("1"), frozen_at=0.0
+            opening_twap=Decimal("100"), ptb=Decimal("99"), buffer=Decimal("1"), frozen_at=0.0
         )
         with pytest.raises(WindowFreezeError, match="already frozen"):
             window.freeze(
-                opening_twap=Decimal("100"), ptb=Decimal("100"), buffer=Decimal("1"), frozen_at=1.0
+                opening_twap=Decimal("100"), ptb=Decimal("99"), buffer=Decimal("1"), frozen_at=1.0
             )
 
     def test_second_freeze_with_identical_values_is_still_refused(self) -> None:
         """A no-op second call is still a second write path; refuse it regardless."""
         window = ExecutionWindow(offset_seconds=3)
-        args = {"opening_twap": Decimal("100"), "ptb": Decimal("100"), "buffer": Decimal("1")}
+        args = {"opening_twap": Decimal("100"), "ptb": Decimal("99"), "buffer": Decimal("1")}
         window.freeze(**args, frozen_at=0.0)
         with pytest.raises(WindowFreezeError):
             window.freeze(**args, frozen_at=0.0)
@@ -410,7 +433,7 @@ class TestWindowFiringAndExpiry:
     def test_mark_fired_from_frozen(self) -> None:
         window = ExecutionWindow(offset_seconds=3)
         window.freeze(
-            opening_twap=Decimal("100"), ptb=Decimal("100"), buffer=Decimal("1"), frozen_at=0.0
+            opening_twap=Decimal("100"), ptb=Decimal("99"), buffer=Decimal("1"), frozen_at=0.0
         )
         window.mark_fired(5.0)
         assert window.state is WindowState.FIRED
@@ -424,7 +447,7 @@ class TestWindowFiringAndExpiry:
     def test_mark_fired_twice_is_refused(self) -> None:
         window = ExecutionWindow(offset_seconds=3)
         window.freeze(
-            opening_twap=Decimal("100"), ptb=Decimal("100"), buffer=Decimal("1"), frozen_at=0.0
+            opening_twap=Decimal("100"), ptb=Decimal("99"), buffer=Decimal("1"), frozen_at=0.0
         )
         window.mark_fired(5.0)
         with pytest.raises(WindowFreezeError):
@@ -439,7 +462,7 @@ class TestWindowFiringAndExpiry:
         """The operator can see what the window was waiting for after it expires."""
         window = ExecutionWindow(offset_seconds=3)
         window.freeze(
-            opening_twap=Decimal("100"), ptb=Decimal("100"), buffer=Decimal("1"), frozen_at=0.0
+            opening_twap=Decimal("100"), ptb=Decimal("99"), buffer=Decimal("1"), frozen_at=0.0
         )
         window.mark_expired()
         assert window.state is WindowState.EXPIRED
@@ -449,7 +472,7 @@ class TestWindowFiringAndExpiry:
     def test_mark_expired_from_fired_is_a_no_op(self) -> None:
         window = ExecutionWindow(offset_seconds=3)
         window.freeze(
-            opening_twap=Decimal("100"), ptb=Decimal("100"), buffer=Decimal("1"), frozen_at=0.0
+            opening_twap=Decimal("100"), ptb=Decimal("99"), buffer=Decimal("1"), frozen_at=0.0
         )
         window.mark_fired(5.0)
         window.mark_expired()

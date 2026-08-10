@@ -42,6 +42,7 @@ __all__ = [
     "MarketDiscovery",
     "MarketMetadata",
     "SlugMath",
+    "build_discovery",
     "decode_json",
     "next_slug_math",
     "open_discovery",
@@ -369,6 +370,10 @@ class MarketDiscovery:
         self._url = url
         self._logger = logger
 
+    async def aclose(self) -> None:
+        """Close the underlying HTTP client. Idempotent."""
+        await self._client.aclose()
+
     async def fetch_metadata(self, slug: str) -> MarketMetadata:
         """Fetch one market's metadata by slug. Raises FeedError on any failure.
 
@@ -432,6 +437,23 @@ class MarketDiscovery:
             computed_close_ts=math.close_ts,
             metadata=metadata,
         )
+
+
+def build_discovery(
+    *,
+    url: str = GAMMA_MARKETS_URL,
+    logger: logging.Logger | None = None,
+) -> MarketDiscovery:
+    """A discovery owning a fresh HTTP client. Caller closes it with `aclose()`.
+
+    The un-scoped sibling of `open_discovery`, for the supervisor: a runtime that
+    is started and stopped by the dashboard has no `async with` block to live
+    inside, because its lifetime is bounded by an operator's two button presses
+    rather than by a function body. Constructed here for the same reason as
+    `open_discovery` — `httpx` is named only inside arc/market/, so every layer
+    above stays reachable from a test with no network.
+    """
+    return MarketDiscovery(httpx.AsyncClient(), url=url, logger=logger)
 
 
 @asynccontextmanager

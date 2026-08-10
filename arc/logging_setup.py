@@ -23,13 +23,17 @@ import logging
 import logging.handlers
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Final
+from zoneinfo import ZoneInfo
 
 __all__ = [
     "LOGGER_NAME",
     "ArcLineFormatter",
     "RedactionFilter",
+    "SessionFilter",
+    "attach_session_id",
     "ensure_utf8_streams",
     "get_logger",
     "log_event",
@@ -133,8 +137,59 @@ class RedactionFilter(logging.Filter):
         return True
 
 
+class SessionFilter(logging.Filter):
+    """Stamps every record with the runtime session id that produced it.
+
+    A filter rather than a LoggerAdapter. An adapter's `process` REPLACES the
+    caller's `extra` dict with its own, which would silently erase `arc_detail`
+    from every line in the codebase — the reason text on every denial, every
+    rejection and every PTB failure — leaving lines that look complete and carry
+    no reason.
+    """
+
+    def __init__(self, runtime_session_id: str) -> None:
+        super().__init__()
+        self._session_id = runtime_session_id
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Never overwrite an id already on the record: a nested runtime's own
+        # stamp is more specific than ours.
+        if not getattr(record, "arc_session_id", ""):
+            record.arc_session_id = self._session_id
+        return True
+
+
+def attach_session_id(logger: logging.Logger, runtime_session_id: str) -> SessionFilter:
+    """Stamp this logger's records with a session id. Idempotent per session.
+
+    Idempotent because a second runtime construction against the same logger — the
+    normal case across a supervisor restart, and across tests sharing a logger —
+    would otherwise stack filters and leave the FIRST session's id winning, so
+    every line after a restart would be attributed to the runtime that ended.
+    """
+    for existing in logger.filters:
+        if isinstance(existing, SessionFilter):
+            if existing.session_id == runtime_session_id:
+                return existing
+            logger.removeFilter(existing)
+    added = SessionFilter(runtime_session_id)
+    logger.addFilter(added)
+    return added
+
+
 class ArcLineFormatter(logging.Formatter):
     """Formats a record as one plain line: HH:MM:SS, marker, event, detail."""
+
+    def __init__(self, timezone: str = "") -> None:
+        super().__init__()
+        # Blank means the host's own zone. A name pins it, which is what lets a VPS
+        # in one region write timestamps an operator in another can line up against
+        # the Polymarket page without doing arithmetic during an incident.
+        self._zone = ZoneInfo(timezone) if timezone else None
 
     # Local time, not UTC. The operator reads these beside the Polymarket page and
     # a UTC log next to a local-time countdown makes every incident harder to
@@ -143,7 +198,9 @@ class ArcLineFormatter(logging.Formatter):
     def formatTime(
         self, record: logging.LogRecord, datefmt: str | None = None
     ) -> str:
-        return time.strftime("%H:%M:%S", time.localtime(record.created))
+        if self._zone is None:
+            return time.strftime("%H:%M:%S", time.localtime(record.created))
+        return datetime.fromtimestamp(record.created, self._zone).strftime("%H:%M:%S")
 
     def format(self, record: logging.LogRecord) -> str:
         marker = _LEVEL_MARKERS.get(record.levelno, " ")
@@ -167,6 +224,7 @@ def setup_logging(
     *,
     secrets: tuple[str, ...] = (),
     level: int = logging.INFO,
+    timezone: str = "",
     console: bool = True,
     retention_days: int = 30,
 ) -> logging.Logger:
@@ -189,7 +247,7 @@ def setup_logging(
         logger.removeHandler(handler)
         handler.close()
 
-    formatter = ArcLineFormatter()
+    formatter = ArcLineFormatter(timezone)
     redaction = RedactionFilter(secrets)
 
     file_handler = logging.handlers.TimedRotatingFileHandler(

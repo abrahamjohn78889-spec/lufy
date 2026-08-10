@@ -1,0 +1,311 @@
+# ARC
+
+A deterministic trading bot for Polymarket's 5-minute BTC Up/Down markets. One
+VPS, one Python process, one SQLite file, one strategy, no cluster.
+
+## What it does
+
+Every five minutes Polymarket opens a BTC Up/Down market with an official Price
+To Beat. ARC accumulates a signal TWAP from a price feed, and at configured
+seconds-before-close windows it freezes the PTB and the TWAP, determines a
+direction, and submits a passive maker limit order if the frozen values clear the
+configured buffer. It does not chase, it does not market-order, and it never
+computes a PTB — the official value is fetched or the market is skipped.
+
+## Requirements
+
+- Python 3.12 or 3.13
+- SQLite (stdlib)
+- A Polymarket account with API credentials, for V2 only
+
+```bash
+pip install -e .
+cp .env.example .env
+```
+
+## Configuration
+
+Two layers, on purpose.
+
+**Infrastructure** — bind address, port, database path, log directory, provider
+URLs, credentials — is read from `.env` on every startup. Change the file,
+restart the process.
+
+**Trading** — windows, buffers, position size, limits, submission count — is read
+from `.env` **only on the first run**, which seeds SQLite. After that SQLite is
+the source of truth and is edited from the dashboard's Settings page. A stale
+`.env` cannot silently revert a buffer the operator changed in the UI.
+
+Precedence: **CLI > SQLite > .env > built-in defaults.** There are no built-in
+defaults for trading values; a substituted buffer is indistinguishable from a
+configured one.
+
+Every setting is documented in [.env.example](.env.example). A test fails the
+build if a field exists in code but not in that file — configuration reachable
+only by reading source is configuration the operator will never find.
+
+### Provider
+
+`ARC_TWAP_PROVIDER=RTDS` (default) or `CHAINLINK`. One provider supplies all TWAP
+data or none of it; there is no fallback, because trading against a different
+price source than the dashboard names is worse than not trading.
+
+Chainlink Data Streams is implemented against the official documented wire format
+and is **configuration-complete but not yet validated against live Chainlink
+credentials.** Supplying valid credentials requires no code change.
+
+## Running
+
+```bash
+arc doctor
+```
+
+Validates configuration, storage, credentials (reported as SET or UNSET, never
+printed) and clock, and prints a full report. Run it before anything else.
+
+```bash
+arc run --mode=v1
+```
+
+Starts the process with the V1 paper runtime up, and serves the dashboard on
+`http://127.0.0.1:8080`.
+
+The bind is loopback and a non-loopback `ARC_API_BIND` is refused at startup.
+There is no login, no session, no token: the network boundary *is* the access
+control. Reach it remotely over SSH:
+
+```bash
+ssh -L 8080:localhost:8080 user@vps
+```
+
+## The two lifecycles
+
+These are separate, and confusing them is the failure the OPS Deck is laid out to
+prevent.
+
+### Runtime lifecycle
+
+```
+Select V1 or V2  →  START RUNTIME  →  Runtime READY  →  STOP RUNTIME
+```
+
+Selecting a mode starts nothing. **START RUNTIME** brings up the entire selected
+system: provider, RTDS or Chainlink, market discovery, PTB discovery, signal
+TWAP, settlement TWAP observation, CLOB, the official websockets, decision, risk
+and limit order engines, recovery, recorder, statistics, Signal Tank, ledger,
+Telegram and health monitoring. The **only** difference between V1 and V2 is the
+execution adapter.
+
+**STOP RUNTIME** disarms trading first, then shuts everything down. No websocket,
+feed, worker, polling task, execution task, recorder or runtime service survives
+it. The process returns to idle with the dashboard still serving — the dashboard
+outlives every runtime, or you could never see that a stop succeeded.
+
+V1 and V2 never run at once, and nothing is reused across a stop except the
+SQLite file. Switching modes performs a full teardown and rebuilds the object
+graph, so two runtimes cannot share execution state, orders, sockets, providers
+or adapters.
+
+V2 additionally requires preflight to pass and refuses to start naming the
+failing checks.
+
+### Trading lifecycle
+
+```
+Configure the Limit Order Engine  →  START TRADING  →  PAUSE / RESUME  →  STOP TRADING
+```
+
+**A running runtime is not a trading runtime.** `execution_armed` is FALSE after
+every start and is never persisted, so a restart comes back disarmed — a gate
+that survived a crash would re-arm a system nobody was watching.
+
+- **START TRADING** arms the Limit Order Engine.
+- **PAUSE TRADING** stops new ExecutionIntents. Resting orders continue to be
+  managed to a terminal state; nothing is cancelled because you paused.
+- **RESUME TRADING** continues, with no runtime restart.
+- **STOP TRADING** disarms. Existing orders continue through reconciliation,
+  fills, settlement and cleanup.
+
+Trading buttons never touch the runtime. Runtime buttons never start trading.
+
+## Three gates
+
+| Gate | Owner | Persisted |
+|---|---|---|
+| `trading_enabled` | the system | yes |
+| `execution_armed` | the operator | no, never |
+| `paused` | the operator | no |
+
+They are displayed independently. A single combined light would hide
+system-disabled-while-armed, which is a real state meaning "the operator wants to
+trade and the system is refusing."
+
+## Three quantities that are never conflated
+
+- **signal TWAP** — the 300 s cumulative mean ARC accumulates. Decides direction.
+- **settlement TWAP** — the venue's official 30 s mean. Observational only.
+- **PTB** — the official Price To Beat, fetched from market metadata, frozen once
+  per market. Never calculated, estimated, interpolated or refreshed.
+
+## Two engines
+
+TWAP is the engine described above and the only one that trades unless MAJORITY is
+switched on deliberately. **MAJORITY** is a second engine in the same process. It
+shares infrastructure — discovery, the market grid, the book refresh, the Executor
+protocol, the Risk Engine, the wallet, the database, reconciliation, fills,
+repricing, sweeping, the event hub, Telegram, the ledger and recovery — and shares
+no decision state at all: trigger state, selected side, order ownership and every
+configured number are per-engine.
+
+MAJORITY reads **Polymarket outcome-share prices only** — the best resting bid on
+each side. Not BTC/USD, not the PTB, not either TWAP, not the midpoint. It runs on
+a two-step rule:
+
+1. the trigger fires when `max(best_bid(UP), best_bid(DOWN)) >= trigger_price`
+2. the side to buy is determined **afterwards**, from a fresh book read
+
+The side that crossed the trigger is not necessarily the side that gets bought. A
+trigger is an instruction to go and look, not an answer.
+
+MAJORITY is not a strategy and does not touch `arc_twap_locked_buffer`. The
+`Strategy` protocol takes `direction` as an input, which cannot express an engine
+that picks its own side after a trigger, so MAJORITY sits beside the Decision
+Engine rather than inside it.
+
+Both engines write to one `orders` table, one `intents` table, one `fills` table
+and one `settlements` table, separated by an `engine` column. TWAP's identifiers
+are unprefixed and unchanged; MAJORITY's carry a `MAJORITY:` prefix, so no
+historical id was rewritten to make room for the second engine.
+
+**MAJORITY ships OFF.** Every value is blank, `enabled` is false, and the eight
+`ARC_MAJORITY_*` keys in `.env.example` are commented out. Because stored settings
+win over `.env`, turning it on means writing the settings table — the Settings page
+or a database backfill — not adding a line to `.env`. Two guards are worth knowing:
+
+- An execution window longer than **30 s** combined with a **non-zero** buffer
+  fails closed. The engine keeps its configuration, submits nothing, and prints the
+  reason on the deck, because no approved live-price buffer formula exists above
+  that window. A 45 s window with a buffer of 0 is a valid configuration.
+- `MAJORITY_SHARES` below the exchange minimum is **refused, never rounded up.** A
+  share count ARC raised is a position size the operator never chose.
+
+MAJORITY added no route. It surfaces on the existing `/status` and `/settings`
+payloads under a `majority` key — read-only on `/settings`, so the dashboard cannot
+write it — and as an eleventh row on the engine panel. Three outcomes there, never
+folded together: OFF reads Waiting (an engine switched off is not a fault),
+fail-closed reads Warning with its reason, and only a tradable engine reads
+Running.
+
+## API
+
+Exactly twelve routes plus one WebSocket. No hidden, admin, diagnostic, export or
+backup endpoints.
+
+```
+POST /start                              POST /stop
+POST /pause                              POST /resume
+GET  /status                             GET  /settings    POST /settings
+GET  /history                            GET  /strategies
+GET  /strategies/{id}                    GET|POST /strategies/{id}/config
+GET  /backtest                           GET  /orderbook
+WS   /ws
+```
+
+`/start` and `/stop` are the runtime lifecycle. Trading is armed through
+`/strategies/{id}/config?action=arm|disarm`. Strategy *parameters* are not
+writable there: one strategy is pinned, and buffers and windows are edited on the
+Settings page.
+
+## Production validation
+
+V1 is the production validation environment, not a simulator: it consumes the
+same live RTDS/Chainlink feed, the same official CLOB order book, the same market
+discovery, the same official PTB and the same TWAPs as V2. The only difference is
+the execution adapter — V1 places simulated orders, V2 places real ones. The
+runtime owns market data once and hands it to whichever adapter is loaded.
+
+The validation report reads the rows a run already wrote. It is not a thirteenth
+route; it is two parameters on `/history`:
+
+```
+GET /history?format=report      the Production Validation Report, plain text
+GET /history?validate=1         the same summary as JSON, alongside the ledger
+GET /history?validate=1&markets=100    bound the audit to the last 100 markets
+```
+
+The report prints the verdict first and its evidence under it:
+
+- **Recorder** — did every market record PTB, both TWAPs, every window, every
+  intent, submission, fill, reconciliation and settlement, with no market gaps.
+  It audits; it never reconstructs a missing value.
+- **Fill statistics by window** — fired, submissions, acknowledged, filled,
+  partial, cancelled, rejected, indeterminate, fill rate and fill latency,
+  bucketed per execution window.
+- **Criteria** — each is PASS, FAIL or UNVERIFIED. UNVERIFIED means the run did
+  not demonstrate it, which is not the same as passing; the verdict stays
+  NOT READY while any criterion is unverified.
+- **Runtime metrics** — uptime, restarts, reconnects, dropped sockets,
+  recoveries, the latencies, recorder size, database growth and validation
+  duration. Two latencies are measured, both from the order row's own
+  timestamps: **submission** (`created_at` → `updated_at`) and **fill**
+  (`created_at` → the first fill). The round trips ARC does not instrument
+  (websocket, CLOB, RTDS, Chainlink) print `UNAVAILABLE (not instrumented)`,
+  because a latency nobody measured, printed beside ones that were, is read as
+  measured. Reconnects, dropped sockets and recoveries are three separate
+  counts: one outage can drive a dozen reconnect attempts, and "how often did
+  the feed go away" is not "how often did it retry". These describe the run;
+  they can never move the verdict.
+
+The verdict is exactly one of `READY FOR V2 LIVE TRADING` or
+`NOT READY FOR V2 LIVE TRADING`, and every failed or unverified criterion is
+listed in full under it.
+
+Five criteria cannot be satisfied by data at all — they need the operator
+watching a live run — and no length of run flips them. CPU, memory, disk and
+network are the host's to report; ARC does not sample them and prints that fact
+rather than a number.
+
+## Transparency
+
+Nothing happens silently. Every significant runtime event appears in the OPS
+Deck, the Signal Tank, the Ledger, Telegram and the logs.
+
+### Dual time
+
+Every displayed instant carries all three of **UTC** (canonical), **IST**
+(`Asia/Kolkata`, the operator) and **ET** (`America/New_York`, the venue), on
+the OPS Deck clocks, every window's open and close, every Ledger record, every
+Signal Tank line, every Telegram message and the Production Validation Report.
+IST and ET are *derived* at render time by `arc/timefmt.py` from the one
+canonical UTC epoch each record already stored — nothing is persisted twice, so
+the zones cannot drift apart across a DST transition, and a replayed run
+shows the same wall clock it showed live. UTC is printed alongside them because
+it is the value every stored row and every log line is keyed on, and therefore
+the one an operator pastes back into a query. Named zones, not fixed offsets:
+New York observes DST, and a hardcoded `-05:00` would be an hour wrong for
+eight months of the year.
+
+Nothing in the trading path reads a derived value. Windows, buffers, freezes,
+PTB, TWAPs and countdowns are computed from the epoch, exactly as before, and a
+test fails if the decision, risk, window, strategy, execution or domain package
+so much as imports the formatter.
+
+Ledger filters accept either zone: `/history?since=2026-08-06 09:00:00&tz=ist`.
+The bound is converted once, on the way in; what is filtered is still the epoch.
+
+## Development
+
+```bash
+python -m ruff check . && python -m mypy arc && python -m pytest -q -p no:randomly
+```
+
+All three must pass. Work commits directly to `main`; there are no feature,
+development or long-lived branches, and the repository stays production-ready.
+
+## Further documentation
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the layers, the two lifecycles,
+  the event stream.
+- [docs/PRODUCTION_CHECKLIST.md](docs/PRODUCTION_CHECKLIST.md) — what to verify
+  before the first live window.
+- `.env.example` — every configuration key, with its default.

@@ -34,6 +34,10 @@ from arc.storage.schema import EXPECTED_TABLES, FORBIDDEN_TABLES
 _CLOCK_MODULE = "clock.py"
 _STORAGE_PACKAGE = "storage"
 _MARKET_PACKAGE = "market"
+# The two packages permitted to open a socket. arc/notify/ is outbound-only: it sends
+# and has no receive path, which is what makes the second exemption narrower than it
+# reads. Any third entry here needs the same argument made explicitly.
+_NETWORK_PACKAGES = (_MARKET_PACKAGE, "notify")
 
 _NETWORK_MODULES = frozenset({"httpx", "websockets", "requests", "aiohttp", "urllib"})
 _MONEY_MODULES = ("money.py", "models.py", "config.py")
@@ -235,11 +239,13 @@ def find_imports_of(
     modules: frozenset[str],
     *,
     exempt_package: str | None = None,
+    exempt_packages: tuple[str, ...] = (),
 ) -> list[str]:
-    """Imports of given top-level modules, optionally exempting one package."""
+    """Imports of given top-level modules, exempting the named package(s)."""
+    exempt = {*exempt_packages, *(() if exempt_package is None else (exempt_package,))}
     offenders: list[str] = []
     for path, tree in files:
-        if exempt_package is not None and exempt_package in path.parts:
+        if exempt & set(path.parts):
             continue
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -587,19 +593,20 @@ class TestMoneyNeverTouchesFloat:
 class TestNoFakeRuntime:
     """A1 Rule 2: nothing is stubbed to make an unbuilt path look functional."""
 
-    def test_run_command_returns_nonzero(self) -> None:
-        import io
+    def test_there_is_no_third_runtime_mode(self) -> None:
+        """Q4: V1 and V2 only. A legacy observe path would be an unused runtime."""
+        from arc.cli import main
+        from arc.domain.enums import Mode
 
-        from arc.cli import run
+        assert [m.value for m in Mode] == ["V1", "V2"]
+        for argv in (["observe"], ["run", "--mode=observe"], ["run"]):
+            with pytest.raises(SystemExit):
+                main(argv)
 
-        out = io.StringIO()
-        assert run(out) == 1
-        assert "not available" in out.getvalue()
-
-    def test_network_imports_are_confined_to_the_market_package(
+    def test_network_imports_are_confined_to_the_market_and_notify_packages(
         self, parsed_source: tuple[tuple[Path, ast.Module], ...]
     ) -> None:
-        """Only arc/market/ may open a socket.
+        """Only arc/market/ and arc/notify/ may open a socket.
 
         Phase 2 introduced the feed and discovery, so "no network anywhere" is no
         longer the invariant — the invariant is that the domain, storage and config
@@ -607,13 +614,20 @@ class TestNoFakeRuntime:
         reproducible from a test with no venue, and what stops a "just fetch it here"
         call appearing inside the money path where it would make a price depend on
         whether a request happened to succeed.
+
+        arc/notify/ is exempt deliberately, not incidentally. Notifications are
+        outbound by definition, and the alternative — a Telegram sender hidden inside
+        arc/market/ to satisfy this list — would put a chat client in the package that
+        produces prices, which is a worse arrangement than naming the exemption. What
+        keeps it safe is that arc/notify/ sends and never receives: it is only listed
+        here, not granted any inbound path.
         """
         offenders = find_imports_of(
-            parsed_source, _NETWORK_MODULES, exempt_package=_MARKET_PACKAGE
+            parsed_source, _NETWORK_MODULES, exempt_packages=_NETWORK_PACKAGES
         )
         assert not offenders, (
-            "network import outside arc/market/ — the layers below it must stay "
-            "testable without a venue:\n  " + "\n  ".join(offenders)
+            "network import outside arc/market/ and arc/notify/ — the layers below "
+            "them must stay testable without a venue:\n  " + "\n  ".join(offenders)
         )
 
     def test_no_placeholder_markers(self, source_root: Path) -> None:

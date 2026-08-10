@@ -26,7 +26,7 @@ from arc.errors import SchemaMigrationError
 
 __all__ = ["EXPECTED_TABLES", "SCHEMA_VERSION", "apply_pragmas", "migrate", "schema_version"]
 
-SCHEMA_VERSION: Final[int] = 2
+SCHEMA_VERSION: Final[int] = 4
 
 EXPECTED_TABLES: Final[tuple[str, ...]] = (
     "schema_migrations",
@@ -40,6 +40,7 @@ EXPECTED_TABLES: Final[tuple[str, ...]] = (
     "settlements",
     "candles",
     "runtime_state",
+    "runtime_sessions",
 )
 
 # Tables that must NEVER exist. Asserted by the test suite: their reappearance
@@ -236,7 +237,156 @@ ALTER TABLE intents ADD COLUMN strategy_id    TEXT NOT NULL DEFAULT '';
 ALTER TABLE intents ADD COLUMN close_ts       INTEGER NOT NULL DEFAULT 0;
 """
 
-_MIGRATIONS: Final[dict[int, str]] = {1: _MIGRATION_1, 2: _MIGRATION_2}
+_MIGRATION_3: Final[str] = """
+ALTER TABLE intents ADD COLUMN trace_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE orders ADD COLUMN trace_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE fills ADD COLUMN trace_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE settlements ADD COLUMN trace_id TEXT NOT NULL DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS runtime_sessions (
+    runtime_session_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    git_commit TEXT NOT NULL,
+    start_reason TEXT NOT NULL,
+    stop_reason TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    ended_at REAL NOT NULL,
+    duration_seconds TEXT NOT NULL,
+    markets_seen INTEGER NOT NULL,
+    -- Three separate counters, straight off the Window Engine. There is no
+    -- "windows opened" number in this system: a window is frozen, then fires or
+    -- expires, and each of those is counted at its own transition. There is also
+    -- deliberately no buffer_misses column -- windows_expired conflates "the
+    -- buffer was too wide" with "the window never froze at all", so it cannot
+    -- answer that question and a column named for it would be a guess.
+    windows_frozen INTEGER NOT NULL,
+    windows_fired INTEGER NOT NULL,
+    windows_expired INTEGER NOT NULL,
+    orders_submitted INTEGER NOT NULL,
+    orders_filled INTEGER NOT NULL,
+    fill_rate TEXT,
+    reconnects INTEGER NOT NULL,
+    disconnects INTEGER NOT NULL,
+    recoveries INTEGER NOT NULL,
+    warnings INTEGER NOT NULL,
+    errors INTEGER NOT NULL,
+    final_status TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_sessions_started ON runtime_sessions(started_at);
+"""
+
+_MIGRATION_4: Final[str] = """
+-- Version 4 adds ENGINE OWNERSHIP. Two trading engines now share this database —
+-- TWAP and MAJORITY — and every execution record has to say which one owns it, or
+-- an engine-scoped sweep cannot tell its own resting orders from the other's.
+--
+-- Additive for orders and fills: a column with a NOT NULL DEFAULT 'TWAP'. Every
+-- pre-v4 row reads back as TWAP, which is not a guess — nothing but TWAP has ever
+-- written one.
+ALTER TABLE orders ADD COLUMN engine TEXT NOT NULL DEFAULT 'TWAP';
+ALTER TABLE fills  ADD COLUMN engine TEXT NOT NULL DEFAULT 'TWAP';
+CREATE INDEX IF NOT EXISTS idx_orders_engine ON orders(engine);
+
+-- `intents` needs more than a column. Its UNIQUE(market_slug, offset_seconds) is
+-- the intent arbiter, and `save_intent` inserts OR IGNORE against it — so with a
+-- second engine that constraint stops meaning "one intent per window" and starts
+-- meaning "one intent per window across ALL engines". A MAJORITY intent on a window
+-- TWAP had already used would be SILENTLY DISCARDED: no error, no order, no
+-- explanation anywhere, because OR IGNORE reports a dropped row as an ordinary
+-- non-insert. Widening the key to (engine, market_slug, offset_seconds) keeps
+-- exactly-one-per-window per ENGINE, which is what the rule always meant.
+--
+-- A constraint cannot be altered in place, so the table is rebuilt. Every column is
+-- named explicitly in the copy rather than using SELECT *: a positional copy is
+-- silently wrong the day the column order differs, and the values being moved here
+-- are the frozen snapshots that execution acts on verbatim.
+ALTER TABLE intents RENAME TO intents_pre_v4;
+
+CREATE TABLE intents (
+    intent_id       TEXT PRIMARY KEY,
+    market_slug     TEXT NOT NULL REFERENCES markets(slug),
+    offset_seconds  INTEGER NOT NULL,
+    direction       TEXT NOT NULL,
+    signal_twap     TEXT NOT NULL,
+    locked_trigger  TEXT NOT NULL,
+    created_at      REAL NOT NULL,
+    opening_twap    TEXT NOT NULL DEFAULT '0',
+    ptb             TEXT NOT NULL DEFAULT '0',
+    buffer          TEXT NOT NULL DEFAULT '0',
+    limit_price     TEXT NOT NULL DEFAULT '0',
+    size            TEXT NOT NULL DEFAULT '0',
+    strategy_id     TEXT NOT NULL DEFAULT '',
+    close_ts        INTEGER NOT NULL DEFAULT 0,
+    trace_id        TEXT NOT NULL DEFAULT '',
+    engine          TEXT NOT NULL DEFAULT 'TWAP',
+    UNIQUE (engine, market_slug, offset_seconds)
+);
+
+INSERT INTO intents (
+    intent_id, market_slug, offset_seconds, direction, signal_twap, locked_trigger,
+    created_at, opening_twap, ptb, buffer, limit_price, size, strategy_id, close_ts,
+    trace_id, engine
+)
+SELECT
+    intent_id, market_slug, offset_seconds, direction, signal_twap, locked_trigger,
+    created_at, opening_twap, ptb, buffer, limit_price, size, strategy_id, close_ts,
+    trace_id, 'TWAP'
+FROM intents_pre_v4;
+
+DROP TABLE intents_pre_v4;
+CREATE INDEX IF NOT EXISTS idx_intents_engine ON intents(engine);
+
+-- `settlements` has the same defect as `intents`, and it is the more expensive one.
+-- Its primary key was `market_slug` alone and `save_settlement` inserts OR IGNORE
+-- against it, so one market could hold exactly one settlement row across BOTH
+-- engines. The second engine to settle would have its row silently dropped.
+--
+-- That is not merely a missing ledger line. settlement_history() feeds
+-- _realised_losses(), which feeds the daily-loss gate and the consecutive-loss
+-- gate. A discarded MAJORITY settlement means MAJORITY's realised losses never
+-- reach the shared risk limits, and the account would keep trading through a
+-- daily loss limit it had in fact already breached.
+--
+-- The key becomes (engine, market_slug): one settlement per market PER ENGINE. The
+-- risk arithmetic stays exactly as it is — one shared account, one set of loss
+-- limits, both engines' losses counted — which is what makes this a widening of the
+-- key rather than a second risk system.
+ALTER TABLE settlements RENAME TO settlements_pre_v4;
+
+CREATE TABLE settlements (
+    market_slug       TEXT NOT NULL REFERENCES markets(slug),
+    outcome           TEXT NOT NULL,
+    settlement_twap   TEXT,
+    ptb               TEXT,
+    pnl               TEXT NOT NULL DEFAULT '0',
+    divergence_logged INTEGER NOT NULL DEFAULT 0,
+    settled_at        REAL NOT NULL,
+    trace_id          TEXT NOT NULL DEFAULT '',
+    engine            TEXT NOT NULL DEFAULT 'TWAP',
+    PRIMARY KEY (engine, market_slug)
+);
+
+INSERT INTO settlements (
+    market_slug, outcome, settlement_twap, ptb, pnl, divergence_logged,
+    settled_at, trace_id, engine
+)
+SELECT
+    market_slug, outcome, settlement_twap, ptb, pnl, divergence_logged,
+    settled_at, trace_id, 'TWAP'
+FROM settlements_pre_v4;
+
+DROP TABLE settlements_pre_v4;
+CREATE INDEX IF NOT EXISTS idx_settlements_engine ON settlements(engine);
+CREATE INDEX IF NOT EXISTS idx_settlements_settled ON settlements(settled_at);
+"""
+
+_MIGRATIONS: Final[dict[int, str]] = {
+    1: _MIGRATION_1,
+    2: _MIGRATION_2,
+    3: _MIGRATION_3,
+    4: _MIGRATION_4,
+}
 
 
 def schema_version(conn: sqlite3.Connection) -> int:

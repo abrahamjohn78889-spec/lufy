@@ -1,16 +1,24 @@
 """Window state transitions. Monotonic, terminal-safe, and checked rather than trusted.
 
     PENDING ─freeze──> FROZEN ─trigger──> FIRED
-       │                  │
+       │  │               │
+       │  └──equality─> NO_DIRECTION
        └──expire──────────┴──expire────> EXPIRED
 
 The graph is deliberately tiny, and everything about it is one-way. Two properties
 matter enough to be enforced here rather than left to the call sites:
 
-FIRED and EXPIRED are TERMINAL. A window that has fired must never fire again — it
-authorises at most one intent, ever (A12) — and a window that expired without
+FIRED, EXPIRED and NO_DIRECTION are TERMINAL. A window that has fired must never fire
+again — it authorises at most one intent, ever (A12) — and a window that expired without
 crossing must never come back to life because a late observation arrived. Both would
 be silent: the second fire looks exactly like the first in every log line.
+
+NO_DIRECTION is terminal for a different and stricter reason. It means the frozen TWAP
+equalled the official PTB at the window's opening instant, so strict comparison yielded
+no direction. Direction is determined ONCE, at that instant. If this state were
+re-enterable — or if the window merely stayed PENDING — the next pass would freeze a
+direction against a LATER TWAP, which is precisely the recalculation the direction
+contract forbids. Terminality is what makes "determined once" structural.
 
 PENDING is re-enterable from nowhere. A frozen window cannot be un-frozen, so there is
 no path by which a window's five locked values can be replaced by a second set
@@ -40,6 +48,7 @@ __all__ = [
     "assert_can_fire",
     "expire_window",
     "is_terminal",
+    "no_direction_window",
     "transition",
 ]
 
@@ -57,14 +66,15 @@ class WindowTransitionError(ArcError):
 # so that a terminal state is a stated fact in this table instead of a KeyError
 # somewhere else.
 LEGAL_TRANSITIONS: Final[dict[WindowState, tuple[WindowState, ...]]] = {
-    WindowState.PENDING: (WindowState.FROZEN, WindowState.EXPIRED),
+    WindowState.PENDING: (WindowState.FROZEN, WindowState.EXPIRED, WindowState.NO_DIRECTION),
     WindowState.FROZEN: (WindowState.FIRED, WindowState.EXPIRED),
     WindowState.FIRED: (),
     WindowState.EXPIRED: (),
+    WindowState.NO_DIRECTION: (),
 }
 
 TERMINAL_WINDOW_STATES: Final[frozenset[WindowState]] = frozenset(
-    {WindowState.FIRED, WindowState.EXPIRED}
+    {WindowState.FIRED, WindowState.EXPIRED, WindowState.NO_DIRECTION}
 )
 
 
@@ -144,6 +154,34 @@ def assert_can_fire(window: ExecutionWindow) -> None:
             f"direction={window.direction} trigger={window.locked_trigger}; "
             "freeze atomicity has been violated"
         )
+
+
+def no_direction_window(
+    window: ExecutionWindow,
+    *,
+    logger: logging.Logger | None = None,
+) -> bool:
+    """End a window whose frozen TWAP equalled the official PTB. Returns False if terminal.
+
+    NOT an error and never logged as one. Equality means the market had not moved off
+    its opening reference at the instant the window opened, and the strict-comparison
+    contract says that produces no direction, no intent and no order. It is a strategy
+    outcome, exactly like an uncrossed trigger.
+
+    Terminal, and that is the operative property. Leaving the window PENDING would let
+    the next pass freeze a direction against a later TWAP — direction determined twice,
+    the second time from a value the contract says is not to be consulted.
+    """
+    if is_terminal(window.state):
+        return False
+    transition(window, WindowState.NO_DIRECTION, logger=logger)
+    log_event(
+        logging.INFO,
+        "Window No Direction",
+        f"{window.offset_seconds}s  frozen TWAP equals official PTB; no trade",
+        logger=logger,
+    )
+    return True
 
 
 def expire_window(

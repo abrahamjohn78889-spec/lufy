@@ -1,11 +1,25 @@
 """Configuration.
 
-Two layers, and the order matters:
+PRECEDENCE, highest wins:
 
-  1. .env seeds the settings ONCE, on the very first startup.
-  2. From then on SQLite is the source of truth and the Settings page edits it.
-     Every later startup loads the saved configuration and ignores .env for
-     trading values.
+    1. CLI arguments          `arc run --mode=v2` beats ARC_MODE in .env
+    2. SQLite operator settings   the Settings page, for trading values
+    3. .env                   seeds SQLite once; sole source for infrastructure
+    4. Built-in defaults      infrastructure only — never a trading value
+
+The split at rung 2 is deliberate and is the whole reason this file has two
+layers. TRADING values (buffers, sizing, quota, entry band, cancel lead) are
+operator-owned: .env seeds them on the very first startup and SQLite is the
+source of truth from then on, so an operator who changed a buffer in the UI does
+not have it silently reverted by a stale .env on the next restart. INFRASTRUCTURE
+values (endpoints, credentials, bind address, log level, provider) are
+deployment-owned and read from .env on every startup, because a credential
+reachable from a web form is a credential that can be replaced from a web form.
+
+Rung 4 exists for infrastructure only. There are NO default values for trading
+parameters: a missing buffer is an error, never a substituted guess — an invented
+number that reaches the trading path is indistinguishable, afterwards, from one
+the operator chose.
 
 An invalid configuration is FATAL and exits non-zero. That is the one thing that
 DOES refuse to boot — documentation uncertainty never does (A8). The reason every
@@ -22,20 +36,56 @@ indistinguishable, afterwards, from one the operator chose.
 from __future__ import annotations
 
 import ipaddress
-from dataclasses import dataclass, field
+import logging
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import SecretStr, field_validator
+import polymarket
+from pydantic import SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from arc.domain.enums import Mode
 from arc.domain.money import dec_str, to_decimal
 from arc.domain.timing import MARKET_DURATION_SECONDS
 from arc.errors import BindAddressError, ConfigInvariantError
+from arc.majority.config import (
+    MAJORITY_DISABLED,
+    MAJORITY_KEYS,
+    MajorityConfig,
+    build_majority_config,
+    env_majority_values,
+)
+from arc.market.providers import ProviderName
 
-__all__ = ["ArcSettings", "Settings", "TradingConfig", "load_settings"]
+__all__ = [
+    "LOG_LEVELS",
+    "THEMES",
+    "ArcSettings",
+    "Settings",
+    "TradingConfig",
+    "load_settings",
+]
+
+# Endpoint and chain defaults come from the official SDK's own production
+# environment rather than from string literals here. A hand-copied hostname is a
+# hostname that silently stops matching the SDK the day Polymarket moves one, and
+# the failure mode is a bot connecting confidently to an address nobody serves.
+_PRODUCTION: Final[polymarket.Environment] = polymarket.PRODUCTION
+
+LOG_LEVELS: Final[dict[str, int]] = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+}
+
+# Two stylesheets ship. Named rather than free text so a typo is a startup error
+# instead of a dashboard that renders unstyled and looks broken.
+THEMES: Final[tuple[str, ...]] = ("dark", "light")
+
 
 # Trading keys that live in SQLite after first run. .env supplies them once.
 TRADING_KEYS: Final[tuple[str, ...]] = (
@@ -50,6 +100,7 @@ TRADING_KEYS: Final[tuple[str, ...]] = (
     "entry_price_max",
     "tick_size",
     "min_tradable_size",
+    "submission_count",
     "cancel_lead_ms",
     "cancel_ack_timeout_ms",
     "feed_stale_warn_ms",
@@ -62,11 +113,26 @@ TRADING_KEYS: Final[tuple[str, ...]] = (
     "observation_retention_days",
 )
 
-_SECRET_FIELDS: Final[tuple[str, ...]] = (
+# Credentials MODE=V2 requires. Kept separate from the full secret list below,
+# because "V2 needs keys" is a statement about the venue only: a Chainlink secret
+# left blank must not make a live-mode boot fail.
+_VENUE_SECRET_FIELDS: Final[tuple[str, ...]] = (
     "polymarket_api_key",
     "polymarket_api_secret",
     "polymarket_api_passphrase",
     "polymarket_private_key",
+)
+
+# Every secret, for redaction and for the log filter. Redaction is not conditional
+# on which provider is live: a value present in the environment can reach a traceback
+# whether or not the code that uses it ever runs.
+_SECRET_FIELDS: Final[tuple[str, ...]] = (
+    *_VENUE_SECRET_FIELDS,
+    "chainlink_api_key",
+    "chainlink_api_secret",
+    # A bot token is a credential: anyone holding it can post as ARC. It is redacted
+    # for the same reason as the venue keys, not because Telegram can trade.
+    "telegram_bot_token",
 )
 
 
@@ -88,7 +154,18 @@ class ArcSettings(BaseSettings):
 
     db_path: str = "data/arc.db"
     log_dir: str = "logs"
+    log_level: str = "INFO"
     observation_retention_days: int = 90
+
+    # Local time is what the operator reads beside the Polymarket page, so the log
+    # formatter and the countdown must agree on which "local" that is. Blank means
+    # the host's own zone; a name here (Europe/London) pins it, which is what makes
+    # a VPS in one region readable by an operator in another.
+    timezone: str = ""
+
+    # Purely descriptive: the name to look for in `pm2 list`. ARC never spawns or
+    # signals PM2 — it only reports whether PM2 spawned IT (see system_payload).
+    pm2_name: str = "arc"
 
     execution_windows: str = ""
     buffers: str = ""
@@ -110,6 +187,10 @@ class ArcSettings(BaseSettings):
     tick_size: str = ""
     min_tradable_size: str = ""
 
+    # How many independent passive orders one approved exposure is DIVIDED into.
+    # Never a multiplier: N submissions sum to the single approved size.
+    submission_count: int = 1
+
     cancel_lead_ms: int = 500
     cancel_ack_timeout_ms: int = 1000
 
@@ -124,6 +205,57 @@ class ArcSettings(BaseSettings):
 
     allow_opposing_directions: bool = False
 
+    # MAJORITY, the second engine. Optional by construction: when disabled these are
+    # never validated and the process boots exactly as it did before the engine
+    # existed. Blank strings rather than numbers because there is NO default trading
+    # value — a MAJORITY number the operator did not choose must never reach the
+    # trading path, so an enabled engine with a blank field is a fatal error, not a
+    # substituted guess. They seed SQLite once, like every other trading value.
+    majority_enabled: bool = False
+    majority_execution_window_seconds: int = 0
+    majority_execution_windows: str = ""
+    majority_buffer: str = ""
+    majority_trigger_price: str = ""
+    majority_target_limit_price: str = ""
+    majority_shares: str = ""
+    majority_entry_price_min: str = ""
+    majority_entry_price_max: str = ""
+
+    # Which price stream feeds the running TWAP. Bootstrap-only, deliberately NOT a
+    # trading value: the source of the data is an infrastructure choice, and putting
+    # it on the Settings page would let it be swapped mid-market.
+    twap_provider: str = "RTDS"
+
+    # The RTDS relay. Defaulted from the official SDK's production environment, not
+    # from a literal, so the address ARC dials is the address the SDK ships.
+    rtds_url: str = _PRODUCTION.rtds_ws_url
+
+    # Chainlink is configuration-ready and unimplemented (see market/providers.py).
+    # No feed ID is defaulted: a guessed identifier would yield prices that look real.
+    chainlink_api_key: SecretStr = SecretStr("")
+    chainlink_api_secret: SecretStr = SecretStr("")
+
+    # ONE spelling. The specification once wrote ARC_CHAINLINK_FEBS_ID; that alias
+    # was removed rather than carried, because two names for one value means a
+    # `grep` for the configured feed finds only half the truth, and no operator
+    # has ever been able to set it — Chainlink has never run.
+    chainlink_feed_id: str = ""
+
+    # The Data Streams websocket origin. Documented hosts are
+    # wss://ws.dataengine.chain.link (mainnet) and
+    # wss://ws.testnet-dataengine.chain.link. Mainnet is the default because ARC
+    # trades real markets; TESTNET is not a runtime mode here (A3), this is only
+    # the address of a price relay.
+    chainlink_ws_url: str = "wss://ws.dataengine.chain.link"
+
+    # Fixed-point scale of the report's price field. The official documentation
+    # states prices "use 8 or 18 decimals depending on the stream", so this CANNOT
+    # be defaulted: guessing 18 for an 8-decimal stream reports BTC at ten billion
+    # times its price, which passes every plausibility check ARC has because the
+    # first sample sets its own reference. 0 means unset and is fatal when
+    # CHAINLINK is selected.
+    chainlink_decimals: int = 0
+
     # SecretStr so the value never appears in repr(), str(), an f-string, a
     # pydantic validation error, or a traceback. Pydantic renders it as
     # '**********' everywhere; only .get_secret_value() returns the real string.
@@ -131,6 +263,143 @@ class ArcSettings(BaseSettings):
     polymarket_api_secret: SecretStr = SecretStr("")
     polymarket_api_passphrase: SecretStr = SecretStr("")
     polymarket_private_key: SecretStr = SecretStr("")
+
+    # The proxy wallet the orders are signed FOR, when it differs from the address
+    # the private key derives. Blank means "the SDK derives it", which is the
+    # documented default. Set wrongly it is not a small error: orders would be
+    # signed against an account holding none of the collateral, and every one of
+    # them would be refused by the venue for a reason that reads as a key problem.
+    polymarket_proxy_address: str = ""
+
+    # The account whose collateral funds the orders. Blank = the proxy address.
+    # Separate from the proxy because the two differ on relayer-funded setups.
+    polymarket_funder: str = ""
+
+    # CLOB endpoints. Defaulted from the official SDK production environment for the
+    # same reason as rtds_url: three hand-copied hostnames are three chances to be
+    # subtly out of date, in the one component that places real orders.
+    clob_host: str = _PRODUCTION.clob_url
+    clob_http_url: str = _PRODUCTION.clob_url
+    clob_ws_url: str = _PRODUCTION.clob_user_ws_url
+
+    # Wallet identity, for display and for the operator's own cross-check against
+    # Polymarket. ARC never derives the address from the key here — the SDK owns
+    # that derivation, and a second implementation of it would eventually disagree
+    # with the first while both looked correct.
+    wallet_address: str = ""
+    network_id: str = _PRODUCTION.name
+    chain_id: int = _PRODUCTION.chain_id
+
+    # Telegram is notification only and can never control trading. Bootstrap-only,
+    # like the provider: the per-category toggles live in the settings table and are
+    # editable from the dashboard, but the credential is not, because a bot token
+    # reachable from a web form is a bot token that can be replaced from a web form.
+    telegram_enabled: bool = True
+    telegram_bot_token: SecretStr = SecretStr("")
+    telegram_chat_id: str = ""
+    # Forum topic id, for a chat organised into threads. Blank posts to the chat
+    # root, which is what a non-forum chat requires — sending a thread id to a
+    # non-forum chat is rejected outright and every notification silently fails.
+    telegram_thread_id: str = ""
+
+    # How long a dropped connection waits before its first retry, and how long the
+    # exponential ladder is allowed to grow to. The ceiling is what stops a long
+    # outage from stretching the retry interval past the length of a market, which
+    # would mean waking up already too late for the next one.
+    reconnect_backoff_ms: int = 500
+    reconnect_backoff_max_ms: int = 30_000
+
+    # How often the browser repaints from the state it already holds. It is NOT a
+    # poll interval — the dashboard never polls (the socket pushes), and this only
+    # sets how often the countdown re-renders between frames.
+    refresh_rate_ms: int = 250
+    theme: str = "dark"
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _validate_log_level(cls, v: Any) -> Any:
+        """Reject an unknown level rather than falling back to INFO.
+
+        A silent fallback is the worst outcome here: an operator who set DEBUG to
+        chase a fault would get INFO and conclude the fault produced no logging.
+        """
+        candidate = str(v).strip().upper()
+        if candidate not in LOG_LEVELS:
+            raise ValueError(
+                f"LOG_LEVEL must be one of {sorted(LOG_LEVELS)}, got {v!r}"
+            )
+        return candidate
+
+    @field_validator("theme", mode="before")
+    @classmethod
+    def _validate_theme(cls, v: Any) -> Any:
+        """A typo'd theme name would load no stylesheet; the dashboard renders
+        unstyled and reads as broken rather than as misconfigured."""
+        candidate = str(v).strip().lower()
+        if candidate not in THEMES:
+            raise ValueError(f"THEME must be one of {list(THEMES)}, got {v!r}")
+        return candidate
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, v: str) -> str:
+        """An unknown zone name must fail at startup, not at the first log line.
+
+        Blank keeps the host zone. A name is resolved here so a typo surfaces
+        immediately instead of raising inside the log formatter, where the
+        exception would be swallowed by logging's own error handling and the
+        timestamps would quietly stay in the wrong zone.
+        """
+        name = v.strip()
+        if not name:
+            return ""
+        try:
+            ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"TIMEZONE {name!r} is not a known IANA zone name") from exc
+        return name
+
+    @field_validator(
+        "api_port",
+        "reconnect_backoff_ms",
+        "reconnect_backoff_max_ms",
+        "refresh_rate_ms",
+    )
+    @classmethod
+    def _validate_positive(cls, v: int) -> int:
+        """Zero or negative here is not a slower setting, it is a busy loop: a
+        0 ms backoff reconnects without pause and a 0 ms refresh repaints every
+        frame, both of which peg a CPU on a box that has one."""
+        if v <= 0:
+            raise ValueError(f"must be positive, got {v}")
+        return v
+
+    @field_validator("reconnect_backoff_max_ms")
+    @classmethod
+    def _validate_backoff_ceiling(cls, v: int, info: ValidationInfo) -> int:
+        """A ceiling below the initial delay makes the ladder shrink instead of
+        grow, so a long outage retries fastest exactly when the venue is least
+        able to answer."""
+        initial = info.data.get("reconnect_backoff_ms")
+        if isinstance(initial, int) and v < initial:
+            raise ValueError(
+                f"RECONNECT_BACKOFF_MAX_MS ({v}) must be at least "
+                f"RECONNECT_BACKOFF_MS ({initial})"
+            )
+        return v
+
+    @field_validator("twap_provider", mode="before")
+    @classmethod
+    def _validate_provider(cls, v: Any) -> Any:
+        """Only the two names the runtime knows. An unrecognised provider must not
+        silently leave RTDS running — the operator would believe the switch took."""
+        candidate = str(v).strip().upper()
+        if candidate not in {p.value for p in ProviderName}:
+            raise ValueError(
+                f"TWAP_PROVIDER must be one of "
+                f"{sorted(p.value for p in ProviderName)}, got {v!r}"
+            )
+        return candidate
 
     @field_validator("mode", mode="before")
     @classmethod
@@ -192,7 +461,8 @@ class ArcSettings(BaseSettings):
         return tuple(v for v in values if v)
 
     def has_credentials(self) -> bool:
-        return all(getattr(self, n).get_secret_value() for n in _SECRET_FIELDS)
+        """Venue credentials only. MODE=V2 does not depend on any provider secret."""
+        return all(getattr(self, n).get_secret_value() for n in _VENUE_SECRET_FIELDS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +486,7 @@ class TradingConfig:
     entry_price_max: Decimal
     tick_size: Decimal
     min_tradable_size: Decimal
+    submission_count: int
     cancel_lead_ms: int
     cancel_ack_timeout_ms: int
     feed_stale_warn_ms: int
@@ -266,6 +537,7 @@ class TradingConfig:
             "entry_price_max": dec_str(self.entry_price_max),
             "tick_size": dec_str(self.tick_size),
             "min_tradable_size": dec_str(self.min_tradable_size),
+            "submission_count": str(self.submission_count),
             "cancel_lead_ms": str(self.cancel_lead_ms),
             "cancel_ack_timeout_ms": str(self.cancel_ack_timeout_ms),
             "feed_stale_warn_ms": str(self.feed_stale_warn_ms),
@@ -497,6 +769,27 @@ def build_trading_config(values: dict[str, str]) -> TradingConfig:
             "Every order at the top of the band would be rejected."
         )
 
+    # 16. Submission count. The approved exposure is DIVIDED into this many passive
+    #     orders; it is never a multiplier. Zero or negative would produce a window
+    #     that submits nothing while every other value reads as configured. The
+    #     upper bound is the number of whole exchange minimums the budget can buy at
+    #     the top of the band: beyond that every split is below the venue minimum and
+    #     the engine would silently reduce N on every single window.
+    submission_count = _int_value(values, "submission_count")
+    if submission_count <= 0:
+        raise ConfigInvariantError(
+            f"SUBMISSION_COUNT must be at least 1, got {submission_count}. "
+            "Zero would submit no order for a window that had been approved."
+        )
+    max_splits = int(max_affordable / min_tradable)
+    if submission_count > max_splits:
+        raise ConfigInvariantError(
+            f"SUBMISSION_COUNT {submission_count} exceeds {max_splits}, the number of "
+            f"exchange minimums ({min_tradable}) that POSITION_NOTIONAL_USD "
+            f"{position_notional} buys at ENTRY_PRICE_MAX {entry_max}. Every split "
+            "would fall below the venue minimum and be reduced away."
+        )
+
     cancel_lead_ms = _int_value(values, "cancel_lead_ms")
     cancel_ack_timeout_ms = _int_value(values, "cancel_ack_timeout_ms")
 
@@ -607,6 +900,7 @@ def build_trading_config(values: dict[str, str]) -> TradingConfig:
         entry_price_max=entry_max,
         tick_size=tick_size,
         min_tradable_size=min_tradable,
+        submission_count=submission_count,
         cancel_lead_ms=cancel_lead_ms,
         cancel_ack_timeout_ms=cancel_ack_timeout_ms,
         feed_stale_warn_ms=feed_warn,
@@ -647,6 +941,12 @@ class Settings:
     env: ArcSettings
     trading: TradingConfig
     seeded_from_env: bool
+    # The second engine. Defaults to the disabled singleton so every existing
+    # `Settings(...)` construction — tests included — stays valid without naming it,
+    # and a process that never configured MAJORITY carries the same OFF object as one
+    # that switched it off. Never None: "no MAJORITY" is a configuration, not an
+    # absence, so the runtime always has a `.tradable` to ask.
+    majority: MajorityConfig = MAJORITY_DISABLED
 
     @property
     def mode(self) -> Mode:
@@ -662,10 +962,59 @@ class Settings:
 
     @property
     def warnings(self) -> tuple[str, ...]:
-        return self.trading.warnings
+        """Every non-fatal advisory, both engines, in engine order.
+
+        MAJORITY's are included because they are shown wherever this property is
+        shown, and a MAJORITY warning that reached nobody would be a warning the
+        operator had no way to act on. TWAP first, so the existing report ordering
+        does not shift when MAJORITY is off and contributes nothing.
+        """
+        return (*self.trading.warnings, *self.majority.warnings)
+
+    def as_storage_dict(self) -> dict[str, str]:
+        """The COMPLETE settings row: both engines' values in one dict.
+
+        Every persistence site must go through here rather than through
+        `trading.as_storage_dict()`. Writing only TWAP's keys would truncate the
+        stored settings to the trading half, and because stored settings win over
+        `.env`, the next boot's backfill would find the MAJORITY keys absent, refill
+        them from `.env` — and quietly discard whatever the operator had last saved.
+        The two halves cannot collide: TRADING_KEYS and MAJORITY_KEYS are disjoint by
+        construction, since every MAJORITY key is prefixed.
+        """
+        return {**self.trading.as_storage_dict(), **self.majority.as_storage_dict()}
 
     def redacted_dump(self) -> dict[str, str]:
         return self.env.redacted_dump()
+
+    def with_mode(self, mode: Mode) -> Settings:
+        """The same configuration, for the other runtime mode.
+
+        The operator selects V1 or V2 in the dashboard, so the mode that actually
+        runs is no longer fixed by `.env` at process start. Everything else — the
+        endpoints, the credentials, the whole validated TradingConfig — is carried
+        across unchanged; only the mode moves, because the mode is the ONE thing
+        that differs between the two runtimes (Q4).
+
+        Switching to V2 re-checks the venue credentials here rather than letting
+        `build_executor` discover the gap. The SDK's own failure for an empty
+        private key is a signing error raised deep inside a client constructor,
+        and an operator reading it would be debugging a key they never set.
+        """
+        if mode is self.env.mode:
+            return self
+        env = self.env.model_copy(update={"mode": mode})
+        if mode is Mode.V2 and not env.has_credentials():
+            missing = [
+                n.upper()
+                for n in _VENUE_SECRET_FIELDS
+                if not getattr(env, n).get_secret_value()
+            ]
+            raise ConfigInvariantError(
+                f"V2 (live) requires credentials; unset: {', '.join(missing)}. "
+                "Set them in .env and restart. V1 needs none of them."
+            )
+        return replace(self, env=env)
 
 
 def env_trading_values(env: ArcSettings) -> dict[str, str]:
@@ -682,6 +1031,7 @@ def env_trading_values(env: ArcSettings) -> dict[str, str]:
         "entry_price_max": env.entry_price_max,
         "tick_size": env.tick_size,
         "min_tradable_size": env.min_tradable_size,
+        "submission_count": str(env.submission_count),
         "cancel_lead_ms": str(env.cancel_lead_ms),
         "cancel_ack_timeout_ms": str(env.cancel_ack_timeout_ms),
         "feed_stale_warn_ms": str(env.feed_stale_warn_ms),
@@ -693,6 +1043,45 @@ def env_trading_values(env: ArcSettings) -> dict[str, str]:
         "allow_opposing_directions": "true" if env.allow_opposing_directions else "false",
         "observation_retention_days": str(env.observation_retention_days),
     }
+
+
+def env_majority_config_values(env: ArcSettings) -> dict[str, str]:
+    """Project the MAJORITY bootstrap fields into the builder's raw-string form.
+
+    Routed through `env_majority_values` (keyword-only, in `arc.majority.config`) so
+    the key names live in one place — the package that owns them — and this file
+    never hard-codes a MAJORITY key it could then misspell.
+
+    The legacy single-window `majority_execution_window_seconds` is converted to a
+    one-element tuple. New .env files should write `majority_execution_windows`
+    directly; the legacy field is accepted so a database that was seeded before
+    the multi-window key existed continues to boot exactly as it did.
+    """
+    legacy = env.majority_execution_window_seconds
+    # The new multi-window field is comma-separated; the legacy scalar is a single
+    # integer. The legacy form takes precedence when the operator set it explicitly,
+    # because rewriting a single number as a list of one is the contract that lets a
+    # database seeded before multi-window boot correctly. When both are blank, no
+    # window is configured and MAJORITY is empty (an enabled-but-empty config is
+    # still legal — it just reports OFF).
+    raw_windows = env.majority_execution_windows.strip()
+    if raw_windows:
+        from arc.majority.config import _parse_window_list  # local import: keeps top-level clean
+        windows = _parse_window_list(raw_windows)
+    elif legacy > 0:
+        windows = (legacy,)
+    else:
+        windows = ()
+    return env_majority_values(
+        enabled=env.majority_enabled,
+        execution_windows=windows,
+        buffer=env.majority_buffer,
+        trigger_price=env.majority_trigger_price,
+        target_limit_price=env.majority_target_limit_price,
+        shares=env.majority_shares,
+        entry_price_min=env.majority_entry_price_min,
+        entry_price_max=env.majority_entry_price_max,
+    )
 
 
 def load_settings(
@@ -721,10 +1110,31 @@ def load_settings(
 
     trading = build_trading_config(merged)
 
+    # BACKFILL, not a second precedence rung. The stored settings table wins for
+    # every key it HOLDS — but a database written before MAJORITY existed holds none
+    # of these eight, and reading an absent key as blank would make an operator's
+    # `.env` MAJORITY block silently inert on every upgraded install. So .env fills
+    # only the gaps: a key already in `stored` is never touched, which keeps the
+    # Settings page the source of truth the moment it has written one.
+    majority_env = env_majority_config_values(settings)
+    for key in MAJORITY_KEYS:
+        if key not in merged:
+            merged[key] = majority_env[key]
+
+    # Venue constraints are passed in from the already-validated TradingConfig rather
+    # than read out of it inside `arc.majority.config`, so that package holds no
+    # reference to TWAP's configuration. The minimum size and the tick are the
+    # exchange's, not TWAP's — the venue does not quote a separate tick per engine.
+    majority = build_majority_config(
+        merged,
+        min_tradable_size=trading.min_tradable_size,
+        tick_size=trading.tick_size,
+    )
+
     if settings.mode is Mode.V2 and not settings.has_credentials():
         missing = [
             n.upper()
-            for n in _SECRET_FIELDS
+            for n in _VENUE_SECRET_FIELDS
             if not getattr(settings, n).get_secret_value()
         ]
         raise ConfigInvariantError(
@@ -732,4 +1142,9 @@ def load_settings(
             "A live-mode bot without keys looks armed and rejects every submission."
         )
 
-    return Settings(env=settings, trading=trading, seeded_from_env=seeded)
+    return Settings(
+        env=settings,
+        trading=trading,
+        seeded_from_env=seeded,
+        majority=majority,
+    )

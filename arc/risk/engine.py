@@ -1,6 +1,6 @@
 """The Risk Engine: the union of every gate, in one deterministic order.
 
-Fourteen gates. Each owns exactly one DenialReason, so a rejection line names the
+Nineteen gates. Each owns exactly one DenialReason, so a rejection line names the
 condition that refused rather than a category that several conditions share. The
 order is fixed and the evaluation short-circuits on the first denial, which is what
 makes the rejection log stable: the same situation always reports the same reason,
@@ -8,16 +8,25 @@ so a change in the log means a change in the world rather than a change in
 evaluation order.
 
 Why this order. The cheapest and most global gates run first — trading disabled,
-wrong phase, window not triggered — because none of them need a quote, a book, a
-size or a database read, and a market that is not tradeable at all should not cause
-any of that work. The gates that need the strategy's output (price, size) run last.
+not armed, wrong phase, window not triggered — because none of them need a quote, a
+book, a size or a database read, and a market that is not tradeable at all should
+not cause any of that work. The gates that need the strategy's output (price, size)
+run last.
+
+Gates 16 to 19 are the LIVE-MONEY preconditions: the supervisor is ready, the
+wallet is connected, reconciliation left nothing unaccounted for, and the account
+can actually pay for the order. They live here, and not in the execution adapter,
+because this is the single admission point before any submission — a check the
+adapter owned would be a second decision layer that V1 never exercises, so the
+paper run would stop being evidence about the live one.
 
 This engine is PURE. It evaluates a frozen RiskContext and returns a verdict. It
 opens no socket, holds no wallet, submits nothing and mutates nothing. The A8
 submission boundary is enforced by gate 1 refusing every intent while the
 settlement spec is unverified — enforced HERE because this is the single place an
 order can be authorised, so a caller who forgets to consult the runtime flag still
-cannot submit.
+cannot submit. Gate 2 is the operator's separate arming switch: BOTH must pass
+before an intent may become an order, and neither can override the other.
 
 There is no lead-time gate. The lead-time gate is repealed entirely (A10/D1): the
 only execution boundary is the market phase, and nothing here reads a clock to
@@ -27,14 +36,14 @@ decide whether an action is "too late".
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Final
 
 from arc.domain.enums import DenialReason, Direction, MarketPhase, SettlementSpecStatus
 from arc.domain.money import dec_str
 
-__all__ = ["GATE_ORDER", "RiskContext", "RiskEngine", "RiskVerdict"]
+__all__ = ["GATE_IDS", "GATE_ORDER", "RiskContext", "RiskEngine", "RiskVerdict", "gate_id"]
 
 _ZERO: Final[Decimal] = Decimal("0")
 
@@ -43,6 +52,7 @@ _ZERO: Final[Decimal] = Decimal("0")
 # bottom, and so a reordering is a visible diff in one place.
 GATE_ORDER: Final[tuple[str, ...]] = (
     "trading_enabled",
+    "execution_armed",
     "market_phase",
     "window_triggered",
     "price_to_beat",
@@ -56,7 +66,24 @@ GATE_ORDER: Final[tuple[str, ...]] = (
     "loss_limits",
     "feed_freshness",
     "runtime_health",
+    "supervisor_ready",
+    "wallet_connected",
+    "orphan_orders",
+    "available_balance",
 )
+
+# Permanent, stable identifiers: G01..G19, derived from the order above rather
+# than kept as a second hand-maintained table that could drift from it. Inserting
+# a gate in the middle renumbers the ones after it, which is why a gate is only
+# ever appended.
+GATE_IDS: Final[dict[str, str]] = {
+    name: f"G{index:02d}" for index, name in enumerate(GATE_ORDER, start=1)
+}
+
+
+def gate_id(name: str) -> str:
+    """The permanent ID for a gate name. Empty for anything not a gate."""
+    return GATE_IDS.get(name, "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,58 +102,96 @@ class RiskContext:
     paused: bool = False
     trading_disabled_reason: str = ""
 
-    # ── gate 2: market phase ─────────────────────────────────────────────────
+    # ── gate 2: operator arming ──────────────────────────────────────────────
+    # Defaults False so a caller that forgets to gather it submits nothing rather
+    # than submitting on an assumption. This is the operator's own switch and is
+    # never inferred from runtime health.
+    execution_armed: bool = False
+
+    # ── gate 3: market phase ─────────────────────────────────────────────────
     phase: MarketPhase = MarketPhase.ACTIVE
 
-    # ── gate 3: window triggered ─────────────────────────────────────────────
+    # ── gate 4: window triggered ─────────────────────────────────────────────
     window_triggered: bool = False
 
-    # ── gate 4: official PTB ─────────────────────────────────────────────────
+    # ── gate 5: official PTB ─────────────────────────────────────────────────
     ptb: Decimal | None = None
 
-    # ── gate 5: strategy enabled ─────────────────────────────────────────────
+    # ── gate 6: strategy enabled ─────────────────────────────────────────────
     strategy_enabled: bool = True
     strategy_id: str = ""
 
-    # ── gate 6: duplicate intent ─────────────────────────────────────────────
+    # ── gate 7: duplicate intent ─────────────────────────────────────────────
     intent_exists: bool = False
 
-    # ── gate 7: trade quota ──────────────────────────────────────────────────
+    # ── gate 8: trade quota ──────────────────────────────────────────────────
     quota_used: int = 0
     quota_reserved: int = 0
     max_trades_per_market: int = 0
 
-    # ── gate 8: opposing direction ───────────────────────────────────────────
+    # ── gate 9: opposing direction ───────────────────────────────────────────
     direction: Direction = Direction.UP
     directions_held: frozenset[Direction] = field(default_factory=frozenset)
     allow_opposing_directions: bool = False
 
-    # ── gate 9: concurrent positions ─────────────────────────────────────────
+    # ── gate 10: concurrent positions ─────────────────────────────────────────
     open_positions: int = 0
     max_concurrent_positions: int = 0
 
-    # ── gates 10 and 11: price and size ──────────────────────────────────────
+    # ── gates 11 and 12: price and size ──────────────────────────────────────
     limit_price: Decimal = _ZERO
     size: Decimal = _ZERO
     entry_price_min: Decimal = _ZERO
     entry_price_max: Decimal = _ZERO
     min_tradable_size: Decimal = _ZERO
 
-    # ── gate 12: loss limits ─────────────────────────────────────────────────
+    # ── gate 13: loss limits ─────────────────────────────────────────────────
     daily_loss_usd: Decimal = _ZERO
     consecutive_losses: int = 0
     max_daily_loss_usd: Decimal = _ZERO
     max_consecutive_losses: int = 0
 
-    # ── gate 13: feed freshness ──────────────────────────────────────────────
+    # ── gate 14: feed freshness ──────────────────────────────────────────────
     feed_blocked: bool = False
     feed_age_ms: float | None = None
 
-    # ── gate 14: clock drift and runtime health ──────────────────────────────
+    # ── gate 15: clock drift and runtime health ──────────────────────────────
     clock_drift_critical: bool = False
     clock_drift_ms: float = 0.0
     runtime_healthy: bool = True
     runtime_detail: str = ""
+
+    # ── gate 16: supervisor readiness ────────────────────────────────────────
+    # Whether the supervisor still considers this runtime the attached one. The
+    # runtime cannot see its own detachment — `runtime_healthy` above is the
+    # runtime reporting on itself, and a cancelled-but-still-looping object
+    # reports itself perfectly healthy while nothing owns it any more.
+    supervisor_ready: bool = True
+    supervisor_detail: str = ""
+
+    # ── gate 17: wallet connectivity ─────────────────────────────────────────
+    # False only on a wallet the venue refused to answer for. V1 has no venue
+    # account at all, which is not a disconnection: the paper wallet reports
+    # PAPER and passes, or V1 could never produce the validation evidence V2
+    # depends on.
+    wallet_connected: bool = True
+    wallet_status: str = ""
+
+    # ── gate 18: orphan orders ───────────────────────────────────────────────
+    # Orders at the venue that reconciliation could not account for. Named
+    # individually rather than counted, so the denial line says which ones.
+    orphan_orders: tuple[str, ...] = ()
+
+    # ── gate 19: available balance ───────────────────────────────────────────
+    # None means no official source reported one, and that is NOT a denial: the
+    # venue publishes collateral only for a live account, and refusing on an
+    # absent figure would be refusing on a number ARC invented. A DISCONNECTED
+    # wallet is caught by gate 17 above, which is the case this would otherwise
+    # be standing in for. The cost is not carried separately — it is
+    # limit_price * size, both already frozen into this context above, and a
+    # second copy could disagree with the order actually submitted.
+    available_balance: Decimal | None = None
+    trace_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,10 +208,16 @@ class RiskVerdict:
     gate: str = ""
     reason: DenialReason | None = None
     detail: str = ""
+    trace_id: str = ""
 
     @property
     def denied(self) -> bool:
         return not self.allowed
+
+    @property
+    def gate_id(self) -> str:
+        """G01..G19. Derived from the gate name, never stored twice."""
+        return GATE_IDS.get(self.gate, "")
 
 
 _ALLOWED: Final[RiskVerdict] = RiskVerdict(allowed=True)
@@ -173,8 +244,8 @@ class RiskEngine:
             gate: Callable[[RiskContext], RiskVerdict] = getattr(self, f"_gate_{name}")
             verdict = gate(context)
             if verdict.denied:
-                return verdict
-        return _ALLOWED
+                return replace(verdict, trace_id=context.trace_id)
+        return replace(_ALLOWED, trace_id=context.trace_id)
 
     # ── 1 ────────────────────────────────────────────────────────────────────
 
@@ -211,6 +282,33 @@ class RiskEngine:
 
     # ── 2 ────────────────────────────────────────────────────────────────────
 
+    def _gate_execution_armed(self, c: RiskContext) -> RiskVerdict:
+        """The OPERATOR boundary, independent of gate 1's SYSTEM boundary.
+
+        Two gates rather than one flag because they answer different questions and
+        have different owners. Gate 1 asks whether ARC is technically permitted to
+        trade and is moved only by ARC's own safety checks; this gate asks whether
+        the operator has asked it to, and is moved only by the Start/Stop Trading
+        control. Collapsing them would let a dashboard click clear a disable that a
+        failed spec verification imposed — the operator would be able to override
+        system safety by pressing a button, which is exactly backwards.
+
+        Ordered SECOND, after the system gate, so that when both are blocking, the
+        reported reason is the system one. An operator told "not armed" while the
+        real obstacle is an unverified spec would arm the bot and see nothing
+        happen, with no reason given for the second refusal.
+        """
+        if not c.execution_armed:
+            return RiskVerdict(
+                allowed=False,
+                gate="execution_armed",
+                reason=DenialReason.EXECUTION_NOT_ARMED,
+                detail="the Limit Order Engine is waiting for the operator to start trading",
+            )
+        return _ALLOWED
+
+    # ── 3 ────────────────────────────────────────────────────────────────────
+
     def _gate_market_phase(self, c: RiskContext) -> RiskVerdict:
         """Phase is the ONLY execution boundary that exists (A10/D1).
 
@@ -242,7 +340,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 3 ────────────────────────────────────────────────────────────────────
+    # ── 4 ────────────────────────────────────────────────────────────────────
 
     def _gate_window_triggered(self, c: RiskContext) -> RiskVerdict:
         """Only a window whose frozen trigger was satisfied may become an intent.
@@ -260,7 +358,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 4 ────────────────────────────────────────────────────────────────────
+    # ── 5 ────────────────────────────────────────────────────────────────────
 
     def _gate_price_to_beat(self, c: RiskContext) -> RiskVerdict:
         """No official PTB, no trade. Never calculated, never estimated (A1 Rule 1).
@@ -278,7 +376,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 5 ────────────────────────────────────────────────────────────────────
+    # ── 6 ────────────────────────────────────────────────────────────────────
 
     def _gate_strategy_enabled(self, c: RiskContext) -> RiskVerdict:
         """A disabled or missing strategy must say so, not silently not trade.
@@ -295,7 +393,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 6 ────────────────────────────────────────────────────────────────────
+    # ── 7 ────────────────────────────────────────────────────────────────────
 
     def _gate_duplicate_intent(self, c: RiskContext) -> RiskVerdict:
         """Exactly one intent per window, ever (A12).
@@ -315,7 +413,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 7 ────────────────────────────────────────────────────────────────────
+    # ── 8 ────────────────────────────────────────────────────────────────────
 
     def _gate_trade_quota(self, c: RiskContext) -> RiskVerdict:
         """Used plus RESERVED against the per-market budget (hazard H2).
@@ -338,7 +436,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 8 ────────────────────────────────────────────────────────────────────
+    # ── 9 ────────────────────────────────────────────────────────────────────
 
     def _gate_opposing_direction(self, c: RiskContext) -> RiskVerdict:
         """Holding both sides of one market is a guaranteed loss (hazard H3).
@@ -361,7 +459,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 9 ────────────────────────────────────────────────────────────────────
+    # ── 10 ───────────────────────────────────────────────────────────────────
 
     def _gate_position_limit(self, c: RiskContext) -> RiskVerdict:
         """Concurrent open positions across the process, not per market.
@@ -379,7 +477,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 10 ───────────────────────────────────────────────────────────────────
+    # ── 11 ───────────────────────────────────────────────────────────────────
 
     def _gate_entry_band(self, c: RiskContext) -> RiskVerdict:
         """The limit price must sit inside the configured band.
@@ -409,7 +507,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 11 ───────────────────────────────────────────────────────────────────
+    # ── 12 ───────────────────────────────────────────────────────────────────
 
     def _gate_exchange_minimum(self, c: RiskContext) -> RiskVerdict:
         """Size must reach the venue's minimum tradable quantity.
@@ -427,7 +525,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 12 ───────────────────────────────────────────────────────────────────
+    # ── 13 ───────────────────────────────────────────────────────────────────
 
     def _gate_loss_limits(self, c: RiskContext) -> RiskVerdict:
         """Daily loss and consecutive losses. Zero on either DISABLES that limit.
@@ -464,7 +562,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 13 ───────────────────────────────────────────────────────────────────
+    # ── 14 ───────────────────────────────────────────────────────────────────
 
     def _gate_feed_freshness(self, c: RiskContext) -> RiskVerdict:
         """A stale feed means the signal TWAP is stale.
@@ -484,7 +582,7 @@ class RiskEngine:
             )
         return _ALLOWED
 
-    # ── 14 ───────────────────────────────────────────────────────────────────
+    # ── 15 ───────────────────────────────────────────────────────────────────
 
     def _gate_runtime_health(self, c: RiskContext) -> RiskVerdict:
         """Critical clock drift, then general runtime health.
@@ -511,5 +609,105 @@ class RiskEngine:
                 gate="runtime_health",
                 reason=DenialReason.RUNTIME_UNHEALTHY,
                 detail=c.runtime_detail or "the runtime reported itself unhealthy",
+            )
+        return _ALLOWED
+
+    # ── 16 ───────────────────────────────────────────────────────────────────
+
+    def _gate_supervisor_ready(self, c: RiskContext) -> RiskVerdict:
+        """The supervisor's view of the run, which the runtime cannot see itself.
+
+        Gate 15 is the runtime reporting on its own status. This is the layer above
+        reporting on whether that runtime is still the attached one and whether its
+        task is alive. The failure it catches is a runtime whose task was cancelled
+        or replaced mid-teardown but whose loop reaches one more decision pass: it
+        reports itself RUNNING, every engine looks correct, and the order it submits
+        belongs to a run nobody owns any more.
+        """
+        if not c.supervisor_ready:
+            return RiskVerdict(
+                allowed=False,
+                gate="supervisor_ready",
+                reason=DenialReason.RUNTIME_SUPERVISOR_NOT_READY,
+                detail=c.supervisor_detail or "the runtime supervisor is not READY",
+            )
+        return _ALLOWED
+
+    # ── 17 ───────────────────────────────────────────────────────────────────
+
+    def _gate_wallet_connected(self, c: RiskContext) -> RiskVerdict:
+        """A wallet the venue would not answer for makes every balance stale.
+
+        The quiet failure: the deck still shows the last balance that was true, the
+        gates below still compare against it, and the operator reads a screen that
+        describes an account state from some minutes ago. Refused rather than
+        warned, because the balance gate underneath would otherwise pass on a
+        remembered number.
+
+        V1 has no venue account and is NOT disconnected — `wallet_connected`
+        arrives True for the paper wallet. A paper run refused here would produce
+        no validation evidence at all, which is the one thing V2 depends on.
+        """
+        if not c.wallet_connected:
+            return RiskVerdict(
+                allowed=False,
+                gate="wallet_connected",
+                reason=DenialReason.WALLET_DISCONNECTED,
+                detail=c.wallet_status or "the venue account could not be read",
+            )
+        return _ALLOWED
+
+    # ── 18 ───────────────────────────────────────────────────────────────────
+
+    def _gate_orphan_orders(self, c: RiskContext) -> RiskVerdict:
+        """An order at the venue that reconciliation could not account for (A14).
+
+        Submitting on top of one doubles the position while both orders look
+        entirely genuine, and neither the ledger nor the deck would show anything
+        wrong until settlement. The orphans are named in the detail rather than
+        counted: "2 orphans" sends the operator to the logs, which is the trip this
+        gate exists to remove.
+        """
+        if c.orphan_orders:
+            return RiskVerdict(
+                allowed=False,
+                gate="orphan_orders",
+                reason=DenialReason.ORPHAN_ORDERS_UNRECONCILED,
+                detail=f"{len(c.orphan_orders)} unreconciled at the venue: "
+                f"{', '.join(c.orphan_orders)}",
+            )
+        return _ALLOWED
+
+    # ── 19 ───────────────────────────────────────────────────────────────────
+
+    def _gate_available_balance(self, c: RiskContext) -> RiskVerdict:
+        """The account must be able to pay for this order.
+
+        Cost is `limit_price * size` — the same two frozen values gate 11 and gate
+        12 already checked, so what is priced here is what is submitted.
+
+        Last, deliberately. It is the only gate that needs both the strategy's
+        output and a venue read, and reaching it means every cheaper condition
+        already passed, so "not enough money" is the true answer rather than the
+        first of several.
+
+        `available_balance is None` ALLOWS. None means no official source reported
+        a figure, which is V1's normal state and, per the wallet contract, the
+        state of any field the venue does not publish. Denying on an absent number
+        would be denying on a number ARC made up; a wallet that genuinely failed to
+        read is DISCONNECTED and gate 17 already refused it.
+        """
+        if c.available_balance is None:
+            return _ALLOWED
+        cost = c.limit_price * c.size
+        if cost > c.available_balance:
+            return RiskVerdict(
+                allowed=False,
+                gate="available_balance",
+                reason=DenialReason.INSUFFICIENT_BALANCE,
+                detail=(
+                    f"order costs {dec_str(cost)} and "
+                    f"{dec_str(c.available_balance)} is available"
+                ),
             )
         return _ALLOWED

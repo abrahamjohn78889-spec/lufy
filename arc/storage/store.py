@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Final, cast
 
 from arc.domain.enums import (
+    DEFAULT_ENGINE,
     LIVE_ORDER_STATES,
     Direction,
     MarketPhase,
@@ -81,6 +82,16 @@ class Store:
 
     def expected_schema_version(self) -> int:
         return SCHEMA_VERSION
+
+    def checkpoint(self) -> None:
+        """Fold the WAL back into the main file.
+
+        Called before a file-copy backup: in WAL mode the newest committed rows live
+        in the -wal sidecar, so copying only the .db would produce a backup missing
+        everything since the last automatic checkpoint — silently, and only
+        discovered when it is restored.
+        """
+        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def close(self) -> None:
         self._conn.close()
@@ -458,6 +469,23 @@ class Store:
             "fired_at": row["fired_at"],
         }
 
+    def window_state(self, slug: str, offset_seconds: int) -> WindowState | None:
+        """One window's persisted state. None when no row exists.
+
+        Exists for the terminal states that carry NO frozen values — NO_DIRECTION is
+        the only one — because restore_frozen deliberately refuses a row with a null
+        trigger. Without this, a NO_DIRECTION window would reload as PENDING after a
+        restart and the next pass would freeze it against a later TWAP, determining
+        direction a second time from a value the contract forbids consulting.
+        """
+        row = self._conn.execute(
+            "SELECT state FROM windows WHERE market_slug = ? AND offset_seconds = ?",
+            (slug, offset_seconds),
+        ).fetchone()
+        if row is None:
+            return None
+        return WindowState(row["state"])
+
     def windows_for(self, slug: str) -> tuple[sqlite3.Row, ...]:
         rows = self._conn.execute(
             "SELECT * FROM windows WHERE market_slug = ? ORDER BY offset_seconds", (slug,)
@@ -466,12 +494,19 @@ class Store:
 
     # ── intents ──────────────────────────────────────────────────────────────
 
-    def save_intent(self, intent: ExecutionIntent) -> bool:
+    def save_intent(self, intent: ExecutionIntent, *, engine: str = DEFAULT_ENGINE) -> bool:
         """Record an execution intent. Returns False if the window already has one.
 
-        Arbitration is the UNIQUE(market_slug, offset_seconds) constraint, not an
-        in-memory guard, so exactly-one-per-window holds across a crash between
-        the decision and the submission (A12).
+        Arbitration is the UNIQUE(engine, market_slug, offset_seconds) constraint,
+        not an in-memory guard, so exactly-one-per-window-per-engine holds across a
+        crash between the decision and the submission (A12).
+
+        `engine` is keyword-only and defaults to TWAP, so the Decision Engine's own
+        call is byte-for-byte the call it always made and its arbitration is
+        unchanged. The engine dimension is what stops one engine's intent from
+        SILENTLY suppressing the other's: this is an OR IGNORE insert, so a row
+        dropped for colliding on the old two-column key would have been reported as
+        an ordinary non-insert, and the second engine would simply never trade.
 
         Every snapshot column is written in the same statement. Persisting the
         decision without the price and size it was made with would leave a
@@ -482,12 +517,13 @@ class Store:
             with self._conn:
                 cur = self._conn.execute(
                     "INSERT OR IGNORE INTO intents "
-                    "(intent_id, market_slug, offset_seconds, direction, signal_twap, "
+                    "(intent_id, trace_id, market_slug, offset_seconds, direction, signal_twap, "
                     " locked_trigger, created_at, opening_twap, ptb, buffer, "
-                    " limit_price, size, strategy_id, close_ts) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " limit_price, size, strategy_id, close_ts, engine) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         intent.intent_id or f"{intent.market_slug}:{intent.offset_seconds}",
+                        intent.trace_id,
                         intent.market_slug,
                         intent.offset_seconds,
                         intent.direction.value,
@@ -501,16 +537,29 @@ class Store:
                         dec_str(intent.size),
                         intent.strategy_id,
                         intent.close_ts,
+                        engine,
                     ),
                 )
                 return cur.rowcount > 0
         except sqlite3.Error as exc:
             raise StorageError(f"failed to save intent: {exc}") from exc
 
-    def intents_for(self, slug: str) -> tuple[ExecutionIntent, ...]:
-        rows = self._conn.execute(
-            "SELECT * FROM intents WHERE market_slug = ? ORDER BY offset_seconds", (slug,)
-        ).fetchall()
+    def intents_for(
+        self, slug: str, *, engine: str | None = None
+    ) -> tuple[ExecutionIntent, ...]:
+        """Every intent for a market, or only one engine's when `engine` is given.
+
+        `engine=None` returns BOTH engines' intents, which is what the ledger and
+        recorder want: they render the whole market, not one engine's slice. A
+        caller that owns a single engine passes its name and never sees the other's.
+        """
+        sql = "SELECT * FROM intents WHERE market_slug = ?"
+        params: list[Any] = [slug]
+        if engine is not None:
+            sql += " AND engine = ?"
+            params.append(engine)
+        sql += " ORDER BY offset_seconds"
+        rows = self._conn.execute(sql, params).fetchall()
         return tuple(
             ExecutionIntent(
                 market_slug=str(r["market_slug"]),
@@ -520,6 +569,7 @@ class Store:
                 locked_trigger=to_decimal(r["locked_trigger"]),
                 created_at=float(r["created_at"]),
                 intent_id=str(r["intent_id"]),
+                trace_id=str(r["trace_id"]),
                 opening_twap=to_decimal(r["opening_twap"]),
                 ptb=to_decimal(r["ptb"]),
                 buffer=to_decimal(r["buffer"]),
@@ -531,10 +581,35 @@ class Store:
             for r in rows
         )
 
-    def has_intent(self, slug: str, offset_seconds: int) -> bool:
+    def intent_keys(self, slug: str) -> tuple[tuple[str, int], ...]:
+        """Every intent's `(engine, offset_seconds)` for one market, ordered.
+
+        Read straight from SQL rather than off an ExecutionIntent, because the intent
+        model deliberately carries no engine field: that dataclass is the frozen
+        determinism contract and its serialization must not shift. The engine lives
+        in the database column, and the validators that need to tell one engine's
+        authorisation from another's read it from here.
+        """
+        rows = self._conn.execute(
+            "SELECT engine, offset_seconds FROM intents WHERE market_slug = ? "
+            "ORDER BY engine, offset_seconds",
+            (slug,),
+        ).fetchall()
+        return tuple((str(r["engine"]), int(r["offset_seconds"])) for r in rows)
+
+    def has_intent(
+        self, slug: str, offset_seconds: int, *, engine: str = DEFAULT_ENGINE
+    ) -> bool:
+        """Whether `engine` already holds an intent for this window.
+
+        `engine` is keyword-only and defaults to TWAP, so the frozen decision engine
+        keeps its exact meaning: "does the ONE TWAP intent for this window exist".
+        The arbiter is now per-engine, which is what lets a MAJORITY intent live on a
+        window TWAP already used without either suppressing the other.
+        """
         row = self._conn.execute(
-            "SELECT 1 FROM intents WHERE market_slug = ? AND offset_seconds = ?",
-            (slug, offset_seconds),
+            "SELECT 1 FROM intents WHERE market_slug = ? AND offset_seconds = ? AND engine = ?",
+            (slug, offset_seconds, engine),
         ).fetchone()
         return row is not None
 
@@ -547,8 +622,8 @@ class Store:
                 self._conn.execute(
                     "INSERT INTO orders (order_id, market_slug, offset_seconds, direction, "
                     " price, size, state, filled_size, venue_order_id, reprice_chain_id, "
-                    " rejection_reason, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    " rejection_reason, trace_id, engine, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(order_id) DO UPDATE SET state=excluded.state, "
                     " filled_size=excluded.filled_size, venue_order_id=excluded.venue_order_id, "
                     " rejection_reason=excluded.rejection_reason, updated_at=excluded.updated_at",
@@ -564,6 +639,13 @@ class Store:
                         order.venue_order_id,
                         order.reprice_chain_id,
                         order.rejection_reason,
+                        order.trace_id,
+                        # Deliberately absent from the ON CONFLICT update list. Engine
+                        # ownership is set once, when the row is first written, and an
+                        # upsert must never move an order from one engine to another —
+                        # that would hand a live position to an engine that never
+                        # approved it, and the original owner would stop sweeping it.
+                        order.engine,
                         order.created_at,
                         order.updated_at,
                     ),
@@ -604,6 +686,24 @@ class Store:
         ).fetchall()
         return tuple(self._order_from_row(r) for r in rows)
 
+    def local_order_id(self, slug: str, venue_order_id: str) -> str:
+        """ARC's derived order id for a venue id, or "" when it is not ours.
+
+        The V2 adapter's only way back from a venue row to a local row: the CLOB
+        assigns its own ids and documents no client-id field. Read from SQLite
+        rather than from a process-local dict, because the process that most needs
+        this mapping is the one that just restarted holding nothing in memory —
+        without it every fill after a restart would be recorded as unlinked and
+        would never advance the order it belongs to.
+        """
+        if not venue_order_id:
+            return ""
+        row = self._conn.execute(
+            "SELECT order_id FROM orders WHERE market_slug = ? AND venue_order_id = ?",
+            (slug, venue_order_id),
+        ).fetchone()
+        return "" if row is None else str(row["order_id"])
+
     @staticmethod
     def _order_from_row(row: sqlite3.Row) -> Order:
         return Order(
@@ -620,6 +720,8 @@ class Store:
             venue_order_id=str(row["venue_order_id"]),
             reprice_chain_id=str(row["reprice_chain_id"]),
             rejection_reason=str(row["rejection_reason"]),
+            trace_id=str(row["trace_id"]),
+            engine=str(row["engine"]),
         )
 
     # ── fills ────────────────────────────────────────────────────────────────
@@ -635,14 +737,17 @@ class Store:
             with self._conn:
                 cur = self._conn.execute(
                     "INSERT OR IGNORE INTO fills "
-                    "(fill_id, order_id, market_slug, size, price, ts) VALUES (?, ?, ?, ?, ?, ?)",
+                    "(fill_id, order_id, market_slug, trace_id, size, price, ts, engine) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         fill.fill_id,
                         fill.order_id,
                         fill.market_slug,
+                        fill.trace_id,
                         dec_str(fill.size),
                         dec_str(fill.price),
                         fill.ts,
+                        fill.engine,
                     ),
                 )
                 return cur.rowcount > 0
@@ -661,6 +766,8 @@ class Store:
                 size=to_decimal(r["size"]),
                 price=to_decimal(r["price"]),
                 ts=float(r["ts"]),
+                trace_id=str(r["trace_id"]),
+                engine=str(r["engine"]),
             )
             for r in rows
         )
@@ -696,28 +803,56 @@ class Store:
             with self._conn:
                 cur = self._conn.execute(
                     "INSERT OR IGNORE INTO settlements "
-                    "(market_slug, outcome, settlement_twap, ptb, pnl, divergence_logged, "
-                    " settled_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "(market_slug, trace_id, outcome, settlement_twap, ptb, pnl, "
+                    "divergence_logged, settled_at, engine) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         settlement.market_slug,
+                        settlement.trace_id,
                         settlement.outcome.value,
                         _opt_str(settlement.settlement_twap),
                         _opt_str(settlement.ptb),
                         dec_str(settlement.pnl),
                         int(settlement.divergence_logged),
                         settlement.settled_at,
+                        settlement.engine,
                     ),
                 )
                 return cur.rowcount > 0
         except sqlite3.Error as exc:
             raise StorageError(f"failed to save settlement: {exc}") from exc
 
-    def settlement_for(self, slug: str) -> Settlement | None:
+    def settlement_for(self, slug: str, *, engine: str = DEFAULT_ENGINE) -> Settlement | None:
+        """ONE engine's settlement for a market. Engine-scoped, never row-order.
+
+        The primary key is now (engine, market_slug), so a bare market lookup could
+        match two rows. This never guesses which: `engine` is keyword-only and
+        defaults to TWAP, so every existing caller keeps returning exactly the TWAP
+        settlement it returned before. A caller that wants both engines' rows uses
+        `settlements_for`.
+        """
         row = self._conn.execute(
-            "SELECT * FROM settlements WHERE market_slug = ?", (slug,)
+            "SELECT * FROM settlements WHERE market_slug = ? AND engine = ?",
+            (slug, engine),
         ).fetchone()
         if row is None:
             return None
+        return self._settlement_from_row(row)
+
+    def settlements_for(self, slug: str) -> tuple[Settlement, ...]:
+        """Every engine's settlement for one market. For whole-market rendering.
+
+        Ordered by engine so the result is deterministic rather than dependent on
+        insertion order — the caller that wants both rows must not have to reason
+        about which physically landed first.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM settlements WHERE market_slug = ? ORDER BY engine", (slug,)
+        ).fetchall()
+        return tuple(self._settlement_from_row(r) for r in rows)
+
+    @staticmethod
+    def _settlement_from_row(row: sqlite3.Row) -> Settlement:
         return Settlement(
             market_slug=str(row["market_slug"]),
             outcome=Outcome(row["outcome"]),
@@ -726,6 +861,8 @@ class Store:
             settled_at=float(row["settled_at"]),
             pnl=to_decimal(row["pnl"]),
             divergence_logged=bool(row["divergence_logged"]),
+            trace_id=str(row["trace_id"]),
+            engine=str(row["engine"]),
         )
 
     def settlement_history(self, limit: int = 100) -> tuple[Settlement, ...]:
@@ -741,6 +878,8 @@ class Store:
                 settled_at=float(r["settled_at"]),
                 pnl=to_decimal(r["pnl"]),
                 divergence_logged=bool(r["divergence_logged"]),
+                trace_id=str(r["trace_id"]),
+                engine=str(r["engine"]),
             )
             for r in rows
         )
@@ -773,6 +912,58 @@ class Store:
     def candle_count(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) AS n FROM candles").fetchone()
         return int(row["n"])
+
+    def row_counts(self) -> dict[str, int]:
+        """Cumulative row counts, for the Systems page. NOT session-scoped.
+
+        These are whole-database totals and say nothing about one run. The
+        end-of-session summary must not use them: after any restart they include
+        every earlier session's rows, and a summary built from them would credit
+        this run with work a previous one did.
+        """
+        return {
+            table: int(self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in ("observations", "intents", "orders", "fills")
+        }
+
+    def order_tally_since(self, since_ts: float) -> dict[str, int]:
+        """Orders created at or after `since_ts`, split into total and fully filled.
+
+        Session-scoped by `created_at`, which is what makes it answer "what did THIS
+        run do" rather than "what is in the database".
+
+        Both numbers come from ONE query so the fill rate can never disagree with
+        its own numerator: two separate counts could straddle a fill landing between
+        them and report more filled orders than submitted.
+
+        "Filled" means filled_size >= size — the order is complete. A partial is
+        counted in `submitted` and not in `filled`, because a half-filled resting
+        order is not a completed trade and reporting it as one would overstate the
+        fill rate. Compared as REAL: sizes are stored as decimal strings, and a
+        string comparison would rank '10' below '9'.
+        """
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS submitted, "
+            " COALESCE(SUM(CAST(filled_size AS REAL) >= CAST(size AS REAL)), 0) AS filled "
+            "FROM orders WHERE created_at >= ?",
+            (since_ts,),
+        ).fetchone()
+        return {"submitted": int(row["submitted"]), "filled": int(row["filled"])}
+
+    def save_runtime_session(self, values: dict[str, object]) -> None:
+        columns = tuple(values)
+        names = ", ".join(columns)
+        placeholders = ", ".join("?" for _ in columns)
+        with self._conn:
+            self._conn.execute(
+                f"INSERT OR REPLACE INTO runtime_sessions ({names}) VALUES ({placeholders})",
+                tuple(values[name] for name in columns),
+            )
+
+    def runtime_sessions(self, limit: int = 50) -> tuple[sqlite3.Row, ...]:
+        return tuple(self._conn.execute(
+            "SELECT * FROM runtime_sessions ORDER BY started_at DESC LIMIT ?", (limit,)
+        ).fetchall())
 
     # ── integrity ────────────────────────────────────────────────────────────
 

@@ -30,6 +30,7 @@ VALID_TRADING_VALUES: dict[str, str] = {
     "entry_price_max": "0.85",
     "tick_size": "0.01",
     "min_tradable_size": "5",
+    "submission_count": "1",
     "cancel_lead_ms": "500",
     "cancel_ack_timeout_ms": "400",
     "feed_stale_warn_ms": "3000",

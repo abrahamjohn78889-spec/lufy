@@ -3,8 +3,15 @@
     opening_twap    ARC's cumulative signal mean at the activation instant
     ptb             the market's official opening reference, frozen once
     buffer          the configured buffer for THIS offset
-    direction       UP if opening_twap >= ptb else DOWN
+    direction       UP if opening_twap > ptb, DOWN if opening_twap < ptb, and NEITHER
+                    on equality — strict comparison only, no >= and no <=
     locked_trigger  opening_twap + buffer (UP) or opening_twap - buffer (DOWN)
+
+EQUALITY IS NOT A FREEZE. When the frozen TWAP equals the official PTB exactly, no
+direction exists, so there are no five values to lock: the window is retired to the
+terminal NO_DIRECTION state and authorises nothing. It is terminal rather than left
+PENDING because direction is determined once, at the opening instant, and a retried
+window would freeze against a TWAP the contract says is not to be consulted.
 
 ATOMICITY (criterion 3). Every failure mode leaves all five as None and the window
 PENDING. ExecutionWindow.freeze already computes into locals and assigns in one block,
@@ -40,9 +47,10 @@ from decimal import Decimal
 from arc.config import TradingConfig
 from arc.domain.enums import WindowState
 from arc.domain.models import ExecutionWindow, MarketInstance
-from arc.errors import StorageError, WindowFreezeError
+from arc.errors import NoDirectionError, StorageError, WindowFreezeError
 from arc.logging_setup import log_event
 from arc.storage.store import Store
+from arc.windows.lifecycle import no_direction_window
 
 __all__ = ["freeze_due_window", "freeze_window", "restore_window"]
 
@@ -65,6 +73,10 @@ def freeze_window(
     Raises WindowFreezeError when the freeze was ATTEMPTED and could not be completed —
     no PTB, no observations yet, a missing buffer, or a refused row. In every one of
     those cases the window is left exactly as it was found.
+
+    Raises NoDirectionError, separately and deliberately, when the frozen TWAP equalled
+    the official PTB. That is a final verdict rather than a retryable failure, so the
+    caller must retire the window instead of leaving it for the next pass.
     """
     if window.state is not WindowState.PENDING:
         return False
@@ -81,6 +93,19 @@ def freeze_window(
             f"window {offset}s of {market.slug} has no configured buffer; "
             "a window without a buffer can never fire"
         ) from exc
+
+    # The activation instant has passed and this window is now open. Logged BEFORE the
+    # freeze, and as its own event, because "Window Open" and "Values Frozen" are two
+    # stages of the Limit Order Engine's lifecycle: a window that opened and could not
+    # freeze yet must show as open rather than as nothing at all. A retry logs it again,
+    # always alongside the rejection line that explains why the first attempt did not
+    # complete.
+    log_event(
+        logging.INFO,
+        "Window Open",
+        f"{market.slug}  {offset}s  buffer {buffer}",
+        logger=logger,
+    )
 
     # freeze_window on the instance validates the PTB and the TWAP and performs the
     # single-assignment commit. Anything it raises leaves the window untouched.
@@ -151,11 +176,25 @@ def freeze_due_window(
     The failure is logged at WARNING and the window stays PENDING, so the next pass
     retries it. That is the correct behaviour for the realistic cause — no observations
     have arrived yet — which resolves by itself on the following tick.
+
+    NoDirectionError is handled differently and must be: the window is retired to
+    NO_DIRECTION and persisted. Retrying it would freeze a direction against a later
+    TWAP, and direction is determined exactly once at the opening instant.
     """
     try:
         return freeze_window(
             market, window, trading=trading, store=store, now=now, logger=logger
         )
+    except NoDirectionError as exc:
+        if no_direction_window(window, logger=logger):
+            store.save_window_state(market.slug, window.offset_seconds, window.state)
+        log_event(
+            logging.INFO,
+            "Window No Direction",
+            f"{market.slug}  {window.offset_seconds}s  {exc}",
+            logger=logger,
+        )
+        return False
     except WindowFreezeError as exc:
         log_event(
             logging.WARNING,
@@ -183,7 +222,17 @@ def restore_window(
     the trigger from the post-restart TWAP produces a DIFFERENT trigger than the window
     locked. The bot would then keep running, look perfectly healthy, and trade a
     strategy nobody configured.
+
+    A NO_DIRECTION window is restored too, and has to be. It carries no frozen values,
+    so restore_frozen returns None for it; without the state check below it would come
+    back PENDING and the next pass would determine its direction a second time, against
+    a TWAP that has since moved off the PTB it equalled.
     """
+    state = store.window_state(market.slug, offset_seconds)
+    if state is WindowState.NO_DIRECTION:
+        market.window(offset_seconds).state = WindowState.NO_DIRECTION
+        return True
+
     frozen = store.restore_frozen(market.slug, offset_seconds)
     if frozen is None:
         return False
