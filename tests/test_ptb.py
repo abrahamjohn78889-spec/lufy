@@ -377,31 +377,28 @@ class TestFreezing:
         assert freeze_ptb_for(market, resolution) is True
         assert market.ptb == Decimal("120000.50")
 
-    def test_unavailability_marks_the_market_dead_and_logs_the_line(
+    def test_unavailability_leaves_market_active_and_logs_info(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
+        """PTB is display-only — missing PTB does not kill the market."""
         market = _market()
         logger = logging.getLogger("arc.test.ptb")
         resolution = resolve_ptb(_metadata(None), window_ts=WINDOW_TS)
 
-        with caplog.at_level(logging.ERROR, logger="arc.test.ptb"):
+        with caplog.at_level(logging.INFO, logger="arc.test.ptb"):
             assert freeze_ptb_for(market, resolution, logger=logger) is False
 
-        assert market.phase is MarketPhase.DEAD
-        assert market.dead_reason == DEAD_REASON_PTB_UNAVAILABLE
+        assert market.phase is MarketPhase.DISCOVERED  # unchanged from initial
         assert market.ptb is None
-        assert "PTB Unavailable" in caplog.text
-        # The detail rides in extra["arc_detail"], which the formatter renders as the
-        # right-hand column; caplog.text carries only the message.
+        assert "PTB Not Yet Available" in caplog.text
         details = [getattr(r, "arc_detail", "") for r in caplog.records]
-        assert any("no trading this market" in d for d in details)
+        assert any("market stays active" in d for d in details)
 
-    def test_a_dead_market_keeps_accepting_observations_for_the_record(self) -> None:
-        """DEAD means never traded, not never recorded — but the accumulator stops,
-        because a market with no official PTB has no trigger to compute against."""
+    def test_a_market_without_ptb_still_accepts_observations(self) -> None:
+        """Missing PTB leaves the market tradable; observations keep flowing."""
         market = _market()
         freeze_ptb_for(market, resolve_ptb(_metadata(None), window_ts=WINDOW_TS))
-        assert market.accepts_observations() is False
+        assert market.accepts_observations() is True
 
     def test_freezing_twice_raises_rather_than_refreshing(self) -> None:
         """A second call means some path believes it may refresh the PTB (A12)."""

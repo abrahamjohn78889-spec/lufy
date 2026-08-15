@@ -22,13 +22,13 @@ from arc.market.providers import ProviderName, TwapProvider, build_provider
 
 # Every module that must remain ignorant of the provider. Stated as paths rather than
 # as a package, because the guarantee is about specific engines, not about a directory
-# that a later refactor might rename.
+# that a later refactor might rename. MAJORITY is now the only engine; the strategy,
+# windows and decision packages were removed with the TWAP trading engine, and the
+# majority engine replaces them in this guarantee.
 PROVIDER_BLIND = (
     "arc/market/ptb.py",
-    "arc/windows",
-    "arc/decision",
+    "arc/majority",
     "arc/risk",
-    "arc/strategy",
 )
 
 
@@ -197,8 +197,7 @@ class TestTheProviderNameAppearsInNoEngine:
 
     The literal sweep the specification names:
 
-        grep -ri "rtds\\|chainlink" arc/strategy/ arc/windows/ arc/decision/ \\
-            arc/risk/ arc/execution/
+        grep -ri "rtds\\|chainlink" arc/majority/ arc/risk/ arc/execution/
 
     must return nothing. Deliberately cruder than the import walk above and kept
     alongside it: this one also catches a provider name in a docstring, a comment
@@ -208,7 +207,7 @@ class TestTheProviderNameAppearsInNoEngine:
     being true.
     """
 
-    ENGINES = ("strategy", "windows", "decision", "risk", "execution")
+    ENGINES = ("majority", "risk", "execution")
     NAMES = ("rtds", "chainlink")
 
     def test_no_engine_source_file_contains_a_provider_name(

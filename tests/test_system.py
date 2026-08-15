@@ -115,7 +115,12 @@ class TestReadOnly:
         assert "<textarea" not in _SYS
 
     def test_the_only_control_is_the_local_backup(self) -> None:
-        assert re.findall(r"<button[^>]*id=\"([^\"]+)\"", _SYS) == ["backup"]
+        """The System page is read-only except for the local backup and the Telegram
+        send-test button (Phase 2 moved Telegram to System with an explicit TEST
+        control). Nothing else may be tunable from this page."""
+        assert set(re.findall(r"<button[^>]*id=\"([^\"]+)\"", _SYS)) == {
+            "backup", "telegram-test"
+        }
 
 
 class TestRestartCount:

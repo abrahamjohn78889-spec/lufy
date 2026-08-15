@@ -11,6 +11,31 @@
 */
 
 :root {
+  --bg: #f7f5fb;
+  --panel: #ffffff;
+  --line: #ddd3ef;
+  --text: #2a2440;
+  --dim: #6b6480;
+  --green: #1a7f47;
+  --amber: #9a6800;
+  --red: #c0281f;
+  --accent: #7c5cbf;
+  --inset: #f1edf9;
+  --hover: #f4f0fb;
+  --on-accent: #ffffff;
+  --majority-line: #c9b8ee;
+  --majority-head: #6d4fc4;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+}
+
+/*
+  The alternate theme. Only the palette variables are overridden — every
+  layout rule below is shared, so a panel added later cannot exist in one theme
+  and be missing from the other. Reds and greens keep their hue and are picked
+  for contrast on dark rather than re-used: UP and DOWN must read the same way
+  in both themes.
+*/
+:root[data-theme="dark"] {
   --bg: #0b0e13;
   --panel: #141922;
   --line: #232a36;
@@ -20,25 +45,11 @@
   --amber: #ffbe3d;
   --red: #ff5f56;
   --accent: #5aa9ff;
-  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
-}
-
-/*
-  The second shipped theme. Only the palette variables are overridden — every
-  layout rule below is shared, so a panel added later cannot exist in one theme
-  and be missing from the other. Reds and greens keep their hue and are darkened
-  rather than re-picked: UP and DOWN must read the same way in both themes.
-*/
-:root[data-theme="light"] {
-  --bg: #f4f6fa;
-  --panel: #ffffff;
-  --line: #d5dbe5;
-  --text: #16202e;
-  --dim: #5c6879;
-  --green: #1a7f47;
-  --amber: #9a6800;
-  --red: #c0281f;
-  --accent: #1667c4;
+  --inset: #0e131b;
+  --hover: #182030;
+  --on-accent: #0b0e13;
+  --majority-line: #7c5cbf;
+  --majority-head: #b794f6;
 }
 
 * { box-sizing: border-box; }
@@ -59,7 +70,7 @@ header {
   position: sticky; top: 0; z-index: 10;
   display: flex; align-items: center; gap: 14px;
   padding: 8px 14px;
-  background: #0e131b;
+  background: var(--inset);
   border-bottom: 1px solid var(--line);
 }
 
@@ -82,9 +93,9 @@ header {
 /* ── banner ───────────────────────────────────────────────────────────────── */
 
 .banner { padding: 8px 14px; font-weight: 700; letter-spacing: 0.5px; }
-.banner.red { background: #3a1216; color: var(--red); }
-.banner.amber { background: #33280d; color: var(--amber); }
-.banner.green { background: #0f2b1c; color: var(--green); }
+.banner.red { background: color-mix(in srgb, var(--red) 12%, var(--panel)); color: var(--red); }
+.banner.amber { background: color-mix(in srgb, var(--amber) 12%, var(--panel)); color: var(--amber); }
+.banner.green { background: color-mix(in srgb, var(--green) 12%, var(--panel)); color: var(--green); }
 .banner.hidden { display: none; }
 
 /* ── workspaces ───────────────────────────────────────────────────────────── */
@@ -100,10 +111,23 @@ header {
 .span2 { grid-column: span 2; }
 .span3 { grid-column: span 3; }
 .span4 { grid-column: span 4; }
+.span-full { grid-column: 1 / -1; }
+
+/* §21: two-column OPS DECK layout. Left column holds operational panels;
+   right column holds MAJORITY engine and config. Collapses to single column
+   on narrow screens. */
+.ops-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.ops-col { display: flex; flex-direction: column; gap: 10px; }
 
 @media (max-width: 1100px) {
   .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .span3, .span4 { grid-column: span 2; }
+  .ops-columns { grid-template-columns: 1fr; }
 }
 
 .panel {
@@ -172,6 +196,10 @@ header {
 
 .checks { display: flex; flex-direction: column; gap: 1px; }
 .check { display: grid; grid-template-columns: 68px 170px 1fr; gap: 8px; }
+.check.loe-card { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); padding: 6px 0; border-bottom: 1px solid var(--line); }
+.loe-row { display: flex; flex-direction: column; gap: 1px; }
+.loe-row i { font-size: 9px; text-transform: uppercase; letter-spacing: .04em; }
+.loe-row b { font-weight: 600; font-size: 12px; }
 .check b { font-weight: 700; }
 .check.pass b { color: var(--green); }
 .check.warning b { color: var(--amber); }
@@ -193,12 +221,12 @@ header {
   flex: 1; text-align: center; padding: 8px;
   border: 1px solid var(--line); border-radius: 3px; color: var(--dim);
 }
-.mode.on { color: var(--text); border-color: var(--accent); background: #14243a; }
+.mode.on { color: var(--text); border-color: var(--accent); background: var(--hover); }
 
 .controls { display: flex; gap: 8px; flex-wrap: wrap; }
 
 button {
-  background: #1d2430; color: var(--text);
+  background: var(--inset); color: var(--text);
   border: 1px solid var(--line); border-radius: 3px;
   padding: 6px 12px; font: inherit; cursor: pointer;
 }
@@ -232,9 +260,9 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   padding: 5px 10px; border: 1px solid var(--line); border-radius: 3px;
   color: var(--dim); font-size: 11px;
 }
-.lifecycle li.done { color: var(--text); border-color: #2f4a38; }
+.lifecycle li.done { color: var(--text); border-color: color-mix(in srgb, var(--green) 40%, var(--line)); }
 .lifecycle li.now {
-  color: #0b0e13; background: var(--accent); border-color: var(--accent); font-weight: 700;
+  color: var(--on-accent); background: var(--accent); border-color: var(--accent); font-weight: 700;
 }
 /* Submitted and Filled are separate boxes and separately coloured: a fill drawn
    as "submitted, done" would tell the operator a position is on when it is not. */
@@ -260,15 +288,29 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .wallet { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
 
+/* §33 paper bankroll controls. Inline row so the input and two buttons sit on one
+   line on wide screens; flex-wrap keeps it usable on narrow ones. The danger
+   button is red-tinted to signal consequence — a reset is not an undoable action. */
+.paper-controls {
+  display: flex; gap: 8px; align-items: end; flex-wrap: wrap;
+  margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line);
+}
+.paper-controls .field { margin-bottom: 0; min-width: 160px; }
+button.danger { background: #3a1418; color: var(--red); border-color: #5a2028; }
+button.danger:hover:not(:disabled) { background: #4a1c22; }
+button.danger:disabled { opacity: 0.4; cursor: not-allowed; }
+.hidden { display: none !important; }
+
 /* ── tables / streams ─────────────────────────────────────────────────────── */
 
 .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
 
 input, select {
-  background: #0e131b; color: var(--text);
+  background: var(--inset); color: var(--text);
   border: 1px solid var(--line); border-radius: 3px;
   padding: 5px 8px; font: inherit;
 }
+input[type="checkbox"], input[type="radio"] { width: auto; }
 input:disabled { opacity: 0.4; }
 
 a { color: var(--accent); }
@@ -279,11 +321,11 @@ a { color: var(--accent); }
 .stream th {
   position: sticky; top: 44px; z-index: 2;
   text-align: left; padding: 5px 8px; white-space: nowrap;
-  background: #0e131b; border-bottom: 1px solid var(--line);
+  background: var(--inset); border-bottom: 1px solid var(--line);
   color: var(--dim); font-weight: 600;
 }
-.stream td { padding: 3px 8px; border-bottom: 1px solid #1a2028; white-space: nowrap; }
-.stream tr:hover td { background: #182030; }
+.stream td { padding: 3px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.stream tr:hover td { background: var(--hover); }
 
 .stream tr.fatal td, .stream tr.error td { color: var(--red); }
 .stream tr.warning td { color: var(--amber); }
@@ -315,7 +357,7 @@ a { color: var(--accent); }
   border: 1px solid var(--line); background: transparent; color: var(--dim);
   cursor: pointer;
 }
-.preset-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(0,210,255,0.08); }
+.preset-btn.active { border-color: var(--accent); color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
 #majority_windows_input { width: 100px; margin-left: 6px; }
 
 #majority-scalars .field { margin-bottom: 6px; }
@@ -328,12 +370,73 @@ a { color: var(--accent); }
 .mwin-label { font-size: 11px; color: var(--dim); min-width: 36px; padding-top: 6px; }
 .majority-window-row .field { flex: 1 1 120px; margin-bottom: 0; }
 
+/* ── MAJORITY config cards (organized sections) ─────────────────────── */
+
+.cfg-card {
+  border: 1px solid var(--line); border-radius: 4px;
+  padding: 10px 12px; margin-bottom: 10px; background: var(--panel);
+}
+.cfg-card h4 {
+  margin: 0 0 8px; font-size: 11px; letter-spacing: 1px;
+  text-transform: uppercase; color: var(--accent);
+}
+.cfg-hint { color: var(--dim); font-size: 11px; margin: 4px 0 0; }
+
+.field.onoff { display: flex; align-items: center; gap: 8px; }
+.field.onoff > span:first-of-type { display: inline; margin: 0; min-width: 140px; }
+.field.onoff input[type="checkbox"] { width: auto; margin: 0; }
+.field.onoff .onoff-state { font-weight: 700; color: var(--accent); min-width: 28px; }
+
+/* ── MAJORITY panel — light purple theme (dominant, top of OPS DECK) ──────── */
+
+.majority-panel {
+  border-color: var(--majority-line);
+  background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 6%, var(--panel)) 0%, var(--panel) 100%);
+}
+.majority-panel h2 { color: var(--majority-head); }
+
+.majority-config-panel {
+  border-color: var(--majority-line);
+  background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 4%, var(--panel)) 0%, var(--panel) 100%);
+}
+.majority-config-panel h2 { color: var(--majority-head); }
+
+/* MAJORITY controls row */
+.majority-controls { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+
+/* Emergency Close All — visually distinct, operator-only */
+.emergency-close {
+  border-color: var(--red) !important;
+  color: var(--red) !important;
+  background: rgba(255,95,86,0.1) !important;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+.emergency-close:hover:not(:disabled) {
+  background: rgba(255,95,86,0.2) !important;
+  border-color: #ff8a80 !important;
+}
+
 /* ── backtest ─────────────────────────────────────────────────────────────── */
+
+/* §35 Ledger expandable detail row */
+.ledger-detail td { padding: 0; border-bottom: 1px solid var(--line); }
+.ledger-detail-inner {
+  padding: 8px 12px; background: var(--inset); font-size: 11px; line-height: 1.6;
+}
+.ledger-detail-inner .ids { color: var(--dim); margin-bottom: 4px; overflow-wrap: anywhere; }
+.ledger-detail-inner .times { color: var(--text); margin-bottom: 4px; overflow-wrap: anywhere; }
+.ledger-detail-inner .why {
+  margin: 4px 0 0; padding: 6px 8px; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 3px;
+  white-space: pre-wrap; font-family: inherit; color: var(--text);
+}
+.ledger-summary { margin-bottom: 12px; }
 
 /* Not a dialog and with no close control: the warning cannot be dismissed
    because a signal chart read as a performance chart is the whole hazard. */
 .warn-banner {
-  background: #33280d; color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 12%, var(--panel)); color: var(--amber);
   border: 1px solid var(--amber); border-radius: 4px;
   padding: 10px 12px; margin-bottom: 12px; font-weight: 600;
 }

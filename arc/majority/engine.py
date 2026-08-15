@@ -1,57 +1,77 @@
-"""MAJORITY per-market engine: trigger, fresh read, side selection, intent, submission.
+"""MAJORITY per-market engine: entry condition, fresh read, side selection, intent, submission.
 
 One instance per process. Keyed internally by (market_slug, window_seconds) so a
 market with N configured windows holds N independent state objects. Per-market state
 objects are created when a market opens and DROPPED when it closes — the same A11
 discipline MarketInstance follows. There is no reset(), clear() or reuse path.
 
-THE TWO-STEP RULE
-=================
-Step 1 (trigger): the book is polled each tick. When
-    max(best_bid(UP), best_bid(DOWN)) >= config.trigger_price
-the trigger fires. Exactly once per market/window.
+THE DIVISION OF LABOUR (spec §6-§10, final spec §5-§9)
+======================================================
+The BUFFER switch decides whether the buffer entry condition is active at all:
+OFF means entry never waits on BTC or TWAP movement. Active, the window's ENTRY
+MODE decides WHEN the opportunity fires:
+  DIRECT        buffer condition absent: fires at window open. No BTC ± 0
+                waiting, no trigger mathematics at all (§8, final spec §9).
+  BTC_TRIGGER   window > 30s with buffer ON > 0: at window open the current BTC
+                spot is captured as the reference; UP_TRIGGER = ref + buffer,
+                DOWN_TRIGGER = ref - buffer. The first level the live spot
+                satisfies opens the opportunity (§6). The levels live in
+                memory only — they are never orders and never Polymarket
+                limit prices.
+  TWAP_SUPPORT  window ≤ 30s with buffer ON: the running TWAP reference
+                supports the entry — the condition |signal TWAP - PTB| ≥
+                buffer opens the opportunity (§9). TWAP is SUPPORT DATA: it
+                gates when, it never decides which side.
 
-Step 2 (determination): AFTER the trigger, a FRESH `executor.best_price` call is
-made for each side. These reads are independent of the interval-cached `_book` dict
-in ArcRuntime — using that cache would compare the same cached numbers twice, and
-"two-step" would be two lookups of one read. The side with the higher fresh bid
-wins. Equal bids → INDETERMINATE → NO_TRADE.
+WHICH side is traded is ALWAYS the MAJORITY decision: after the entry
+condition fires, a FRESH book read is taken and the side with the higher
+fresh bid wins (STRICT — equal or missing bids are INDETERMINATE → NO_TRADE).
+The trigger that fired first does NOT force the direction: an UP trigger can
+fire and MAJORITY can still select DOWN, and the DOWN order is correct (§6).
 
-The side that crossed the trigger is NOT necessarily the side bought. A book that
-read UP 0.91/DOWN 0.85 to satisfy a 0.90 trigger could read UP 0.16/DOWN 0.85 on
-the fresh pass and yield DOWN. That is correct.
+THE COMBINED SWITCH (spec §10, final spec §5/§12)
+=================================================
+One switch controls the editable trigger + target limit price together:
+  ON  → the window first waits for the configured Polymarket trigger price to
+        be reached (latched once), then evaluates the buffer condition, then
+        submits at the configured TARGET LIMIT PRICE (band-gated, risk-gated).
+        The trigger is a WHEN gate only — the fresh read after the fire still
+        decides which side.
+  OFF → the trigger price is validated but never waited on; the window trades
+        the MAJORITY direction at the currently valid market price: the
+        majority side's live best bid, quantized to the venue tick and bounded
+        by the entry band and every risk gate.
+The switch decides the PRICE, never the direction.
 
-MULTI-WINDOW
-============
-A single tick advances EVERY configured window for a market. Each window has its
-own state object, its own side lock, its own intent and its own order. A 3s and a
-90s window run side by side; neither sees the other's book or side. The per-window
-trigger evaluation is identical to the single-window case, parameterised by the
-window's own configuration.
+THE FINAL DIRECTION GATE (spec §13)
+===================================
+Before EVERY submission, `_gate_direction` re-verifies 12 checks — market id,
+window id, engine identity, decision evidence, locked side, direction match,
+token/price mapping, price validity, quantity validity, risk verdict, data
+freshness, duplicate absence. Any failure refuses the submission and records
+which check failed. The gate never corrects a mismatched direction; it
+refuses it.
 
 QUOTA ISOLATION
 ===============
-MAJORITY keeps its own submitted/filled accounting and never touches
-`market.reservations` (the shared set TWAP uses). Sharing it would let a MAJORITY
-reservation consume TWAP's quota slot for the same offset, and vice versa. The
-MAJORITY quota is simpler than TWAP's: at most one trade per market/window ever,
-so `_submitted` is a set of (slug, window) pairs that have already reached the
-submission path.
+MAJORITY keeps its own submitted accounting and never touches
+`market.reservations` (the shared set TWAP used). At most one trade per
+market/window ever, enforced in memory by `_submitted` and durably by the
+intent table's UNIQUE constraint.
 
 PERSISTENT SIDE LOCK
 ====================
 A side lock decided by `select_side` lives only in memory. A restart loses it.
-Reconstruction reads the persisted ExecutionIntent for each (market, window) and
-materialises the locked-side state via `reconstruct_locked_side`, so a restarted
-process resumes a locked-side market without re-reading the book and without
-risking a second determination that disagrees with the persisted one.
+Reconstruction reads the persisted ExecutionIntent for each (market, window)
+and materialises the locked-side state via `reconstruct_locked_side`, so a
+restarted process resumes a locked-side market without re-reading the book.
 
 GATE 5 (price_to_beat)
 ======================
-RiskContext requires a positive PTB. MAJORITY has no conceptual PTB dependency —
-it never compares against it — but the gate runs for every engine. `market.ptb` is
-passed through unchanged: it is either already frozen (normal case) or None
-(pre-freeze edge), in which case G05 denies and the window waits for the next tick.
+RiskContext requires a positive PTB. MAJORITY never compares against it, but
+the gate runs for every engine. `market.ptb` is passed through unchanged: it
+is either already frozen (normal case) or None (pre-freeze edge), in which
+case G05 denies and the window waits for the next tick.
 """
 
 from __future__ import annotations
@@ -60,14 +80,20 @@ import logging
 from decimal import Decimal
 from typing import Final
 
-from arc.decision.engine import RuntimeHealth
 from arc.domain.enums import Direction
+from arc.domain.health import RuntimeHealth
 from arc.domain.models import ExecutionIntent, MarketInstance
+from arc.domain.money import quantize_price
 from arc.errors import MarketPhaseError
 from arc.execution.protocol import Executor
 from arc.execution.submit import Submitter
 from arc.logging_setup import log_event
-from arc.majority.config import MAJORITY_ENGINE, MajorityConfig, MajorityWindowConfig
+from arc.majority.config import (
+    MAJORITY_ENGINE,
+    EntryMode,
+    MajorityConfig,
+    MajorityWindowConfig,
+)
 from arc.majority.identity import majority_intent_id_for, majority_trace_id_for
 from arc.majority.state import (
     MajorityMarketState,
@@ -142,6 +168,7 @@ class MajorityEngine:
         "_store",
         "_submitted",
         "_submitter",
+        "_tick_size",
     )
 
     def __init__(
@@ -151,6 +178,7 @@ class MajorityEngine:
         executor: Executor,
         submitter: Submitter,
         *,
+        tick_size: Decimal,
         logger: logging.Logger | None = None,
     ) -> None:
         self._config = config
@@ -163,6 +191,9 @@ class MajorityEngine:
         # minimum — it is the caller's responsibility, because the minimum must be
         # built from a single value, not from a per-window tuple.
         self._submitter = submitter
+        # The venue's price increment (spec §11). Used only to validate the
+        # submission price in the final direction gate — never to reprice.
+        self._tick_size = tick_size
         self._risk = RiskEngine()
         self._logger = logger
         self._states: dict[tuple[str, int], MajorityMarketState] = {}
@@ -193,13 +224,15 @@ class MajorityEngine:
                 )
             return
         for window in self._config.tradable_windows:
-            self._states[_window_key(slug, window.execution_window_seconds)] = (
-                MajorityMarketState(
-                    market_slug=slug,
-                    close_ts=close_ts,
-                    execution_window_seconds=window.execution_window_seconds,
-                )
+            state = MajorityMarketState(
+                market_slug=slug,
+                close_ts=close_ts,
+                execution_window_seconds=window.execution_window_seconds,
             )
+            state.entry_mode = EntryMode.for_window(
+                window, buffer_enabled=self._config.buffer_enabled
+            ).value
+            self._states[_window_key(slug, window.execution_window_seconds)] = state
         log_event(
             logging.DEBUG,
             "MAJORITY Market Opened",
@@ -212,8 +245,22 @@ class MajorityEngine:
         """Discard state for every window of a market. A11: thrown away, never reset.
 
         Drops ALL keys with this slug regardless of window, so a market with three
-        configured windows leaves nothing behind when it closes.
+        configured windows leaves nothing behind when it closes. Windows that close
+        still sitting before an intent are reported once: they are an entry
+        opportunity that expired, which is an engine outcome, not an error.
         """
+        expired = sorted(
+            s.execution_window_seconds
+            for (k0, _), s in self._states.items()
+            if k0 == slug and not s.terminal and s.state in _EXPIRABLE_STATES
+        )
+        if expired:
+            log_event(
+                logging.INFO,
+                "MAJORITY Windows Expired",
+                f"{slug}  no entry on {', '.join(f'{o}s' for o in expired)}",
+                logger=self._logger,
+            )
         for key in list(self._states):
             if key[0] == slug:
                 self._states.pop(key, None)
@@ -324,9 +371,8 @@ class MajorityEngine:
     ) -> None:
         """Advance ONE window for one market, one tick.
 
-        Mirrors the single-window sequence (trigger → fresh read → submit), keyed
-        by the window so two windows never share an evaluation. Returns when:
-          - the engine is OFF / fail-closed (caller already filtered, but defensive)
+        Sequence: entry condition (§6/§8/§9) → fresh read → MAJORITY decision →
+        direction lock → final gate → intent → submission. Returns when:
           - no state exists for this (slug, window)
           - the window's MAJORITY sequence is already terminal
           - the market/window has already been submitted this cycle
@@ -348,14 +394,15 @@ class MajorityEngine:
 
         state.open_window()   # idempotent: only moves WAITING_WINDOW → WINDOW_OPEN
 
-        # ── 2. trigger (step 1) ───────────────────────────────────────────────
+        # ── 2. entry condition ────────────────────────────────────────────────
         # Only evaluate when the trigger has not already fired. state.triggered is
-        # set on the first firing and this block never runs again for the market.
+        # set on the first firing and this block never runs again for the window.
         if not state.triggered:
-            await self._evaluate_trigger(market, state, window, now)
-            return  # let the runtime do one tick before the fresh read (step 2)
+            await self._evaluate_entry(market, state, window, now)
+            return  # the fresh read happens on the NEXT tick, so the book it
+            # reads is a distinct, later read than anything the trigger saw
 
-        # ── 3. fresh read and determination (step 2) ─────────────────────────
+        # ── 3. fresh read and MAJORITY determination ──────────────────────────
         # Only once: if we already have a verdict (MAJORITY_DETERMINED or later),
         # fall through to submission.
         if state.state is MajorityState.TRIGGERED:
@@ -367,54 +414,161 @@ class MajorityEngine:
 
     # ── internal steps ────────────────────────────────────────────────────────
 
-    async def _evaluate_trigger(
+    async def _evaluate_entry(
         self,
         market: MarketInstance,
         state: MajorityMarketState,
         window: MajorityWindowConfig,
         now: float,
     ) -> None:
-        """Step 1: poll the book cache and test the trigger.
+        """Evaluate the window's entry condition (spec §6/§8/§9, final spec
+        §5-§13). Async: the trigger gate reads the book directly.
 
-        Uses executor.best_price for both sides. These are the same calls the fresh
-        read uses, so V1's PaperExecutor.best_price and V2's LiveExecutor.best_price
-        are the only data sources — no mid-price, no asks, no cached interval data.
+        The entry condition decides WHEN the opportunity fires — never WHICH side
+        is traded. That is the fresh book read's job in the next step. The order
+        of the conditions is fixed by final spec §12 — no order may be placed
+        before ALL configured conditions are satisfied — so the two gates run in
+        this order, and each returns without the next when its condition is not
+        met:
 
-        Returns without marking anything if either side read fails (None result is
-        treated as a missing bid, which is handled by is_triggered → False).
+          1. trigger gate (trigger/target switch ON): the configured Polymarket
+             trigger price must be reached first. Latched once reached; the book
+             moving back through it cannot un-fire it.
+          2. buffer gate (BUFFER switch ON): the window's buffer condition —
+             BTC ± buffer for windows > 30s, |signal TWAP - PTB| ≥ buffer for
+             windows ≤ 30s — all memory-only entry conditions, never orders and
+             never Polymarket limit prices.
+
+        No order is submitted from here; no Polymarket price is derived from a
+        BTC level.
         """
-        up = await self._executor.best_price(market.slug, Direction.UP)
-        down = await self._executor.best_price(market.slug, Direction.DOWN)
-
-        snapshot = BookSnapshot(
-            best_bid_up=up,
-            best_bid_down=down,
-            # The caller's clock reading, never one taken here (A10/D1). Mixing a
-            # monotonic reading into a field the freshness comparison uses would
-            # subtract two different epochs and produce a meaningless age.
-            read_at=now,
-            fresh=True,  # just read; staleness is the caller's verdict
-        )
-
-        if is_triggered(snapshot, window.trigger_price):
-            # Re-checked AFTER the two awaits above, which are the only points at
-            # which a second tick could have reached this market and fired the
-            # trigger already. Asked as a question rather than caught as an error:
-            # mark_triggered raises on a second firing because a second firing means
-            # a caller believes it may re-determine the side, and swallowing that
-            # exception here would hide exactly the bug it exists to report.
-            if state.triggered:
-                return
-            state.mark_triggered(snapshot, now)
-            log_event(
-                logging.INFO,
-                "MAJORITY Triggered",
-                f"{market.slug}  {window.execution_window_seconds}s  {snapshot.describe()}  "
-                f"threshold {window.trigger_price}",
-                logger=self._logger,
+        # ── 1. trigger gate (final spec §10-§12) ──────────────────────────────
+        # The trigger price is compared against the market's best bid — the same
+        # value MAJORITY's determination reads. `is_triggered` is inclusive and
+        # requires a fresh, complete read; an unusable or unreached read leaves
+        # the window waiting.
+        if self._config.trigger_limit_enabled and not state.price_trigger_reached:
+            best_bid_up = await self._executor.best_price(market.slug, Direction.UP)
+            best_bid_down = await self._executor.best_price(market.slug, Direction.DOWN)
+            snapshot = BookSnapshot(
+                best_bid_up=best_bid_up,
+                best_bid_down=best_bid_down,
+                read_at=now,
+                fresh=True,
             )
+            if is_triggered(snapshot, window.trigger_price):
+                state.price_trigger_reached = True
+                log_event(
+                    logging.INFO,
+                    "MAJORITY Price Trigger Reached",
+                    f"{market.slug}  {window.execution_window_seconds}s  "
+                    f"trigger={window.trigger_price}  book={snapshot.describe()}",
+                    logger=self._logger,
+                )
+            else:
+                state.await_trigger()
+                return
+
+        # ── 2. buffer gate (final spec §5-§9) ─────────────────────────────────
+        # BUFFER OFF → DIRECT, whatever the stored buffer value says: the value
+        # is not an entry condition while the switch is OFF.
+        mode = EntryMode.for_window(window, buffer_enabled=self._config.buffer_enabled)
+
+        if mode is EntryMode.DIRECT:
+            # §8 / final spec §9: no buffer condition. Never wait for BTC + 0 /
+            # BTC - 0 — the MAJORITY direction is taken at the best valid
+            # limit-order price available.
+            self._fire(state, window, now, fired_level=None, fired_spot=None)
+            return
+
+        if mode is EntryMode.BTC_TRIGGER:
+            # §6: capture the BTC reference ONCE at window open, then monitor
+            # ref ± buffer. No reference yet (no observation since open) → wait.
+            if state.btc_reference is None:
+                spot = market.last_btc
+                if spot is None:
+                    state.await_trigger()
+                    return
+                state.btc_reference = spot
+                state.btc_up_trigger = spot + window.buffer
+                state.btc_down_trigger = spot - window.buffer
+                log_event(
+                    logging.DEBUG,
+                    "MAJORITY Trigger Levels Set",
+                    f"{market.slug}  {window.execution_window_seconds}s  "
+                    f"ref={spot}  up={state.btc_up_trigger}  "
+                    f"down={state.btc_down_trigger}",
+                    logger=self._logger,
+                )
+            spot = market.last_btc
+            if spot is None:
+                state.await_trigger()
+                return
+            # Inclusive, and UP first: the levels are symmetric around a single
+            # spot, so both cannot be satisfied by one observation unless the
+            # buffer is zero — which is the DIRECT mode, handled above.
+            if state.btc_up_trigger is not None and spot >= state.btc_up_trigger:
+                self._fire(state, window, now, fired_level=state.btc_up_trigger, fired_spot=spot)
+            elif state.btc_down_trigger is not None and spot <= state.btc_down_trigger:
+                self._fire(state, window, now, fired_level=state.btc_down_trigger, fired_spot=spot)
+            else:
+                state.await_trigger()
+            return
+
+        # §9 TWAP_SUPPORT: window ≤ 30s. The running TWAP reference supports the
+        # entry; |signal TWAP - PTB| ≥ buffer is the direction-agnostic timing
+        # gate. PTB frozen but no observations yet → signal_twap is None → wait.
+        ptb = market.ptb
+        twap = market.signal_twap
+        if ptb is None or twap is None:
+            state.await_trigger()
+            return
+        if abs(twap - ptb) >= window.buffer:
+            self._fire(state, window, now, fired_level=None, fired_spot=None)
         else:
             state.await_trigger()
+
+    def _fire(
+        self,
+        state: MajorityMarketState,
+        window: MajorityWindowConfig,
+        now: float,
+        *,
+        fired_level: Decimal | None,
+        fired_spot: Decimal | None,
+    ) -> None:
+        """Record that the entry condition is satisfied. Fires exactly once.
+
+        The trigger snapshot for non-BTC modes carries no book data at all — the
+        entry condition was a BTC-spot or TWAP comparison, and inventing book
+        bids for it would make the trigger evidence lie about what fired it.
+        """
+        if state.triggered:
+            return
+        state.fired_level = fired_level
+        state.fired_spot = fired_spot
+        snapshot = BookSnapshot(
+            best_bid_up=None,
+            best_bid_down=None,
+            # The caller's clock reading, never one taken here (A10/D1). The
+            # freshness comparison in step 2 subtracts two readings of this same
+            # clock; mixing epochs would make every fresh read look stale.
+            read_at=now,
+            fresh=True,
+        )
+        state.mark_triggered(snapshot, now)
+        evidence = (
+            f"level={fired_level} spot={fired_spot}"
+            if fired_level is not None
+            else "direct entry"
+        )
+        log_event(
+            logging.INFO,
+            "MAJORITY Triggered",
+            f"{state.market_slug}  {window.execution_window_seconds}s  "
+            f"mode={state.entry_mode}  {evidence}",
+            logger=self._logger,
+        )
 
     async def _fresh_read_and_determine(
         self,
@@ -423,15 +577,17 @@ class MajorityEngine:
         window: MajorityWindowConfig,
         now: float,
     ) -> None:
-        """Step 2: read the book FRESH and determine which side to buy.
+        """Read the book FRESH and let MAJORITY determine which side to buy.
 
-        This is a SEPARATE, INDEPENDENT read from the trigger read. The trigger
-        snapshot and this snapshot are different objects: the trigger explains why
-        the sequence started; this one explains which side is bought. Keeping both
-        makes the two-step rule auditable rather than merely intended.
+        This is a SEPARATE, INDEPENDENT read from whatever satisfied the entry
+        condition — for a BTC trigger it is the first book read of the sequence
+        at all. The trigger snapshot and this snapshot are different evidence:
+        the trigger explains why the sequence started, this one explains which
+        side is bought. Keeping both makes the two-step rule auditable.
 
-        A read older than _FRESH_MAX_AGE_SECONDS is marked stale, which causes
-        determine_majority to return INDETERMINATE and the market to resolve NO_TRADE.
+        A determination older than _FRESH_MAX_AGE_SECONDS from the trigger is
+        marked stale, which causes determine_majority to return INDETERMINATE
+        and the window to resolve NO_TRADE.
         """
         state.mark_reading()
 
@@ -493,27 +649,22 @@ class MajorityEngine:
         health: RuntimeHealth,
         now: float,
     ) -> None:
-        """Build intent, run risk gates, persist and submit.
+        """Build intent, run risk gates, pass the direction gate, persist, submit.
 
-        Mirrors the ordering in DecisionEngine.decide, and the ordering is the whole
-        point:
-          1. build intent (pure)
-          2. evaluate risk gates
-          3. save_intent (False means the UNIQUE constraint refused a second row)
-          4. submit via Submitter
+        Ordering is the whole point:
+          1. price the order (switch-dependent, §10)
+          2. build intent (pure)
+          3. evaluate risk gates
+          4. final 12-check direction gate (§13) — any failure refuses submission
+          5. save_intent (False means the UNIQUE constraint refused a second row)
+          6. submit via Submitter
 
         Gates BEFORE the insert, never after. Gate 7 (duplicate_intent) reads
         `store.has_intent`, so persisting first would hand the gate the very row this
         call just wrote: every MAJORITY submission would deny itself as its own
         duplicate and no order would ever be placed. A4's write-before-act rule
-        constrains the order of the insert and the VENUE CALL, which step 4 still
+        constrains the order of the insert and the VENUE CALL, which step 6 still
         honours; it says nothing about the gates, which are pure reads.
-
-        QUOTA: MAJORITY allows at most one trade per market/window. The
-        `_submitted` set enforces this without touching market.reservations. The
-        insert at step 3 is the durable half of the same guarantee — it is what
-        makes a restart refuse a second order for a market this process already
-        traded.
         """
         key = _window_key(market.slug, window.execution_window_seconds)
         if key in self._submitted:
@@ -525,24 +676,47 @@ class MajorityEngine:
             state.mark_no_trade("selected_side is None at submission time")
             return
 
+        # ── price the order (§10) ─────────────────────────────────────────────
+        # Switch ON  → the configured target limit price.
+        # Switch OFF → the currently valid market price for the MAJORITY side:
+        #              the fresh decision read's best bid for that side, quantized
+        #              to the venue tick. An unreadable or out-of-band price is a
+        #              refusal, never a fallback to another price.
+        if self._config.trigger_limit_enabled:
+            limit_price = window.target_limit_price
+        else:
+            live_price = self._live_entry_price(state, direction)
+            if live_price is None:
+                state.mark_no_trade(
+                    "switch OFF: no valid live price for the MAJORITY direction"
+                )
+                log_event(
+                    logging.INFO,
+                    "MAJORITY No Trade",
+                    f"{market.slug}  {window.execution_window_seconds}s  "
+                    "live entry price unreadable or outside the entry band",
+                    logger=self._logger,
+                )
+                return
+            limit_price = live_price
+
         intent = ExecutionIntent(
             market_slug=market.slug,
             offset_seconds=window.execution_window_seconds,
             direction=direction,
             # MAJORITY has no signal TWAP or locked trigger in the TWAP sense.
-            # These fields are CARRIED on ExecutionIntent for the TWAP path; MAJORITY
-            # writes zero. They must be present because ExecutionIntent is shared
-            # across engines — zero is an honest "not applicable" for a field that
-            # TWAP computes and MAJORITY does not.
+            # signal_twap/opening_twap are CARRIED as honest zeros (not
+            # applicable); locked_trigger carries the BTC level that opened the
+            # opportunity when one exists, and zero when the entry was direct.
             signal_twap=_ZERO,
-            locked_trigger=_ZERO,
+            locked_trigger=state.fired_level if state.fired_level is not None else _ZERO,
             created_at=now,
             intent_id=majority_intent_id_for(market.slug, window.execution_window_seconds),
             trace_id=majority_trace_id_for(market.slug, window.execution_window_seconds),
             opening_twap=_ZERO,
             ptb=market.ptb if market.ptb is not None else _ZERO,
             buffer=window.buffer,
-            limit_price=window.target_limit_price,
+            limit_price=limit_price,
             size=window.shares,
             strategy_id=MAJORITY_ENGINE,
             close_ts=market.close_ts,
@@ -567,6 +741,21 @@ class MajorityEngine:
             )
             return
 
+        # ── the final direction gate (spec §13) ───────────────────────────────
+        # The last boundary before the venue. Re-verifies the whole proposal —
+        # identity, direction, price, quantity, risk, freshness, duplicates —
+        # and refuses on ANY failure. It never corrects a mismatch; it refuses.
+        gate_failure = self._gate_direction(market, state, window, intent, verdict, key)
+        if gate_failure is not None:
+            log_event(
+                logging.WARNING,
+                "MAJORITY Direction Gate Failed",
+                f"{market.slug}  {window.execution_window_seconds}s  {gate_failure}",
+                logger=self._logger,
+            )
+            state.mark_no_trade(f"direction gate: {gate_failure}")
+            return
+
         # Persist before the venue call (write-before-act, A4). save_intent returns
         # False when the UNIQUE constraint fires — another pass, or the process
         # before this one, already recorded this window. SQLite arbitrates, and the
@@ -585,6 +774,13 @@ class MajorityEngine:
             return
 
         state.mark_intent_created()
+        log_event(
+            logging.INFO,
+            "MAJORITY Intent Created",
+            f"{market.slug}  {window.execution_window_seconds}s  "
+            f"intent={intent.intent_id}",
+            logger=self._logger,
+        )
 
         # Mark submitted before the venue call: if the process dies between here
         # and the call completing, the persisted intent above is what makes the
@@ -615,13 +811,118 @@ class MajorityEngine:
                 logging.INFO,
                 "MAJORITY Submitted",
                 f"{market.slug}  {window.execution_window_seconds}s  "
-                f"{direction.value}  {window.target_limit_price}  {len(placed)} order(s)",
+                f"{direction.value}  {limit_price}  {len(placed)} order(s)",
                 logger=self._logger,
             )
         else:
             # Submitter split produced zero orders (size below minimum). Already
             # logged by the Submitter; record NO_TRADE here so the state is terminal.
             state.mark_no_trade("size split produced no orders (below exchange minimum)")
+
+    # ── the final direction gate (spec §13) ───────────────────────────────────
+
+    def _gate_direction(
+        self,
+        market: MarketInstance,
+        state: MajorityMarketState,
+        window: MajorityWindowConfig,
+        intent: ExecutionIntent,
+        risk: RiskVerdict,
+        key: tuple[str, int],
+    ) -> str | None:
+        """The 12-check final execution boundary. Returns None when all pass,
+        otherwise the name of the first check that failed.
+
+        Runs before EVERY submission (V1 and V2 alike — parity mandates one
+        logic). It is the last gate the proposal passes; a failure here is a
+        refusal, never an auto-correction. Correcting a mismatched direction
+        would mean the engine trading a side MAJORITY never chose.
+        """
+        # 1. market identity
+        if intent.market_slug != market.slug:
+            return "market id mismatch"
+        # 2. window identity
+        if intent.offset_seconds != window.execution_window_seconds:
+            return "window id mismatch"
+        if state.execution_window_seconds != window.execution_window_seconds:
+            return "state window mismatch"
+        # 3. engine identity
+        if intent.strategy_id != MAJORITY_ENGINE:
+            return "engine identity mismatch"
+        # 4. a MAJORITY decision exists
+        if state.verdict is None or state.decision_snapshot is None:
+            return "no MAJORITY decision on record"
+        # 5. a locked direction exists
+        if not state.side_locked or state.selected_side is None:
+            return "no locked direction"
+        # 6. requested order direction == locked MAJORITY direction
+        if intent.direction != state.selected_side:
+            return "order direction != locked MAJORITY direction"
+        # 7. market/token mapping: the decision book carries a usable bid for
+        # the chosen side. UP shares are bought against the UP bid, DOWN against
+        # the DOWN bid — a missing price means the mapping cannot be verified.
+        # Completeness only, NOT freshness: `usable` folds both in, and a stale
+        # read refused here would be reported as a missing bid. Freshness is
+        # check 11's job, and it must be reachable to be verifiable.
+        snapshot = state.decision_snapshot
+        side_bid = (
+            snapshot.best_bid_up
+            if intent.direction is Direction.UP
+            else snapshot.best_bid_down
+        )
+        if not snapshot.complete or side_bid is None:
+            return "decision book has no usable bid for the chosen side"
+        # 8. price valid: positive and on the venue's exact tick grid
+        if intent.limit_price <= _ZERO:
+            return "price not positive"
+        if quantize_price(intent.limit_price, self._tick_size) != intent.limit_price:
+            return "price not on the venue tick grid"
+        # 9. quantity valid: positive, exactly the configured size, ≥ venue minimum
+        if intent.size <= _ZERO or intent.size != window.shares:
+            return "quantity invalid"
+        # 10. risk permits this exact execution
+        if risk.denied:
+            return f"risk denied: {risk.gate_id} {risk.reason}"
+        # 11. data fresh: the decision read is a fresh one, and the feed gates
+        # (which the risk layer already evaluated) all passed
+        if not snapshot.fresh:
+            return "decision read is stale"
+        # 12. no duplicate order exists — in memory or durably
+        if key in self._submitted:
+            return "duplicate submission in this run"
+        if self._store.has_intent(
+            market.slug, window.execution_window_seconds, engine=MAJORITY_ENGINE
+        ):
+            return "duplicate intent already persisted"
+        return None
+
+    def _live_entry_price(
+        self, state: MajorityMarketState, direction: Direction
+    ) -> Decimal | None:
+        """The switch-OFF submission price: the MAJORITY side's live best bid.
+
+        Taken from the fresh decision read (the only book this sequence has
+        read), quantized to the venue tick and bounded by the entry band. None
+        means no valid live price exists — the caller refuses rather than
+        substituting another price.
+        """
+        snapshot = state.decision_snapshot
+        if snapshot is None or not snapshot.fresh or not snapshot.usable:
+            return None
+        bid = (
+            snapshot.best_bid_up if direction is Direction.UP else snapshot.best_bid_down
+        )
+        if bid is None:
+            return None
+        price = quantize_price(bid, self._tick_size)
+        if price <= _ZERO:
+            return None
+        window = self._config.window_for(state.execution_window_seconds)
+        if window is None:
+            return None
+        if price < window.entry_price_min or price > window.entry_price_max:
+            return None
+        return price
 
     # ── risk context ──────────────────────────────────────────────────────────
 
@@ -711,3 +1012,19 @@ class MajorityEngine:
                 market.slug, window.execution_window_seconds
             ),
         )
+
+
+# States a window can still be in when its market closes: nothing persisted, nothing
+# refused, nothing that already reported itself. Reaching an intent means the window
+# acted; terminal states mean it already spoke. What remains is an expired entry.
+_EXPIRABLE_STATES: Final[frozenset[MajorityState]] = frozenset(
+    {
+        MajorityState.WAITING_WINDOW,
+        MajorityState.WINDOW_OPEN,
+        MajorityState.WAITING_TRIGGER,
+        MajorityState.TRIGGERED,
+        MajorityState.READING_CLOB,
+        MajorityState.MAJORITY_DETERMINED,
+        MajorityState.SIDE_SELECTED,
+    }
+)

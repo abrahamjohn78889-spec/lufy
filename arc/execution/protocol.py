@@ -71,3 +71,11 @@ class Executor(Protocol):
 
     def best_price(self, market_slug: str, direction: Direction) -> Awaitable[Decimal | None]:
         """Best resting bid on the given side, or None when the book is empty."""
+
+    def mark_price(self, market_slug: str, direction: Direction) -> Decimal | None:
+        """Synchronous best price for marking an open position.
+
+        The same value `best_price` would return, but readable without an await so
+        a synchronous payload builder (the status document) can mark live P&L. None
+        when no price exists rather than zero — a zero would read as "no risk".
+        """

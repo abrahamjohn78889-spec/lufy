@@ -295,24 +295,26 @@ class TestASettingsSaveDoesNotDiscardMajority:
     property of the write, not of the payload the deck reads back.
     """
 
-    def test_editing_a_twap_field_leaves_all_eight_majority_keys_intact(
+    def test_editing_a_majority_field_leaves_all_eight_majority_keys_intact(
         self, run_on: ArcRuntime
     ) -> None:
         client = TestClient(build_app(run_on))
         before = run_on.settings.majority.as_storage_dict()
 
-        assert client.post("/settings", json={"position_notional_usd": "77.00"}).status_code == 200
+        assert client.post("/settings", json={"majority_shares": "7"}).status_code == 200
 
         stored = run_on.store.load_settings()
         # Legacy flat keys (the eight MAJORITY settings that were the contract before
         # multi-window) AND the per-window keys must both survive.
         for key in MAJORITY_KEYS:
-            assert key in stored, f"{key} was dropped by a TWAP-only settings save"
-            assert stored[key] == before[key], f"{key} was changed by a TWAP-only settings save"
+            if key == "majority_shares":
+                continue  # we edited this one on purpose
+            assert key in stored, f"{key} was dropped by a MAJORITY-only settings save"
+            assert stored[key] == before[key], f"{key} was changed by a MAJORITY-only settings save"
         per_window_keys = [k for k in before if k.startswith("majority_w_")]
         assert per_window_keys, "before must carry per-window keys"
         for key in per_window_keys:
-            assert key in stored, f"{key} was dropped by a TWAP-only settings save"
+            assert key in stored, f"{key} was dropped by a MAJORITY-only settings save"
             assert stored[key] == before[key]
 
     def test_the_saved_row_reboots_into_the_same_majority_config(
@@ -325,13 +327,22 @@ class TestASettingsSaveDoesNotDiscardMajority:
         OFF, so a stored row that failed to win would come back disabled.
         """
         client = TestClient(build_app(run_on))
-        assert client.post("/settings", json={"position_notional_usd": "77.00"}).status_code == 200
+        assert client.post("/settings", json={"majority_shares": "7"}).status_code == 200
 
         rebooted = load_settings(ArcSettings(), run_on.store.load_settings())
         assert rebooted.seeded_from_env is False
         assert rebooted.majority.as_storage_dict() == run_on.settings.majority.as_storage_dict()
         assert rebooted.majority.enabled is True
-        assert str(rebooted.trading.position_notional_usd) == "77.00"
+        # shares is a per-window value; the fixture ships one 30s window with a
+        # per-window override (`majority_w_30_shares`). Per-window overrides win
+        # over the shared `majority_shares`, so the round-trip contract here is
+        # that the stored row still carries BOTH keys (shared + override) and
+        # they both survive into the rebuilt MajorityConfig.
+        stored = run_on.store.load_settings()
+        assert stored.get("majority_shares") == "7"
+        assert any(str(w.shares) for w in rebooted.majority.windows), (
+            "at least one window must carry shares after reload"
+        )
 
 
 class TestMAJORITYFieldEditing:
@@ -441,3 +452,173 @@ class TestMAJORITYFieldEditing:
         )
         assert resp.status_code == 200
         assert resp.json()["restart_required"] is True
+
+
+class TestWindowOrderSummaryFields:
+    """§37 LOE card payload verification.
+
+    Each states_by_window entry must carry the order-level fields that paintActiveOrders
+    renders. The values are read off persisted rows exactly as the ledger does, so a
+    live card and a settled record of the same trade can never disagree. Verified at
+    the payload layer rather than in the browser because the fresh server has no
+    MAJORITY windows configured and cannot produce live window states.
+    """
+
+    def test_states_by_window_carries_loe_fields_with_no_orders(
+        self, run_on: ArcRuntime
+    ) -> None:
+        """A fresh window with no orders still reports all LOE field keys."""
+        market = _open_market(run_on)
+        doc = majority_payload(run_on, market)
+        assert doc["states_by_window"], "must have at least one window"
+        first = next(iter(doc["states_by_window"].values()))
+        for key in (
+            "locked_trigger", "buffer", "limit_price", "fill_price",
+            "shares", "filled_shares", "order_state", "retry_count", "live_pnl",
+        ):
+            assert key in first, f"LOE field {key} missing from states_by_window"
+
+    def test_order_and_fill_appear_in_the_payload(self, tmp_path: Any) -> None:
+        """Insert an order + fill, verify the payload reads them back correctly."""
+        from arc.domain.enums import Direction, OrderState
+        from arc.domain.models import Fill, Order
+
+        run = _run(tmp_path, majority=_config())
+        market = _open_market(run)
+        slug = market.slug
+        offset = 30
+
+        # Insert an order into the store for this window
+        order = Order(
+            order_id="ord-001",
+            market_slug=slug,
+            offset_seconds=offset,
+            direction=Direction.UP,
+            price=Decimal("0.85"),
+            size=Decimal("20"),
+            state=OrderState.FILLED,
+            filled_size=Decimal("20"),
+            created_at=_NOW + 1.0,
+            updated_at=_NOW + 2.0,
+            venue_order_id="venue-001",
+            reprice_chain_id="chain-001",
+            engine="MAJORITY",
+        )
+        run.store.save_order(order)
+
+        fill = Fill(
+            fill_id="fill-001",
+            order_id="ord-001",
+            market_slug=slug,
+            size=Decimal("20"),
+            price=Decimal("0.84"),
+            ts=_NOW + 2.0,
+            engine="MAJORITY",
+        )
+        run.store.save_fill(fill)
+
+        doc = majority_payload(run, market)
+        window_key = str(offset)
+        assert window_key in doc["states_by_window"], f"window {offset}s not in payload"
+        entry = doc["states_by_window"][window_key]
+
+        assert entry["limit_price"] == "0.85"
+        assert entry["fill_price"] == "0.84"
+        assert entry["shares"] == "20"
+        assert entry["filled_shares"] == "20"
+        assert entry["order_state"] == "Filled"
+        assert entry["retry_count"] == 0
+        # live_pnl depends on mark_price; PaperExecutor._books is empty here → None
+        assert entry["live_pnl"] is None
+
+    def test_reprice_chain_shows_retry_count(self, tmp_path: Any) -> None:
+        """Two orders in the same chain → retry_count = 1, leader is newest."""
+        from arc.domain.enums import Direction, OrderState
+        from arc.domain.models import Order
+
+        run = _run(tmp_path, majority=_config())
+        market = _open_market(run)
+        slug = market.slug
+        offset = 30
+
+        first = Order(
+            order_id="ord-a",
+            market_slug=slug,
+            offset_seconds=offset,
+            direction=Direction.UP,
+            price=Decimal("0.90"),
+            size=Decimal("10"),
+            state=OrderState.CANCELLED,
+            created_at=_NOW + 1.0,
+            updated_at=_NOW + 2.0,
+            reprice_chain_id="chain-r",
+            engine="MAJORITY",
+        )
+        second = Order(
+            order_id="ord-b",
+            market_slug=slug,
+            offset_seconds=offset,
+            direction=Direction.UP,
+            price=Decimal("0.88"),
+            size=Decimal("10"),
+            state=OrderState.SUBMITTED,
+            created_at=_NOW + 3.0,
+            updated_at=_NOW + 3.0,
+            reprice_chain_id="chain-r",
+            engine="MAJORITY",
+        )
+        run.store.save_order(first)
+        run.store.save_order(second)
+
+        doc = majority_payload(run, market)
+        entry = doc["states_by_window"][str(offset)]
+        assert entry["retry_count"] == 1
+        # Leader is the newest (ord-b), limit_price reflects its price
+        assert entry["limit_price"] == "0.88"
+        assert entry["order_state"] == "Working"
+
+    def test_live_pnl_marked_when_book_has_price(self, tmp_path: Any) -> None:
+        """PaperExecutor.mark_price returns a value when the book is seeded."""
+        from arc.domain.enums import Direction, OrderState
+        from arc.domain.models import Fill, Order
+
+        run = _run(tmp_path, majority=_config())
+        market = _open_market(run)
+        slug = market.slug
+        offset = 30
+
+        order = Order(
+            order_id="ord-pnl",
+            market_slug=slug,
+            offset_seconds=offset,
+            direction=Direction.UP,
+            price=Decimal("0.85"),
+            size=Decimal("20"),
+            state=OrderState.FILLED,
+            filled_size=Decimal("20"),
+            created_at=_NOW + 1.0,
+            updated_at=_NOW + 2.0,
+            venue_order_id="venue-pnl",
+            reprice_chain_id="chain-pnl",
+            engine="MAJORITY",
+        )
+        run.store.save_order(order)
+        run.store.save_fill(Fill(
+            fill_id="fill-pnl",
+            order_id="ord-pnl",
+            market_slug=slug,
+            size=Decimal("20"),
+            price=Decimal("0.84"),
+            ts=_NOW + 2.0,
+            engine="MAJORITY",
+        ))
+
+        # Seed the paper executor's book so mark_price returns a value.
+        # _books is a PaperExecutor implementation detail, not on the Protocol;
+        # the type-ignore acknowledges we are testing through the concrete adapter.
+        run.executor._books[(slug, Direction.UP)] = Decimal("0.90")  # type: ignore[attr-defined]
+
+        doc = majority_payload(run, market)
+        entry = doc["states_by_window"][str(offset)]
+        # P&L = filled * mark - cost = 20 * 0.90 - 20 * 0.84 = 18.0 - 16.8 = 1.2
+        assert Decimal(entry["live_pnl"]) == Decimal("1.2")

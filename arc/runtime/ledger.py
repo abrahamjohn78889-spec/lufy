@@ -31,7 +31,7 @@ from arc.domain.enums import (
     Outcome,
     WindowState,
 )
-from arc.domain.models import Fill, Order
+from arc.domain.models import ExecutionIntent, Fill, Order
 from arc.domain.money import dec_str
 from arc.storage.store import Store
 from arc.timefmt import stamps
@@ -39,6 +39,8 @@ from arc.timefmt import stamps
 __all__ = [
     "BUFFER_NOT_SATISFIED",
     "LedgerRecord",
+    "_chain_orders",
+    "_leader",
     "ledger_records",
     "ledger_totals",
     "search_records",
@@ -207,8 +209,7 @@ def _record(
     window: Any,
     orders: tuple[Order, ...],
     fills: tuple[Fill, ...],
-    intent_id: str,
-    trace_id: str,
+    intent: ExecutionIntent | None,
     settlement_time: float | None,
     outcome: Outcome | None,
     pnl: Decimal | None,
@@ -243,13 +244,15 @@ def _record(
         ptb=_dec(window["ptb"]) or _dec(market["ptb"]),
         signal_twap=_dec(window["opening_twap"]),
         settlement_twap=_dec(market["settlement_twap"]),
-        direction=str(window["direction"] or WindowState.NO_DIRECTION.value)
-        if window_state is not WindowState.PENDING
-        else "",
+        direction=(
+            str(window["direction"] or WindowState.NO_DIRECTION.value)
+            if window_state is not WindowState.PENDING
+            else (intent.direction.value if intent is not None else "")
+        ),
         locked_trigger=_dec(window["locked_trigger"]),
         buffer=_dec(window["buffer"]),
-        intent_id=intent_id,
-        trace_id=trace_id,
+        intent_id=intent.intent_id if intent is not None else "",
+        trace_id=intent.trace_id if intent is not None else "",
         local_order_id=leader.order_id if leader is not None else "",
         venue_order_id=leader.venue_order_id if leader is not None else "",
         submission_time=leader.created_at if leader is not None else None,
@@ -282,9 +285,12 @@ def ledger_records(store: Store, *, market_limit: int = 50) -> tuple[LedgerRecor
         slug = str(market["slug"])
         orders = store.orders_for(slug)
         fills = store.fills_for(slug)
-        intents = {i.offset_seconds: i.intent_id for i in store.intents_for(slug)}
-        traces = {i.offset_seconds: i.trace_id for i in store.intents_for(slug)}
-        settlement = store.settlement_for(slug)
+        intents = {i.offset_seconds: i for i in store.intents_for(slug)}
+        # Engine-agnostic read: settlement_for defaults to the legacy engine name,
+        # and MAJORITY rows would never be found through it. settlements_for is
+        # ordered by engine, so the first row is a deterministic choice.
+        settlements = store.settlements_for(slug)
+        settlement = settlements[0] if settlements else None
         for window in store.windows_for(slug):
             records.append(
                 _record(
@@ -292,14 +298,31 @@ def ledger_records(store: Store, *, market_limit: int = 50) -> tuple[LedgerRecor
                     window,
                     orders,
                     fills,
-                    intents.get(int(window["offset_seconds"]), ""),
-                    traces.get(int(window["offset_seconds"]), ""),
+                    intents.get(int(window["offset_seconds"])),
                     settlement.settled_at if settlement is not None else None,
                     settlement.outcome if settlement is not None else None,
                     settlement.pnl if settlement is not None else None,
                 )
             )
     return tuple(records)
+
+
+def _matches_status(record: LedgerRecord, status: str) -> bool:
+    """Map the operator-facing status categories to internal record fields."""
+    if status == "open":
+        return record.settlement_result == "UNRESOLVED" and record.state not in (
+            WindowState.EXPIRED.value,
+            WindowState.NO_DIRECTION.value,
+        )
+    if status == "win":
+        return "WIN" in record.settlement_result
+    if status == "loss":
+        return "LOSS" in record.settlement_result
+    if status == "skipped":
+        return record.buffer_status in (BUFFER_NOT_SATISFIED, "NO_DIRECTION")
+    if status == "cancelled":
+        return record.state == OrderState.CANCELLED.value
+    return True
 
 
 def search_records(
@@ -309,6 +332,7 @@ def search_records(
     direction: str = "",
     state: str = "",
     result: str = "",
+    status: str = "",
     since: float | None = None,
     until: float | None = None,
 ) -> tuple[LedgerRecord, ...]:
@@ -329,6 +353,8 @@ def search_records(
             continue
         if result and result.lower() not in record.settlement_result.lower():
             continue
+        if status and not _matches_status(record, status):
+            continue
         if since is not None and record.window_ts < since:
             continue
         if until is not None and record.window_ts > until:
@@ -344,11 +370,29 @@ def ledger_totals(records: tuple[LedgerRecord, ...]) -> dict[str, Any]:
     unsatisfied = sum(1 for r in records if r.buffer_status == BUFFER_NOT_SATISFIED)
     wins = sum(1 for r in records if r.pnl is not None and r.pnl > _ZERO)
     losses = sum(1 for r in records if r.pnl is not None and r.pnl < _ZERO)
+    total_trades = wins + losses
     fill_latencies = [
         r.fill_time - r.submission_time
         for r in records
         if r.fill_time is not None and r.submission_time is not None
     ]
+    # §47 side performance and average trade P&L. Computed here so the frontend
+    # never does arithmetic on money values (UI blindness contract).
+    realized_pnl = sum((r.pnl for r in records if r.pnl is not None), Decimal("0"))
+    avg_trade_pnl = (
+        dec_str(realized_pnl / Decimal(total_trades)) if total_trades else None
+    )
+    def _side_count(d: str, win: bool) -> int:
+        return sum(
+            1 for r in records
+            if r.direction == d and r.pnl is not None
+            and ((r.pnl > _ZERO) if win else (r.pnl < _ZERO))
+        )
+
+    up_wins = _side_count("UP", True)
+    up_losses = _side_count("UP", False)
+    down_wins = _side_count("DOWN", True)
+    down_losses = _side_count("DOWN", False)
     return {
         "markets_processed": len({r.market for r in records}),
         "filled_orders": filled,
@@ -356,6 +400,13 @@ def ledger_totals(records: tuple[LedgerRecord, ...]) -> dict[str, Any]:
         "buffer_not_satisfied": unsatisfied,
         "win_count": wins,
         "loss_count": losses,
+        "total_trades": total_trades,
+        "realized_pnl": dec_str(realized_pnl),
+        "average_trade_pnl": avg_trade_pnl,
+        "up_wins": up_wins,
+        "up_losses": up_losses,
+        "down_wins": down_wins,
+        "down_losses": down_losses,
         "average_fill_seconds": (
             round(sum(fill_latencies) / len(fill_latencies), 3) if fill_latencies else None
         ),

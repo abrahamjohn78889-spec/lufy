@@ -16,14 +16,15 @@ the operator reaches it through one loopback HTTP port.
                     └────────────────────┼─────────────────────┘
                                          ▼
        ┌───────────────────────── ArcRuntime ────────────────────────────┐
-       │ Market Discovery → Rotator → Window Engine → Decision Engine    │
-       │        │              │            │              │             │
-       │   PTB (frozen)   Signal TWAP  Settlement TWAP   Risk Engine     │
-       │                       ▲                             │           │
-       │                  Provider feed                      ▼           │
-       │              (RTDS or Chainlink, never both)  Limit Order Engine│
-       │                                                     │           │
-       │  Recovery · Recorder · Statistics · Watchdog         ▼          │
+       │ Market Discovery → Rotator → MAJORITY Engine                   │
+       │        │              │            │                            │
+       │   PTB (frozen)   Signal TWAP  Settlement TWAP                  │
+       │                       ▲                             ▼          │
+       │                  Provider feed                    Risk Engine   │
+       │              (RTDS or Chainlink, never both)         │          │
+       │                                                     ▼          │
+       │  Recovery · Recorder · Statistics · Watchdog  Limit Order Eng. │
+       │                                                     │          │
        │                                            V1 Paper / V2 Live   │
        └──────────────────┬──────────────────────────────┬───────────────┘
                           ▼                              ▼
@@ -42,8 +43,7 @@ the operator reaches it through one loopback HTTP port.
 | `arc/clock.py` | the only source of time; drift measurement |
 | `arc/domain/` | enums and value objects. No I/O, no behaviour that reads the world |
 | `arc/market/` | discovery, the provider feed, PTB, rotation, the watchdog |
-| `arc/windows/` | window lifecycle: open → freeze → fire → expire |
-| `arc/decision/` | the TWAP-vs-PTB comparison. Pure, given a window |
+| `arc/majority/` | MAJORITY engine: trigger, direction determination, entry conditions |
 | `arc/risk/` | the gates. Nothing is submitted that this did not pass |
 | `arc/execution/` | the Limit Order Engine, fills, reconciliation, wallet |
 | `arc/runtime/` | the loop, the supervisor, RuntimeState, the EventHub, the ledger |
@@ -52,7 +52,7 @@ the operator reaches it through one loopback HTTP port.
 | `arc/notify/` | Telegram. Outbound only |
 | `arc/web/` | the dashboard: three static files, no build step |
 
-Dependencies point one way: `domain` ← `market`/`windows`/`decision`/`risk`/
+Dependencies point one way: `domain` ← `market`/`majority`/`risk`/
 `execution` ← `runtime` ← `api`. Nothing in the strategy path knows which
 provider is feeding it — enforced as a test, not a convention.
 

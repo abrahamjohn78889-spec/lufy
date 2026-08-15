@@ -150,6 +150,8 @@ POST_ONLY_WOULD_CROSS_REASON: Final[str] = "POST_ONLY_WOULD_CROSS"
 # Rejected; what is new is why, and why belongs in the reason column.
 REJECTION_REASON_DISPLAY: Final[dict[str, str]] = {
     POST_ONLY_WOULD_CROSS_REASON: "Would cross - not repriced",
+    "BUFFER_NOT_SATISFIED": "Buffer requirement was not met before window expired",
+    "NO_DIRECTION": "No clear direction could be determined",
 }
 
 DISPLAYED_ORDER_STATES: Final[tuple[str, ...]] = (

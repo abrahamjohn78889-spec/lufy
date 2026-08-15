@@ -367,13 +367,7 @@ class RiskEngine:
         freeze still absent, and trading it would mean trading against a reference
         this process invented.
         """
-        if c.ptb is None or c.ptb <= _ZERO:
-            return RiskVerdict(
-                allowed=False,
-                gate="price_to_beat",
-                reason=DenialReason.PTB_UNAVAILABLE,
-                detail="no official Price To Beat is frozen on this market",
-            )
+        # PTB is display-only — never gates trading (user directive).
         return _ALLOWED
 
     # ── 6 ────────────────────────────────────────────────────────────────────

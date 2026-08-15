@@ -884,6 +884,20 @@ class Store:
             for r in rows
         )
 
+    def skipped_windows_since(self, epoch: float) -> int:
+        """Windows that ended without a trade, in markets opened at/after `epoch`.
+
+        The paper account's skipped counter, counted in one query rather than
+        walked in Python: the range can span the whole database.
+        """
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM windows AS w "
+            "JOIN markets AS m ON m.slug = w.market_slug "
+            "WHERE m.window_ts >= ? AND w.state IN (?, ?)",
+            (epoch, WindowState.EXPIRED.value, WindowState.NO_DIRECTION.value),
+        ).fetchone()
+        return int(row["n"])
+
     # ── candles ──────────────────────────────────────────────────────────────
 
     def save_candles(self, rows: Sequence[tuple[int, str, str, str, str, str, str]]) -> int:

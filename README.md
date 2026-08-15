@@ -147,19 +147,14 @@ trade and the system is refusing."
 - **PTB** — the official Price To Beat, fetched from market metadata, frozen once
   per market. Never calculated, estimated, interpolated or refreshed.
 
-## Two engines
+## MAJORITY Engine
 
-TWAP is the engine described above and the only one that trades unless MAJORITY is
-switched on deliberately. **MAJORITY** is a second engine in the same process. It
-shares infrastructure — discovery, the market grid, the book refresh, the Executor
-protocol, the Risk Engine, the wallet, the database, reconciliation, fills,
-repricing, sweeping, the event hub, Telegram, the ledger and recovery — and shares
-no decision state at all: trigger state, selected side, order ownership and every
-configured number are per-engine.
-
-MAJORITY reads **Polymarket outcome-share prices only** — the best resting bid on
-each side. Not BTC/USD, not the PTB, not either TWAP, not the midpoint. It runs on
-a two-step rule:
+MAJORITY is the sole trading engine. TWAP exists only as data/display support —
+the Running TWAP panel and ≤30s buffer-entry reference for MAJORITY. TWAP does
+not select direction, submit orders, or act as a strategy. **MAJORITY** reads
+**Polymarket outcome-share prices only** — the best resting bid on each side.
+Not BTC/USD, not the PTB, not either TWAP, not the midpoint. It runs on a
+two-step rule:
 
 1. the trigger fires when `max(best_bid(UP), best_bid(DOWN)) >= trigger_price`
 2. the side to buy is determined **afterwards**, from a fresh book read
@@ -167,14 +162,14 @@ a two-step rule:
 The side that crossed the trigger is not necessarily the side that gets bought. A
 trigger is an instruction to go and look, not an answer.
 
-MAJORITY is not a strategy and does not touch `arc_twap_locked_buffer`. The
-`Strategy` protocol takes `direction` as an input, which cannot express an engine
-that picks its own side after a trigger, so MAJORITY sits beside the Decision
-Engine rather than inside it.
+MAJORITY is the sole trading engine. It does not use a `Strategy` protocol —
+direction is determined at trigger time from a fresh book read, not passed in as
+an input.
 
-Both engines write to one `orders` table, one `intents` table, one `fills` table
-and one `settlements` table, separated by an `engine` column. TWAP's identifiers
-are unprefixed and unchanged; MAJORITY's carry a `MAJORITY:` prefix, so no
+All trades write to one `orders` table, one `intents` table, one `fills` table
+and one `settlements` table, separated by an `engine` column. Legacy TWAP
+identifiers are unprefixed and unchanged; MAJORITY's carry a `MAJORITY:` prefix,
+so no
 historical id was rewritten to make room for the second engine.
 
 **MAJORITY ships OFF.** Every value is blank, `enabled` is false, and the eight

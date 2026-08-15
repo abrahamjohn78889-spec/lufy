@@ -21,7 +21,7 @@ import itertools
 from decimal import Decimal
 from typing import Final
 
-from arc.domain.enums import Direction, Mode
+from arc.domain.enums import DEFAULT_ENGINE, Direction, Mode
 from arc.domain.models import Fill, Order
 from arc.errors import ArcError
 from arc.execution.protocol import VenueOrder
@@ -34,10 +34,11 @@ _ZERO: Final[Decimal] = Decimal("0")
 class PaperExecutor:
     """In-memory venue. Same interface, same sequencing, no network."""
 
-    __slots__ = ("_books", "_fills", "_resting", "_sequence")
+    __slots__ = ("_books", "_directions", "_fills", "_resting", "_sequence")
 
     def __init__(self) -> None:
         self._resting: dict[str, VenueOrder] = {}
+        self._directions: dict[str, Direction] = {}
         self._fills: dict[str, list[Fill]] = {}
         self._books: dict[tuple[str, Direction], Decimal] = {}
         self._sequence = itertools.count(1)
@@ -63,6 +64,7 @@ class PaperExecutor:
             filled_size=order.filled_size,
             resting=True,
         )
+        self._directions[order.order_id] = order.direction
         return venue_id
 
     async def cancel(self, order: Order) -> None:
@@ -70,6 +72,7 @@ class PaperExecutor:
         if existing is None:
             raise ArcError(f"no resting order {order.order_id}")
         self._resting.pop(order.order_id)
+        self._directions.pop(order.order_id, None)
 
     async def open_orders(self, market_slug: str) -> tuple[VenueOrder, ...]:
         prefix = f"{market_slug}:"
@@ -81,6 +84,15 @@ class PaperExecutor:
         return tuple(self._fills.get(market_slug, ()))
 
     async def best_price(self, market_slug: str, direction: Direction) -> Decimal | None:
+        return self._books.get((market_slug, direction))
+
+    def mark_price(self, market_slug: str, direction: Direction) -> Decimal | None:
+        """The current best price on one side, read synchronously.
+
+        The paper book is a process-local dict that the runtime writes once per
+        pass, so a synchronous read here sees exactly what the async `best_price`
+        would — without forcing the caller into an await just to mark a position.
+        """
         return self._books.get((market_slug, direction))
 
     # ── simulation controls ──────────────────────────────────────────────────
@@ -100,8 +112,18 @@ class PaperExecutor:
         for direction in Direction:
             self._books.pop((market_slug, direction), None)
 
-    def trade(self, market_slug: str, price: Decimal, size: Decimal) -> tuple[Fill, ...]:
-        """A counterparty trades `size` at `price`. Fills whoever it crosses.
+    def trade(
+        self,
+        market_slug: str,
+        price: Decimal,
+        size: Decimal,
+        direction: Direction | None = None,
+    ) -> tuple[Fill, ...]:
+        """A counterparty trades `size` at `price` on `direction` (if given).
+
+        Fills whoever it crosses. When `direction` is provided only resting
+        orders on that side are eligible — a binary market's UP and DOWN tokens
+        trade on separate books, so a trade on one must not fill the other.
 
         Matched in client-order-id order, which is deterministic because the ids
         themselves are derived rather than generated. Price-time priority would be
@@ -114,7 +136,17 @@ class PaperExecutor:
             if remaining <= _ZERO:
                 break
             resting = self._resting[client_id]
-            if not client_id.startswith(f"{market_slug}:"):
+            # Direction filter: skip orders on the other side of the binary.
+            if direction is not None and self._directions.get(client_id) != direction:
+                continue
+            # The default engine's ids begin with the slug; any other engine's
+            # ids carry the engine first (MAJORITY:slug:...). Both spellings must
+            # match, or an engine-prefixed order could never fill in paper mode.
+            if client_id.startswith(f"{market_slug}:"):
+                engine = DEFAULT_ENGINE
+            elif f":{market_slug}:" in client_id:
+                engine = client_id.split(":", 1)[0]
+            else:
                 continue
             # A passive buy fills when someone sells at or below its limit.
             if price > resting.price:
@@ -132,11 +164,18 @@ class PaperExecutor:
                 size=traded,
                 price=resting.price,
                 ts=0.0,
+                # Derived from the order id, same rule as the match above: the
+                # default engine's ids begin with the slug, every other engine's
+                # carry the engine first (final spec §32). A paper fill without
+                # this would be recorded under the model's TWAP default, no
+                # matter which engine actually placed the order.
+                engine=engine,
             )
             produced.append(fill)
             self._fills.setdefault(market_slug, []).append(fill)
             if filled >= resting.size:
                 self._resting.pop(client_id)
+                self._directions.pop(client_id, None)
             else:
                 self._resting[client_id] = VenueOrder(
                     venue_order_id=resting.venue_order_id,

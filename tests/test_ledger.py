@@ -253,5 +253,12 @@ class TestSearchAndTotals:
             "buffer_not_satisfied": 0,
             "win_count": 1,
             "loss_count": 0,
+            "total_trades": 1,
+            "realized_pnl": "12.50",
+            "average_trade_pnl": "12.50",
+            "up_wins": 1,
+            "up_losses": 0,
+            "down_wins": 0,
+            "down_losses": 0,
             "average_fill_seconds": None,
         }

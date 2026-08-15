@@ -22,7 +22,7 @@ from execution_fixtures import (
     submitter,
 )
 
-from arc.domain.enums import MarketPhase, OrderState
+from arc.domain.enums import Direction, MarketPhase, OrderState
 from arc.domain.models import Fill
 from arc.execution.v1_paper import PaperExecutor
 from arc.storage.store import Store
@@ -207,3 +207,46 @@ class TestFillAccounting:
         engine = fill_engine(store, executor)
         assert engine.ingest(market.slug, pushed, NOW).filled_size == Decimal("3")
         assert len(store.fills_for(market.slug)) == 1
+
+
+class TestDirectionSafety:
+    """UP/DOWN tokens trade on separate books; cross-side activity must not fill."""
+
+    def test_up_resting_order_does_not_fill_on_down_activity(self, wired) -> None:  # type: ignore[no-untyped-def]
+        store, executor, market = wired
+        _submit(store, executor, direction=Direction.UP)
+        fills = executor.trade(market.slug, LIMIT_PRICE, Decimal("35"), direction=Direction.DOWN)
+        assert fills == ()
+        assert store.orders_for(market.slug)[0].state is OrderState.SUBMITTED
+
+    def test_down_resting_order_does_not_fill_on_up_activity(self, wired) -> None:  # type: ignore[no-untyped-def]
+        store, executor, market = wired
+        _submit(store, executor, direction=Direction.DOWN)
+        fills = executor.trade(market.slug, LIMIT_PRICE, Decimal("35"), direction=Direction.UP)
+        assert fills == ()
+        assert store.orders_for(market.slug)[0].state is OrderState.SUBMITTED
+
+    def test_correct_side_activity_fills_an_up_order(self, wired) -> None:  # type: ignore[no-untyped-def]
+        store, executor, market = wired
+        _submit(store, executor, direction=Direction.UP)
+        fills = executor.trade(market.slug, LIMIT_PRICE, Decimal("35"), direction=Direction.UP)
+        assert len(fills) == 1
+        assert fills[0].size == Decimal("35")
+        asyncio.run(fill_engine(store, executor).poll(market.slug, NOW))
+        assert store.orders_for(market.slug)[0].state is OrderState.FILLED
+
+    def test_correct_side_activity_fills_a_down_order(self, wired) -> None:  # type: ignore[no-untyped-def]
+        store, executor, market = wired
+        _submit(store, executor, direction=Direction.DOWN)
+        fills = executor.trade(market.slug, LIMIT_PRICE, Decimal("35"), direction=Direction.DOWN)
+        assert len(fills) == 1
+        assert fills[0].size == Decimal("35")
+        asyncio.run(fill_engine(store, executor).poll(market.slug, NOW))
+        assert store.orders_for(market.slug)[0].state is OrderState.FILLED
+
+    def test_undirected_trade_still_fills_for_backward_compatibility(self, wired) -> None:  # type: ignore[no-untyped-def]
+        """Existing tests omit direction; the bridge always passes it, but old callers don't."""
+        store, executor, market = wired
+        _submit(store, executor, direction=Direction.UP)
+        fills = executor.trade(market.slug, LIMIT_PRICE, Decimal("35"))
+        assert len(fills) == 1
