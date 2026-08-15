@@ -32,6 +32,7 @@ import io
 import re
 import shutil
 from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, WebSocket
@@ -43,11 +44,11 @@ from arc.domain.enums import Direction, Mode
 from arc.domain.money import dec_str
 from arc.domain.timing import MARKET_DURATION_SECONDS, window_ts_for
 from arc.errors import ArcError, ArcFatalError
+from arc.majority.config import MAJORITY_ENGINE
 from arc.notify.telegram import CATEGORIES, notification_values
 from arc.runtime.ledger import ledger_records, search_records
 from arc.runtime.report import render_report
 from arc.runtime.validation import validate_run
-from arc.strategy.registry import default_registry
 from arc.timefmt import parse_at
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
@@ -77,17 +78,15 @@ router = APIRouter()
 
 _EDITABLE = frozenset(
     {
-        # TWAP fields — original set
-        "buffers",
-        "execution_windows",
-        "submission_count",
-        "position_notional_usd",
-        # MAJORITY fields — added so the Settings page controls both engines.
-        # The save flow validates both halves: TWAP through build_trading_config,
-        # MAJORITY through build_majority_config. A bad MAJORITY value is rejected
-        # with a 400 before anything is written, and restart_required is True so
-        # the operator knows a restart is needed after any change.
+        # MAJORITY fields only. The TWAP engine is gone; TWAP remains as a visual
+        # display and as internal data support for <=30s buffer-entry windows.
+        # TWAP-level TradingConfig fields (buffers, execution_windows,
+        # submission_count, position_notional_usd) are no longer user-editable.
         "majority_enabled",
+        "majority_trigger_limit_enabled",
+        "majority_buffer_enabled",
+        "majority_price_retry_enabled",
+        "majority_price_retry_attempts",
         "majority_buffer",
         "majority_trigger_price",
         "majority_target_limit_price",
@@ -252,11 +251,17 @@ async def status(request: Request) -> dict[str, Any]:
 async def get_settings(
     request: Request,
     snapshot: str = Query("", description="list | a snapshot name to read"),
+    configs: str = Query("", description="list | a saved config name to read"),
 ) -> dict[str, Any]:
-    """Read configuration, or the configuration snapshots, or the SQLite backup list."""
+    """Read configuration, snapshots, saved config profiles, or the SQLite backup list."""
     run = _runtime(request)
     from arc.api.models import settings_payload
 
+    if configs == "list":
+        return {"configs": _saved_config_names(run)}
+    if configs:
+        values = _load_saved_config(run, configs)
+        return {"config_name": configs, "values": values}
     if snapshot == "list":
         return {"snapshots": _snapshot_list(run)}
     if snapshot:
@@ -268,7 +273,10 @@ async def get_settings(
 @router.post("/settings")
 async def post_settings(
     request: Request,
-    action: str = Query("save", description="save | backup | notifications"),
+    action: str = Query(
+        "save",
+        description="save | backup | notifications | save_config | load_config | paper",
+    ),
 ) -> dict[str, Any]:
     """Write configuration, or take a local SQLite backup.
 
@@ -285,7 +293,78 @@ async def post_settings(
         # approved under. A notification toggle changes nothing about execution, and
         # locking it would mean the operator cannot silence a noisy category during
         # the only period when it is actually firing.
-        return _notifications(run, await request.json())
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="expected a JSON object")
+        # §34: a real send attempt, honest outcome. Telegram failure must never stop
+        # MAJORITY, so errors are caught and reported as text rather than raised.
+        # Never fabricate success: an operator who believes they are connected when
+        # they are not will miss the alert that matters.
+        if body.get("test"):
+            notifier = run.notifier
+            if not notifier.configured:
+                return {
+                    "ok": False,
+                    "message": "Telegram unavailable",
+                    "detail": "bot token or chat id not configured in environment",
+                }
+            sent = await notifier.send("[ARC] Test message\nTelegram connectivity verified.")
+            if sent:
+                return {
+                    "ok": True,
+                    "message": "Telegram connected / Test message sent successfully.",
+                }
+            return {
+                "ok": False,
+                "message": "Telegram unavailable",
+                "detail": "unable to send test message (check token, chat id and network)",
+            }
+        return _notifications(run, body)
+
+    if action == "save_config":
+        # Saving a snapshot of the CURRENT config is read-only on the live settings,
+        # so it is allowed even while armed. The name comes from the request body.
+        body = await request.json()
+        if not isinstance(body, dict) or not body.get("name"):
+            raise HTTPException(status_code=400, detail="expected {\"name\": \"...\"}")
+        stored = run.store.load_settings() or run.settings.as_storage_dict()
+        return _save_named_config(run, str(body["name"]), stored)
+
+    if action == "paper":
+        # The paper bankroll (#33) is refused unless the runtime is STOPPED: a
+        # reset under an open position would orphan committed cost the new epoch
+        # never saw, and an edited start balance would move a balance a live
+        # runtime is mid-reporting. STARTING/STOPPING are not stopped either.
+        # Lazy import: the engine imports api.app -> routes, so engine names
+        # cannot be imported at module level here.
+        from arc.runtime.engine import RuntimeStatus
+        from arc.runtime.paper_account import (
+            paper_account,
+            reset_paper_account,
+            set_start_balance,
+        )
+
+        if run.status != RuntimeStatus.STOPPED:
+            raise HTTPException(
+                status_code=409,
+                detail="stop trading before editing the paper account",
+            )
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="expected a JSON object")
+        try:
+            if body.get("reset"):
+                reset_paper_account(run.store, run.clock.now())
+            elif "start_balance" in body:
+                set_start_balance(run.store, str(body["start_balance"]), run.clock.now())
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="expected {\"start_balance\": \"...\"} or {\"reset\": true}",
+                )
+        except ArcError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"saved": True, "paper": await paper_account(run)}
 
     if run.state.execution_armed:
         raise HTTPException(
@@ -294,6 +373,29 @@ async def post_settings(
 
     if action == "backup":
         return _backup(run)
+
+    if action == "load_config":
+        # Load a named profile into the settings store. Does NOT auto-start trading;
+        # the operator still presses START TRADING to apply.
+        body = await request.json()
+        if not isinstance(body, dict) or not body.get("name"):
+            raise HTTPException(status_code=400, detail="expected {\"name\": \"...\"}")
+        values = _load_saved_config(run, str(body["name"]))
+        # Validate through the same builders the runtime boots with.
+        try:
+            build_trading_config(values)
+            from arc.majority.config import build_majority_config
+
+            trading = run.settings.trading
+            build_majority_config(
+                values,
+                min_tradable_size=trading.min_tradable_size,
+                tick_size=trading.tick_size,
+            )
+        except (ArcError, ArcFatalError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        run.store.save_settings(values, run.clock.now())
+        return {"loaded": True, "name": str(body["name"]), "restart_required": True}
 
     body = await request.json()
     if not isinstance(body, dict):
@@ -306,20 +408,20 @@ async def post_settings(
             detail=f"not editable from the dashboard: {sorted(unknown)}",
         )
 
-    # The full stored row. Writing only the TWAP half would discard MAJORITY's, so
-    # this is always the complete dict both engines need — TWAP's half plus whatever
-    # MAJORITY keys survived the last save.
+    # The full stored row. Writing only a subset would discard the rest, so
+    # this is always the complete dict — whatever MAJORITY keys survived the
+    # last save, plus the edits in this request.
     stored = run.store.load_settings() or run.settings.as_storage_dict()
     merged = dict(stored)
     merged.update({k: str(v) for k, v in body.items()})
     try:
-        # TWAP half: validated through the same builder the runtime boots with.
+        # TradingConfig half: validated through the same builder the runtime boots
+        # with, so stored TWAP-support values remain coherent.
         build_trading_config(merged)
         # MAJORITY half: validated through the same builder so a value the
         # dashboard accepts cannot be a value that refuses to start on next launch.
-        # MAJORITY keys that are absent (operator sent only TWAP fields) are
-        # handled inside build_majority_config: absent+enabled=false is OFF,
-        # absent+enabled=true is a ConfigInvariantError.
+        # MAJORITY keys that are absent are handled inside build_majority_config:
+        # absent+enabled=false is OFF, absent+enabled=true is a ConfigInvariantError.
         from arc.majority.config import build_majority_config
 
         trading = run.settings.trading
@@ -350,6 +452,7 @@ async def history(
     direction: str = Query(""),
     state: str = Query(""),
     result: str = Query(""),
+    status: str = Query("", description="open | win | loss | skipped | cancelled"),
     since: str = Query("", description="epoch, or a wall clock read in ?tz="),
     until: str = Query("", description="epoch, or a wall clock read in ?tz="),
     tz: str = Query("utc", description="utc | ist | et — the zone since/until are written in"),
@@ -373,6 +476,7 @@ async def history(
         direction=direction,
         state=state,
         result=result,
+        status=status,
         since=parse_at(since, tz),
         until=parse_at(until, tz),
     )
@@ -422,12 +526,12 @@ async def history(
 
 @router.get("/strategies")
 async def strategies(request: Request) -> list[dict[str, Any]]:
-    return strategy_payload(_runtime(request))
+    return strategy_payload()
 
 
 @router.get("/strategies/{strategy_id}")
 async def strategy(request: Request, strategy_id: str) -> dict[str, Any]:
-    for entry in strategy_payload(_runtime(request)):
+    for entry in strategy_payload():
         if entry["id"] == strategy_id:
             return entry
     raise HTTPException(status_code=404, detail=f"no strategy {strategy_id}")
@@ -441,14 +545,13 @@ async def strategy_config(request: Request, strategy_id: str) -> dict[str, Any]:
     disableable, and a selector with one entry invites the belief that others exist.
     """
     run = _runtime(request)
-    registry = default_registry()
-    if strategy_id not in registry.ids():
+    if strategy_id != MAJORITY_ENGINE:
         raise HTTPException(status_code=404, detail=f"no strategy {strategy_id}")
     trading = run.settings.trading
     return {
         "id": strategy_id,
         "editable": False,
-        "pinned": registry.is_pinned(strategy_id),
+        "pinned": True,
         "config": {
             "buffers": {
                 str(o): dec_str(trading.buffer_for(o)) for o in trading.windows_by_priority
@@ -467,7 +570,7 @@ async def strategy_config(request: Request, strategy_id: str) -> dict[str, Any]:
 async def set_strategy_config(
     request: Request,
     strategy_id: str,
-    action: str = Query("", description="arm | disarm"),
+    action: str = Query("", description="arm | disarm | start"),
 ) -> dict[str, Any]:
     """START TRADING / STOP TRADING. The Limit Order Engine's own control.
 
@@ -480,21 +583,93 @@ async def set_strategy_config(
     `execution_armed` is in-memory and never persisted, so a restart comes back
     disarmed. A gate that survived a crash would re-arm a system nobody was
     watching.
+
+    `action=start` is the full START TRADING: optionally accepts a JSON body of
+    MAJORITY config fields, validates and saves them, ensures the runtime is
+    running (restarting if config changed), then arms. This composes existing
+    primitives without adding new trading behaviour — the supervisor switch is
+    the only honest path since MAJORITY config is frozen at construction.
     """
     run = _runtime(request)
-    if strategy_id not in default_registry().ids():
+    if strategy_id != MAJORITY_ENGINE:
         raise HTTPException(status_code=404, detail=f"no strategy {strategy_id}")
     if action == "arm":
         run.arm()
     elif action == "disarm":
         run.disarm()
+    elif action == "start":
+        sup = _supervisor(request)
+        # ── START TRADING: optional config apply + ensure running + arm ───────
+        content_length = int(request.headers.get("content-length", 0))
+        body: dict[str, Any] = {}
+        if content_length > 0:
+            raw = await request.json()
+            if isinstance(raw, dict):
+                body = raw
+
+        config_applied = False
+        if body:
+            _PER_WINDOW_RE = re.compile(r"^majority_w_\d+_\w+$")
+            unknown = {k for k in body if k not in _EDITABLE and not _PER_WINDOW_RE.match(k)}
+            if unknown:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"not editable from the dashboard: {sorted(unknown)}",
+                )
+            stored = run.store.load_settings() or run.settings.as_storage_dict()
+            merged = dict(stored)
+            merged.update({k: str(v) for k, v in body.items()})
+            try:
+                build_trading_config(merged)
+                from arc.majority.config import build_majority_config
+
+                trading = run.settings.trading
+                build_majority_config(
+                    merged,
+                    min_tradable_size=trading.min_tradable_size,
+                    tick_size=trading.tick_size,
+                )
+            except (ArcError, ArcFatalError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            run.store.save_settings(merged, run.clock.now())
+            config_applied = True
+
+        # Ensure runtime is running. Restart if config changed under a live one.
+        if not sup.running:
+            mode = sup.mode
+            if mode is Mode.V2:
+                report = preflight(sup.runtime)
+                if report["result"] == "FAIL":
+                    failed = [c["check"] for c in report["checks"] if c["result"] == "FAIL"]
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"V2 preflight failed: {', '.join(failed)}",
+                    )
+            try:
+                run = await sup.start(mode)
+            except (ArcError, ArcFatalError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        elif config_applied:
+            try:
+                run = await sup.switch(sup.mode)
+            except (ArcError, ArcFatalError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        run.arm()
+        return {
+            "id": strategy_id,
+            "execution_armed": run.state.execution_armed,
+            "trading_enabled": run.state.trading_enabled,
+            "paused": run.paused,
+            "config_applied": config_applied,
+        }
     else:
         raise HTTPException(
             status_code=405,
             detail=(
                 f"{strategy_id} is pinned and not configurable from the dashboard; "
                 "edit buffers and windows on the Settings page. "
-                "Use ?action=arm or ?action=disarm to start or stop trading"
+                "Use ?action=arm|disarm|start to control trading"
             ),
         )
     return {
@@ -503,9 +678,6 @@ async def set_strategy_config(
         "trading_enabled": run.state.trading_enabled,
         "paused": run.paused,
     }
-
-
-# ── majority ────────────────────────────────────────────────────────────────
 
 
 # ── research ─────────────────────────────────────────────────────────────────
@@ -637,6 +809,65 @@ def _snapshot_list(run: ArcRuntime) -> list[dict[str, Any]]:
         {"name": p.name, "bytes": p.stat().st_size, "modified": p.stat().st_mtime}
         for p in sorted(directory.glob(f"{run.store.path.stem}-*.db"))
     ]
+
+
+def _configs_dir(run: ArcRuntime) -> Path:
+    """Named config profiles live as JSON beside the SQLite db."""
+    d = run.store.path.parent / "configs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _saved_config_names(run: ArcRuntime) -> list[dict[str, Any]]:
+    """List named configuration profiles."""
+    import json as _json
+
+    d = _configs_dir(run)
+    result = []
+    for p in sorted(d.glob("*.json")):
+        try:
+            data = _json.loads(p.read_text(encoding="utf-8"))
+            result.append(
+                {
+                    "name": p.stem,
+                    "modified": p.stat().st_mtime,
+                    "windows": data.get("majority_execution_windows", ""),
+                }
+            )
+        except Exception:
+            continue
+    return result
+
+
+def _load_saved_config(run: ArcRuntime, name: str) -> dict[str, str]:
+    """Read a named config profile. Raises HTTPException on missing/malformed."""
+    import json as _json
+
+    safe = re.sub(r"[^A-Za-z0-9_\-]", "_", name)
+    if safe != name or not name:
+        raise HTTPException(status_code=400, detail=f"invalid config name: {name}")
+    p = _configs_dir(run) / f"{safe}.json"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail=f"no saved config: {name}")
+    try:
+        data = _json.loads(p.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"corrupt config file: {exc}") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=500, detail="config file is not a JSON object")
+    return {str(k): str(v) for k, v in data.items()}
+
+
+def _save_named_config(run: ArcRuntime, name: str, values: dict[str, str]) -> dict[str, Any]:
+    """Persist current settings as a named profile."""
+    import json as _json
+
+    safe = re.sub(r"[^A-Za-z0-9_\-]", "_", name)
+    if safe != name or not name:
+        raise HTTPException(status_code=400, detail=f"invalid config name: {name}")
+    p = _configs_dir(run) / f"{safe}.json"
+    p.write_text(_json.dumps(values, indent=2, sort_keys=True), encoding="utf-8")
+    return {"saved": True, "name": safe, "path": str(p)}
 
 
 def _notifications(run: ArcRuntime, body: Any) -> dict[str, Any]:

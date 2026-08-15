@@ -37,6 +37,7 @@ holds a reference to it. TWAP cannot read it, clear it, or advance it.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import StrEnum
 from typing import Final
 
@@ -156,6 +157,24 @@ class MajorityMarketState:
     triggered_at: float | None = None
     side_selected_at: float | None = None
     no_trade_reason: str = ""
+    # ── entry-condition evidence (spec §6/§8/§9) ─────────────────────────────
+    # The entry condition decides WHEN the opportunity fires; it NEVER decides
+    # the side. Kept separately from the decision snapshot so the timing
+    # evidence (which mode, which BTC levels, which spot crossed) is auditable
+    # apart from the book evidence that explains which side was bought.
+    entry_mode: str = ""
+    btc_reference: Decimal | None = None
+    btc_up_trigger: Decimal | None = None
+    btc_down_trigger: Decimal | None = None
+    fired_level: Decimal | None = None
+    fired_spot: Decimal | None = None
+    # Final spec §10-§12: with the trigger/target switch ON, the window first
+    # waits for the configured Polymarket trigger price to be reached before the
+    # buffer condition is evaluated. Latched once — the trigger only decides WHEN
+    # the sequence starts; which side is traded comes from the fresh read after
+    # the fire, and the latch keeps a book moving back through the trigger level
+    # from re-arming or re-evaluating anything.
+    price_trigger_reached: bool = False
     _selected_side: Direction | None = field(default=None, repr=False)
 
     # ── the side lock ────────────────────────────────────────────────────────
@@ -316,4 +335,5 @@ class MajorityMarketState:
         """One line for the deck and the log."""
         side = "-" if self._selected_side is None else self._selected_side.value
         book = "-" if self.decision_snapshot is None else self.decision_snapshot.describe()
-        return f"{self.market_slug}  {self.state.value}  side {side}  {book}"
+        mode = self.entry_mode or "-"
+        return f"{self.market_slug}  {self.state.value}  mode {mode}  side {side}  {book}"

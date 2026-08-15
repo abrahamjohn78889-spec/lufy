@@ -26,7 +26,7 @@ dependencies = [
     # arc/execution/v2_live.py classifies venue failures on the SDK's own exception
     # TYPES (A14), and a classifier that has to guess at the types because the package
     # might be absent is a classifier that retries a request it must never retry.
-    "polymarket-client>=0.3.0",
+    "polymarket-client>=0.3.0,<0.5.0",
 ]
 
 [project.optional-dependencies]

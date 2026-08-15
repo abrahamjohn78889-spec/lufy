@@ -202,19 +202,20 @@ class TestGate4WindowTriggered:
 
 
 class TestGate5PriceToBeat:
-    def test_a_missing_ptb_denies(self, engine: RiskEngine) -> None:
+    """PTB is display-only per operator directive — gate 5 always allows."""
+
+    def test_a_missing_ptb_is_allowed(self, engine: RiskEngine) -> None:
         verdict = engine.evaluate(_context(ptb=None))
-        assert verdict.reason is DenialReason.PTB_UNAVAILABLE
+        assert verdict.allowed
 
     @pytest.mark.parametrize("ptb", [Decimal("0"), Decimal("-1")])
-    def test_a_non_positive_ptb_denies(self, engine: RiskEngine, ptb: Decimal) -> None:
-        assert engine.evaluate(_context(ptb=ptb)).reason is DenialReason.PTB_UNAVAILABLE
+    def test_a_non_positive_ptb_is_allowed(self, engine: RiskEngine, ptb: Decimal) -> None:
+        assert engine.evaluate(_context(ptb=ptb)).allowed
 
-    def test_it_is_separate_from_the_dead_phase_check(self, engine: RiskEngine) -> None:
-        """A market can be ACTIVE with the PTB freeze still absent, and trading it
-        would mean trading against a reference this process invented."""
+    def test_active_market_without_ptb_is_allowed(self, engine: RiskEngine) -> None:
+        """An ACTIVE market without PTB is still tradable; PTB is reference only."""
         verdict = engine.evaluate(_context(phase=MarketPhase.ACTIVE, ptb=None))
-        assert verdict.reason is DenialReason.PTB_UNAVAILABLE
+        assert verdict.allowed
 
 
 class TestGate6StrategyEnabled:
@@ -526,14 +527,16 @@ class TestOrderIsDeterministic:
     def test_each_gate_reports_itself_when_it_is_the_only_failure(
         self, engine: RiskEngine
     ) -> None:
-        """Every gate is individually reachable. A gate fully shadowed by an earlier
-        one would be dead code that reads as protection."""
+        """Every denying gate is individually reachable. A gate fully shadowed by an
+        earlier one would be dead code that reads as protection."""
+        # price_to_beat is display-only (operator directive) — it never denies, so
+        # it cannot appear in a breakages map that expects a denial. It remains in
+        # GATE_ORDER for observability (G05).
         breakages: dict[str, dict[str, object]] = {
             "trading_enabled": {"spec_status": SettlementSpecStatus.UNVERIFIED},
             "execution_armed": {"execution_armed": False},
             "market_phase": {"phase": MarketPhase.CANCELLING},
             "window_triggered": {"window_triggered": False},
-            "price_to_beat": {"ptb": None},
             "strategy_enabled": {"strategy_enabled": False},
             "duplicate_intent": {"intent_exists": True},
             "trade_quota": {"quota_used": 3},
@@ -549,7 +552,7 @@ class TestOrderIsDeterministic:
             "orphan_orders": {"orphan_orders": ("0xabc",)},
             "available_balance": {"available_balance": Decimal("0")},
         }
-        assert set(breakages) == set(GATE_ORDER)
+        assert set(breakages) == set(GATE_ORDER) - {"price_to_beat"}
         for gate, breakage in breakages.items():
             verdict = engine.evaluate(_context(**breakage))
             assert verdict.gate == gate, (gate, verdict.gate, verdict.detail)
@@ -558,6 +561,9 @@ class TestOrderIsDeterministic:
         """Short-circuit at the first denial, so the same situation always reports the
         same reason and a log change means a world change."""
         for index in range(len(GATE_ORDER)):
+            if GATE_ORDER[index] == "price_to_beat":
+                # Display-only gate — never denies, skip in the denial-order sweep.
+                continue
             broken: dict[str, object] = {
                 "spec_status": SettlementSpecStatus.UNVERIFIED,
                 "execution_armed": False,
@@ -678,9 +684,9 @@ class TestLimitsProjection:
         in mind."""
         from dataclasses import fields
 
-        from arc.strategy.config import StrategyConfig
+        from arc.majority.config import MajorityConfig
 
-        names = {f.name for f in fields(StrategyConfig)}
+        names = {f.name for f in fields(MajorityConfig)}
         assert names.isdisjoint(
             {
                 "max_trades_per_market",

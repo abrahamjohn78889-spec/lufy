@@ -23,6 +23,7 @@ from arc.buildinfo import git_commit
 from arc.domain.enums import (
     DISPLAYED_ORDER_STATES,
     LIVE_ORDER_STATES,
+    ORDER_STATE_DISPLAY,
     MarketPhase,
     Mode,
     OrderState,
@@ -38,13 +39,16 @@ from arc.domain.timing import (
     next_window_ts,
     slug_for,
 )
-from arc.execution.wallet import WalletSnapshot
+from arc.execution.wallet import STATUS_CONNECTED, STATUS_PAPER, WalletSnapshot
+from arc.majority.config import MAJORITY_ENGINE
 from arc.majority.state import MajorityState
 from arc.notify.telegram import CATEGORIES, CATEGORY_LABELS
 from arc.risk.engine import GATE_ORDER
-from arc.runtime.ledger import ledger_records, ledger_totals
-from arc.strategy.registry import DEFAULT_STRATEGY_ID
+from arc.runtime.ledger import _chain_orders, _leader, ledger_records, ledger_totals
+from arc.runtime.paper_account import paper_account
 from arc.timefmt import clocks, stamps
+
+_ZERO = Decimal("0")
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from arc.majority.config import MajorityConfig
@@ -211,7 +215,9 @@ def preflight(run: ArcRuntime) -> dict[str, Any]:
                "not yet run" if report is None else ", ".join(report.unresolved_orders) or "clean",
                warn=report is None),
         _check("Risk Engine", gate.enabled, gate.reason),
-        _check("Decision Engine", True, DEFAULT_STRATEGY_ID),
+        # MAJORITY is the one trading engine; TWAP survives only as data feeding it
+        # and is not listed. The row name predates the removal and stays for the UI.
+        _check("Decision Engine", True, MAJORITY_ENGINE),
         _check("Limit Order Engine", gate.armed, "not armed", warn=True),
         _check("WebSocket", True, "serving"),
         _check("RPC", run.venue_client is not None, "V1 uses no RPC", warn=True),
@@ -229,6 +235,18 @@ def preflight(run: ArcRuntime) -> dict[str, Any]:
 
 def _window_payload(run: ArcRuntime, market: MarketInstance, offset: int) -> dict[str, Any]:
     window = market.windows[offset]
+    # The market's window set is trading's offsets UNION MAJORITY's tradable
+    # windows, so an offset can exist here that trading never configured. Such a
+    # window's configured buffer is MAJORITY's own; the implied BTC move is a
+    # TWAP tuning metric and has no MAJORITY meaning — None, not a guess.
+    trading = run.settings.trading
+    if offset in trading.buffers:
+        configured_buffer: Decimal | None = trading.buffer_for(offset)
+        implied_btc_move: Decimal | None = trading.implied_btc_move(offset)
+    else:
+        majority_window = run.settings.majority.window_for(offset)
+        configured_buffer = majority_window.buffer if majority_window is not None else None
+        implied_btc_move = None
     return {
         "offset_seconds": offset,
         "label": f"{offset}s",
@@ -250,8 +268,8 @@ def _window_payload(run: ArcRuntime, market: MarketInstance, offset: int) -> dic
         "opens_at_display": stamps(activation_ts(market.close_ts, offset)),
         "frozen_at_display": stamps(window.frozen_at),
         "fired_at_display": stamps(window.fired_at),
-        "configured_buffer": _s(run.settings.trading.buffer_for(offset)),
-        "implied_btc_move": _s(run.settings.trading.implied_btc_move(offset)),
+        "configured_buffer": _s(configured_buffer),
+        "implied_btc_move": _s(implied_btc_move),
     }
 
 
@@ -271,10 +289,17 @@ def market_payload(run: ArcRuntime, now: float) -> dict[str, Any]:
             "countdown": "00:00", "next_market": slug_for(window_ts),
             "ptb": None, "signal_twap": None, "settlement_twap": None,
             "settlement_window_seconds": SETTLEMENT_WINDOW_SECONDS,
+            "btc_price": None, "signal_settlement_diff": None,
             "observation_count": 0, "windows": [], "closing": None,
             "opens_display": stamps(None), "closes_display": stamps(None),
         }
     closing = run.rotator.closing
+    settlement = run.settlement_twap(market.slug)
+    # Running-vs-settlement difference: what the operator reads to see how far
+    # the live TWAP is drifting from the price the market settles against.
+    diff = None
+    if market.signal_twap is not None and settlement is not None:
+        diff = market.signal_twap - settlement
     return {
         "slug": market.slug,
         "phase": market.phase.value,
@@ -290,8 +315,10 @@ def market_payload(run: ArcRuntime, now: float) -> dict[str, Any]:
         "next_market": slug_for(next_window_ts(market.window_ts)),
         "ptb": _s(market.ptb),
         "signal_twap": _s(market.signal_twap),
-        "settlement_twap": _s(run.settlement_twap(market.slug)),
+        "settlement_twap": _s(settlement),
         "settlement_window_seconds": SETTLEMENT_WINDOW_SECONDS,
+        "btc_price": _s(market.last_btc),
+        "signal_settlement_diff": _s(diff),
         "observation_count": market.observation_count,
         "windows": [_window_payload(run, market, o) for o in sorted(market.windows)],
         "closing": None if closing is None else {
@@ -379,6 +406,9 @@ def wallet_payload(snapshot: WalletSnapshot) -> dict[str, Any]:
         "markets_settled": ledger.markets_settled,
         "wins": ledger.wins,
         "losses": ledger.losses,
+        "win_rate": f"{ledger.wins * 100 / (ledger.wins + ledger.losses):.1f}%"
+        if (ledger.wins + ledger.losses) > 0
+        else _UNAVAILABLE,
     }
 
 
@@ -409,16 +439,16 @@ def settings_payload(run: ArcRuntime) -> dict[str, Any]:
         "implied_btc_move": {
             str(o): dec_str(trading.implied_btc_move(o)) for o in trading.windows_by_priority
         },
-        # Read-only text, never a selector. There is exactly one strategy (A17) and
-        # a dropdown with one entry invites the assumption that others exist.
-        "strategy": DEFAULT_STRATEGY_ID,
+        # Read-only text, never a selector. There is exactly one trading engine
+        # (MAJORITY; TWAP is a data source) and a dropdown with one entry invites
+        # the assumption that others exist.
+        "strategy": MAJORITY_ENGINE,
         "strategy_editable": False,
         "provider": run.settings.env.twap_provider,
-        # MAJORITY's configuration, read-only on this page. `_EDITABLE` in the routes
-        # bounds what POST /settings may change and none of the eight majority_* keys
-        # are in it, so shipping them here reports the running configuration without
-        # implying the page can edit it. Read off the engine, not `settings.majority`:
-        # the engine holds the config that is actually in force.
+        # MAJORITY's configuration. `_EDITABLE` in the routes bounds what POST
+        # /settings may change; the majority_* keys in it are the complete set of
+        # trading settings (final spec §34-§37). Read off the engine, not
+        # `settings.majority`: the engine holds the config that is actually in force.
         "majority": majority_config_payload(run.majority.config),
         # Presentation, shipped rather than hardcoded in the markup so a theme or a
         # repaint cadence set in .env is the one the browser actually uses.
@@ -430,25 +460,25 @@ def settings_payload(run: ArcRuntime) -> dict[str, Any]:
             name: run.notifier.wants(name) for name in CATEGORIES
         },
         "notification_labels": dict(CATEGORY_LABELS),
-        "telegram_configured": run.notifier.configured,
+        "telegram_configured": "ACTIVE" if run.notifier.configured else "NOT CONFIGURED",
         "warnings": list(run.settings.warnings),
     }
 
 
-def strategy_payload(run: ArcRuntime) -> list[dict[str, Any]]:
-    from arc.strategy.registry import default_registry
-
-    registry = default_registry()
+def strategy_payload() -> list[dict[str, Any]]:
+    """The engine list. MAJORITY is the only trading engine: TWAP survived the
+    removal only as a data source feeding MAJORITY, makes no decisions, and is
+    not listed. One entry, pinned, not disableable — the shape the routes and
+    the dashboard were built for, unchanged."""
     return [
         {
-            "id": d.strategy_id,
-            "name": d.name,
-            "description": d.description,
-            "pinned": d.pinned,
-            "disableable": d.disableable,
-            "active": d.strategy_id == DEFAULT_STRATEGY_ID,
+            "id": MAJORITY_ENGINE,
+            "name": MAJORITY_ENGINE,
+            "description": "Fresh-CLOB majority direction; BTC triggers open the entry",
+            "pinned": True,
+            "disableable": False,
+            "active": True,
         }
-        for d in registry.describe_all()
     ]
 
 
@@ -514,10 +544,13 @@ def system_payload(run: ArcRuntime, now: float) -> dict[str, Any]:
         "sqlite_tables": len(run.store.table_names()),
         "schema_version": run.store.schema_version(),
         "active_provider": run.settings.env.twap_provider,
-        "wallet": run.venue_client is not None,
+        # These four rows are operator-facing state words, not booleans. The System
+        # page is the one place an operator SSHes back to when a value here looks
+        # wrong — raw YES/NO hides whether the cause is paper mode or a missing key.
+        "wallet": STATUS_CONNECTED if run.venue_client is not None else STATUS_PAPER,
         "rtds": run.watchdog.status,
-        "websocket": run.feed.url,
-        "rpc": run.venue_client is not None,
+        "websocket": "CONNECTED" if run.feed.connected else "DISCONNECTED",
+        "rpc": STATUS_CONNECTED if run.venue_client is not None else "NOT CONFIGURED",
         # The endpoints and chain this process is actually dialling, read from the
         # live configuration rather than from constants in the markup. An operator
         # who overrode a CLOB host in .env must be able to confirm the override took
@@ -532,7 +565,7 @@ def system_payload(run: ArcRuntime, now: float) -> dict[str, Any]:
         "timezone": run.settings.env.timezone,
         "restart_count": run.restart_count,
         "runtime_uptime_seconds": max(now - run.started_at, 0.0) if run.started_at else 0.0,
-        "mode": run.mode.value,
+        "mode": "V2 LIVE" if run.mode is Mode.V2 else "V1 PAPER",
     }
 
 
@@ -720,8 +753,47 @@ def majority_config_payload(config: MajorityConfig) -> dict[str, Any]:
         "enabled": config.enabled,
         "tradable": config.tradable,
         "disable_reason": config.disable_reason,
+        # THE THREE SWITCHES (final spec §5) and the pre-repricing attempt count,
+        # shipped so the Settings page can read and edit every one of them.
+        "trigger_limit_enabled": config.trigger_limit_enabled,
+        "buffer_enabled": config.buffer_enabled,
+        "price_retry_enabled": config.price_retry_enabled,
+        "price_retry_attempts": config.price_retry_attempts,
         "windows": windows,
         "warnings": list(config.warnings),
+    }
+
+
+def _window_order_summary(run: ArcRuntime, market: MarketInstance, offset: int) -> dict[str, Any]:
+    """The order-level half of one window's LOE card (§37).
+
+    Read off the persisted rows exactly as the ledger does, so an active card and
+    the settled record of the same trade can never disagree. `live_pnl` is marked
+    against the venue book the same way the paper account marks open positions;
+    None when no mark exists rather than a zero that would read as "no risk".
+    """
+    window = market.windows.get(offset)
+    orders = _chain_orders(run.store.orders_for(market.slug), offset)
+    leader = _leader(orders)
+    chain_ids = {o.order_id for o in orders}
+    fills = tuple(f for f in run.store.fills_for(market.slug) if f.order_id in chain_ids)
+    filled = sum((f.size for f in fills), _ZERO)
+    fill_notional = sum((f.size * f.price for f in fills), _ZERO)
+    live_pnl = None
+    if leader is not None and filled > _ZERO:
+        mark = run.executor.mark_price(market.slug, leader.direction)
+        if mark is not None:
+            live_pnl = _s(filled * mark - fill_notional)
+    return {
+        "locked_trigger": None if window is None else _s(window.locked_trigger),
+        "buffer": None if window is None else _s(window.buffer),
+        "limit_price": None if leader is None else _s(leader.price),
+        "fill_price": _s(fill_notional / filled) if filled > _ZERO else None,
+        "shares": None if leader is None else _s(leader.size),
+        "filled_shares": _s(filled),
+        "order_state": None if leader is None else ORDER_STATE_DISPLAY[leader.state],
+        "retry_count": max(len(orders) - 1, 0),
+        "live_pnl": live_pnl,
     }
 
 
@@ -767,9 +839,10 @@ def majority_payload(run: ArcRuntime, market: MarketInstance | None) -> dict[str
     first_state = None
     if market is not None:
         for state in run.majority.states_for_market(market.slug):
-            states_by_window[str(state.execution_window_seconds)] = (
-                majority_window_state_payload(state)
-            )
+            key = str(state.execution_window_seconds)
+            payload = majority_window_state_payload(state)
+            payload.update(_window_order_summary(run, market, state.execution_window_seconds))
+            states_by_window[key] = payload
         windows = config.windows_by_offset
         if windows:
             first_state = run.majority.state_for(market.slug, windows[0].execution_window_seconds)
@@ -913,6 +986,10 @@ async def status_payload(run: ArcRuntime, now: float) -> dict[str, Any]:
         # wallet rather than inside it: those figures come from the venue, these
         # are what ARC did with them.
         "balance": run.balance_detail(now),
+        # V1 only (#52): the paper bankroll is its own block and null in V2, where
+        # real funds answer through wallet and balance. The arithmetic lives in
+        # arc.runtime.paper_account — this module serialises, it never computes.
+        "paper": await paper_account(run) if run.mode is Mode.V1 else None,
         "recovery": {
             "running": report is None,
             "stage": "COMPLETE" if report is not None else "PENDING",

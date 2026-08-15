@@ -4,12 +4,12 @@
     V2   the COMPLETE pipeline with LiveExecutor
 
 There is no third mode. V1 is not a lightweight simulator and not an observation
-run: market engine, window engine, decision engine, risk engine, limit order
-engine, fills, reprice, sweep, reconcile and recovery all execute identically.
-The ONLY component that differs between the two is the executor, which is why
-this file selects it once at construction and nothing below that line branches
-on mode. A second runtime path is a second set of behaviour to keep in sync, and
-the paper evidence would stop being evidence about the live run.
+run: market engine, MAJORITY engine, risk engine, limit order engine, fills,
+reprice, sweep, reconcile and recovery all execute identically. The ONLY
+component that differs between the two is the executor, which is why this file
+selects it once at construction and nothing below that line branches on mode. A
+second runtime path is a second set of behaviour to keep in sync, and the paper
+evidence would stop being evidence about the live run.
 
 Startup order is A8's, and the order matters:
 
@@ -59,12 +59,15 @@ from arc.api.app import serve as serve_dashboard
 from arc.buildinfo import git_commit
 from arc.clock import Clock, DriftMonitor, DriftStatus
 from arc.config import Settings
-from arc.decision.engine import DecisionEngine, RuntimeHealth
-from arc.decision.quota import QuotaLedger
-from arc.domain.enums import DEFAULT_ENGINE, Direction, MarketPhase, Mode
-from arc.domain.models import MarketInstance, Order
-from arc.domain.money import dec_str
-from arc.domain.timing import MARKET_DURATION_SECONDS, slug_for
+from arc.domain.enums import Direction, MarketPhase, Mode, Outcome, SettlementSpecStatus
+from arc.domain.health import RuntimeHealth
+from arc.domain.models import MarketInstance, Settlement
+from arc.domain.money import dec_str, to_decimal
+from arc.domain.timing import (
+    MARKET_DURATION_SECONDS,
+    SETTLEMENT_WINDOW_SECONDS,
+    slug_for,
+)
 from arc.errors import ArcError, ConfigInvariantError, FeedError, ObservationRejectedError
 from arc.execution.fill_engine import FillEngine
 from arc.execution.protocol import Executor
@@ -86,7 +89,6 @@ from arc.majority.state import MajorityMarketState
 from arc.market.discovery import MarketDiscovery
 from arc.market.providers import TwapProvider
 from arc.market.ptb import (
-    DEAD_REASON_PTB_UNAVAILABLE,
     PreviousClosePtbCache,
     PtbResolution,
     freeze_ptb_for,
@@ -104,9 +106,6 @@ from arc.runtime.events import EventHub, attach
 from arc.runtime.recovery import RecoveryReport, RecoveryRunner
 from arc.runtime.state import RuntimeState
 from arc.storage.store import Store
-from arc.strategy.config import config_from_trading
-from arc.strategy.registry import default_registry
-from arc.windows.engine import WindowEngine
 
 __all__ = [
     "EXPECTED_SYMBOL",
@@ -144,6 +143,13 @@ _PTB_RETRY_SECONDS: Final[float] = 5.0
 
 # One day, for the daily-loss gate's window.
 _DAY_SECONDS: Final[float] = 86400.0
+
+# How long past close a market waits before settlement is written. The collector
+# needs observations all the way to the close instant; a few seconds of grace let
+# the last frames land before the outcome is computed. No grace means a race
+# between the last observation and the settlement pass, and the loser of that race
+# is the TWAP the outcome is decided on.
+_SETTLE_GRACE_SECONDS: Final[float] = 5.0
 
 # How often the official CLOB book is re-read, and how long a read stays usable.
 #
@@ -363,7 +369,6 @@ class ArcRuntime:
         "_book_client",
         "_bucket",
         "_clock",
-        "_decisions",
         "_discovery",
         "_drift",
         "_executor",
@@ -386,14 +391,12 @@ class ArcRuntime:
         "_previous_close",
         "_reconciler",
         "_recovery",
-        "_repricer",
         "_risk",
         "_runtime",
         "_settings",
         "_settlement",
         "_spec",
         "_store",
-        "_submitter",
         "_sweeper",
         "_validator",
         "_venue_client",
@@ -414,7 +417,6 @@ class ArcRuntime:
         "supervisor_ready",
         "supervisor_state",
         "tokens",
-        "windows",
     )
 
     def __init__(
@@ -439,6 +441,15 @@ class ArcRuntime:
         self._store = store
         self._clock = clock
         self._runtime = runtime
+        # First-run seeding. The CLI seeds the settings table on boot when it
+        # loaded from .env (cli.py, `seeded_from_env`), but any construction that
+        # bypasses the CLI — a test, an embedding host — leaves the table empty,
+        # and the /settings handler merges over whatever the store HOLDS. The
+        # complete row must exist before the first save, or that save becomes the
+        # write that first materialises the other engine's values. An empty table
+        # is unambiguous: nothing stored means nothing can be overwritten.
+        if not store.load_settings():
+            store.save_settings(settings.as_storage_dict(), clock.now())
         self._discovery = discovery
         self._feed = feed
         self._executor = executor
@@ -542,37 +553,32 @@ class ArcRuntime:
         )
 
         # ── execution half ───────────────────────────────────────────────────
+        # MAJORITY is the only trading engine. The TWAP trading engine — its
+        # submitter, repricer, decision engine and window engine — has been
+        # removed; TWAP survives only as a data source feeding MAJORITY.
         self._bucket = TokenBucket(
             sustained=trading.outbound_rate_sustained,
             burst=trading.outbound_rate_burst,
             now=clock.now(),
         )
-        self._submitter = Submitter(
-            store,
-            executor,
-            bucket=self._bucket,
-            minimum=trading.min_tradable_size,
-            logger=logger,
-        )
         self._fills = FillEngine(store, executor, logger=logger)
-        self._repricer = Repricer(
-            store,
-            executor,
-            RepricePolicy(
-                band_min=trading.entry_price_min,
-                band_max=trading.entry_price_max,
-                tick=trading.tick_size,
-            ),
-            bucket=self._bucket,
-            logger=logger,
-        )
-        # Per-window MAJORITY repricer. Each window has its own entry band, so the
-        # repricer must follow the band of the WINDOW the order belongs to — a
-        # TWAP-band repricer on a MAJORITY order would move the order to a price
-        # outside the band the operator set for MAJORITY, and the gates that
-        # approved the order would no longer cover the resting price. Built as a
-        # dict keyed by window so the engine looks up the policy by the order's
-        # offset in O(1).
+        # Per-window MAJORITY repricer (spec §11 price retry). Each window has
+        # its own entry band, so the repricer must follow the band of the WINDOW
+        # the order belongs to — a foreign-band repricer on a MAJORITY order would
+        # move the order to a price outside the band the operator set for MAJORITY,
+        # and the gates that approved the order would no longer cover the resting
+        # price. Built as a dict keyed by window so the engine looks up the policy
+        # by the order's offset in O(1).
+        #
+        # The §11 switch is the whole gate: with price retry OFF there are NO
+        # repricers and `_reprice_open` finds nothing to look up, so a resting
+        # MAJORITY order stays exactly where it was placed.
+        #
+        # Final spec §20/§22: +1/-1 repricing applies ONLY while the
+        # trigger/target switch is OFF. With the switch ON the order is placed
+        # at the configured target price and must rest there — never walked to
+        # $0.94 or $0.92. The two conditions together are the gate; a repricer
+        # built under either one alone would violate the other rule.
         self._majority_repricers: dict[int, Repricer] = {
             window.execution_window_seconds: Repricer(
                 store,
@@ -583,18 +589,23 @@ class ArcRuntime:
                     tick=trading.tick_size,
                 ),
                 bucket=self._bucket,
+                # Final spec §20: same-price attempts before the first reprice,
+                # configurable 5-10 and validated at configuration time.
+                pre_reprice_attempts=settings.majority.price_retry_attempts,
                 logger=logger,
             )
             for window in settings.majority.tradable_windows
-        }
+        } if (
+            settings.majority.price_retry_enabled
+            and not settings.majority.trigger_limit_enabled
+        ) else {}
         self._sweeper = Sweeper(store, executor, logger=logger)
         self._reconciler = Reconciler(store, executor, logger=logger)
 
         # ── MAJORITY half ────────────────────────────────────────────────────
-        # A SECOND Submitter, constructed with engine=MAJORITY so every order it
-        # derives carries the MAJORITY prefix and the MAJORITY engine column. The
-        # TWAP submitter above is untouched and keeps its empty prefix, so no
-        # existing order id changes.
+        # Constructed with engine=MAJORITY so every order it derives carries the
+        # MAJORITY prefix and the MAJORITY engine column. The historical TWAP
+        # rows keep their empty prefix, so no existing order id changes.
         #
         # `minimum` is the MINIMUM share count across the configured windows. The
         # split is over MAJORITY's size and a foreign minimum would either reject
@@ -625,37 +636,30 @@ class ArcRuntime:
             store,
             executor,
             self._majority_submitter,
+            tick_size=trading.tick_size,
             logger=logger,
         )
 
-        # ── decision half ────────────────────────────────────────────────────
+        # ── risk + rotation ──────────────────────────────────────────────────
         # Owned here so the Systems page can read the timings without reaching
-        # through the Decision Engine into a gate it is not allowed to time.
+        # through a decision layer into a gate it is not allowed to time.
         self._risk = TimedRiskEngine()
-        self._decisions = DecisionEngine(
-            store,
-            strategy_config=config_from_trading(trading),
-            limits=limits_from_trading(trading),
-            registry=default_registry(),
-            quota=QuotaLedger(
-                max_trades_per_market=trading.max_trades_per_market,
-                min_tradable_size=trading.min_tradable_size,
-            ),
-            quote_source=self._quote,
-            health_source=self.health,
-            risk=self._risk,
-            logger=logger,
+        # MAJORITY's windows are windows of the market too: the ledger, the
+        # recorder and the deck all read the windows table, and a window with
+        # no row there is a trade that never appears in any of them. Trading's
+        # offsets plus MAJORITY's tradable offsets form the row set; the union
+        # is computed here because the rotator persists it at market creation
+        # and settings only change by rebuilding this runtime.
+        offsets = tuple(
+            sorted(
+                set(trading.windows_by_priority)
+                | {w.execution_window_seconds for w in majority.tradable_windows}
+            )
         )
-
-        # The Window Engine holds no per-market state, so one instance correctly
-        # serves both markets alive across a close boundary (A11).
-        self.windows = WindowEngine(store, trading, logger=logger)
         self.rotator = MarketRotator(
             store,
             clock,
-            offsets=trading.windows_by_priority,
-            windows=self.windows,
-            decisions=self._decisions,
+            offsets=offsets,
             logger=logger,
         )
 
@@ -748,18 +752,19 @@ class ArcRuntime:
         """
         health = self.health()
         gate = self._runtime.gate
+        limits = limits_from_trading(self._settings.trading)
         report = self._recovery
         orphans = () if report is None else report.orphans
         standing: dict[str, tuple[bool, str]] = {
             "trading_enabled": (gate.enabled, gate.reason or "enabled"),
             "execution_armed": (gate.armed, "armed" if gate.armed else "not armed"),
             "strategy_enabled": (
-                self._decisions.strategy_count > 0,
-                f"{self._decisions.strategy_count} registered",
+                self._settings.majority.enabled,
+                "MAJORITY enabled" if self._settings.majority.enabled else "MAJORITY disabled",
             ),
             "loss_limits": (
-                health.daily_loss_usd <= self._decisions.limits.max_daily_loss_usd
-                and health.consecutive_losses < self._decisions.limits.max_consecutive_losses,
+                health.daily_loss_usd <= limits.max_daily_loss_usd
+                and health.consecutive_losses < limits.max_consecutive_losses,
                 f"{dec_str(health.daily_loss_usd)} today, "
                 f"{health.consecutive_losses} consecutive",
             ),
@@ -839,11 +844,6 @@ class ArcRuntime:
             "summary": f"{passing} / {len(rows)} Gates PASS",
             "failures": blocked,
         }
-
-    @property
-    def decisions(self) -> DecisionEngine:
-        """The Decision Engine. Read-only from here; the loop is what drives it."""
-        return self._decisions
 
     @property
     def risk_eval_ms(self) -> float:
@@ -1053,24 +1053,6 @@ class ArcRuntime:
                 counting = False
         return loss, streak
 
-    def _quote(self, market_slug: str, direction: Direction) -> Decimal | None:
-        """The book price the strategy sizes against.
-
-        Synchronous because the decision pass is synchronous, and answered from the
-        cache `_refresh_books` fills from the official CLOB. A quote older than
-        `_BOOK_MAX_AGE_SECONDS` is reported as absent rather than returned: the
-        window then skips with NO_QUOTE, which is the correct outcome for a book
-        nobody could read, whereas a stale price would be sized against as if it
-        were current.
-        """
-        cached = self._book.get((market_slug, direction))
-        if cached is None:
-            return None
-        price, read_at = cached
-        if self._clock.now() - read_at > _BOOK_MAX_AGE_SECONDS:
-            return None
-        return price
-
     async def _refresh_books(self, now: float) -> None:
         """Re-read the official CLOB book for every live market and both sides.
 
@@ -1115,6 +1097,24 @@ class ArcRuntime:
                     # repricer and /orderbook read — answers with the live price.
                     # V2 reads the venue directly and needs nothing handed to it.
                     self._executor.quote(market.slug, direction, best)
+                    # Simulate counterparty activity at the live CLOB price so
+                    # resting paper orders can fill honestly.  Without this bridge
+                    # the paper executor never sees a trade, every order sits until
+                    # the settlement sweep cancels it, and fills are always zero.
+                    # The simulated size covers the configured share count plus
+                    # headroom; any excess is simply ignored by the matcher.
+                    produced = self._executor.trade(
+                        market.slug, best, Decimal("100"), direction=direction,
+                    )
+                    for fill in produced:
+                        log_event(
+                            logging.INFO,
+                            "Paper Fill",
+                            f"{market.slug} {direction.value} "
+                            f"price={fill.price} size={fill.size} "
+                            f"order={fill.order_id}",
+                            logger=self._logger,
+                        )
 
     async def _refresh_wallet(self, now: float) -> None:
         """Re-read the venue account so gate 19 has a current balance.
@@ -1219,22 +1219,18 @@ class ArcRuntime:
             )
 
     def _maybe_dead(self, market: MarketInstance, now: float, detail: str) -> None:
-        """Mark the market DEAD only once its earliest execution window has passed.
+        """PTB is display-only (user directive).
 
-        Before that instant an unresolved PTB is a value that has not been published
-        yet and the correct response is to try again. After it, no PTB can arrive in
-        time, and leaving the market PENDING forever would hide a permanently
-        unusable market behind a hopeful state.
+        Missing PTB no longer kills the market. Log for dashboard visibility only;
+        keep the market tradable regardless of PTB availability.
         """
         if now < self._ptb_deadline(market):
             return
-        market.phase = MarketPhase.DEAD
-        market.dead_reason = DEAD_REASON_PTB_UNAVAILABLE
-        self._store.save_phase(market.slug, MarketPhase.DEAD, now, DEAD_REASON_PTB_UNAVAILABLE)
+        # PTB is display-only — never gate or kill the market on it.
         log_event(
-            logging.ERROR,
-            "PTB Unavailable",
-            f"{market.slug} — no trading this market ({detail})",
+            logging.INFO,
+            "PTB Not Yet Available",
+            f"{market.slug} — PTB missing but market stays active ({detail})",
             logger=self._logger,
         )
         self.stats.ptb_unavailable += 1
@@ -1268,8 +1264,20 @@ class ArcRuntime:
             observation = self._validator.validate_payload(
                 message, expected_symbol=EXPECTED_SYMBOL, received_at=received_at
             )
-        except ObservationRejectedError:
+        except ObservationRejectedError as _exc:
             self.stats.observations_rejected += 1
+            if self.stats.observations_rejected <= 10:
+                _msg_str = (
+                    json.dumps(message)[:200]
+                    if isinstance(message, dict)
+                    else str(message)[:200]
+                )
+                log_event(
+                    logging.WARNING,
+                    "Observation Rejected",
+                    f"{_exc} | msg={_msg_str}",
+                    logger=self._logger,
+                )
             return
 
         self.stats.observations_accepted += 1
@@ -1288,21 +1296,16 @@ class ArcRuntime:
                 self.stats.settlement_samples += 1
                 self.stats.settlement_stream_found = True
 
-        # Re-evaluate frozen triggers now, not on the next tick. The signal TWAP only
-        # moves when an observation lands, so this is the only instant at which a
-        # trigger can newly become satisfied; deferring it to the 200 ms loop would
-        # make the check sampled rather than continuous (A12).
-        self.rotator.evaluate_windows(received_at)
-
     # ── the limit order engine ───────────────────────────────────────────────
 
     async def _drive_execution(self, now: float) -> None:
-        """Submit, fill, reprice. Level-triggered and idempotent, like everything else.
+        """MAJORITY decision, fill, reprice. Level-triggered and idempotent.
 
-        Reads its work from SQLite rather than from a queue: an intent persisted but
-        not yet submitted is discovered on the next pass regardless of what killed
-        the process in between, which is what makes a restart resume instead of drop
-        the window.
+        MAJORITY is the only engine that submits: it persists an intent and hands
+        it to the submitter inside its own tick, under the same operator gates
+        checked here. Nothing re-submits a persisted intent on its own — the
+        removed TWAP engine's unsubmitted intents stay unsubmitted, and MAJORITY's
+        are guarded by its own duplicate tracking.
         """
         # Gathered at most ONCE per pass, and only when MAJORITY can actually use
         # it. `health()` runs two SQLite reads (live orders, realised losses) and
@@ -1316,18 +1319,18 @@ class ArcRuntime:
         # against different views of the same process.
         health: RuntimeHealth | None = None
         for market in self._live_markets():
-            await self._submit_pending(market, now)
-            # MAJORITY runs BETWEEN submission and fill polling, on the same market,
-            # in the same pass. Its own trigger, its own fresh read, its own side and
-            # its own submitter — the only thing it shares with the two calls around
+            # MAJORITY runs first, then fill polling, on the same market, in the
+            # same pass. Its own trigger, its own fresh read, its own side and
+            # its own submitter — the only thing it shares with the calls after
             # it is the market object, which it reads and never mutates.
             #
-            # Driven under the same operator gates as _submit_pending above, and for
-            # the same reason: an operator pressing Stop Trading must stop MAJORITY
-            # too, and the gate that can still see that change is this one. A paused
-            # runtime therefore does not evaluate the MAJORITY trigger at all, so a
-            # window crossed while paused is not traded when the pause lifts — the
-            # side would then be chosen from a book minutes newer than the trigger.
+            # Driven under the operator gates, and for a deliberate reason: an
+            # operator pressing Stop Trading must stop MAJORITY too, and the gate
+            # that can still see that change is this one. A paused runtime
+            # therefore does not evaluate the MAJORITY trigger at all, so a
+            # window crossed while paused is not traded when the pause lifts —
+            # the side would then be chosen from a book minutes newer than the
+            # trigger.
             if (
                 self._settings.majority.tradable
                 and not self._paused
@@ -1340,60 +1343,16 @@ class ArcRuntime:
             self.stats.fills_recorded += len(report.new_fills)
             await self._reprice_open(market.slug, now)
 
-    async def _submit_pending(self, market: MarketInstance, now: float) -> None:
-        """Submit every persisted intent that has no order yet.
-
-        BOTH gates are re-checked here and not only inside the risk engine. The
-        gates were evaluated when the intent was created; an operator pressing Stop
-        Trading, or ARC disabling trading, in the milliseconds between creation and
-        submission must stop the order, and the only place that can still see that
-        change is this one. Pause is checked in the same breath and for the same
-        reason.
-        """
-        if market.phase is not MarketPhase.ACTIVE:
-            return
-        if self._paused or not self._runtime.gate.submitting:
-            return
-        # BOTH reads are scoped to this engine. `intents_for` with no engine returns
-        # every engine's intents, and this submitter stamps DEFAULT_ENGINE onto every
-        # order it derives — so an unscoped read would take MAJORITY's intent, submit
-        # it as a TWAP order, and MAJORITY would then find an order it never placed
-        # sitting on its window. The offsets are scoped for the mirror-image reason:
-        # a MAJORITY order resting on offset 45 would make this engine skip its own
-        # window 45 as already submitted, and the TWAP trade would silently never
-        # happen.
-        submitted_offsets = {
-            o.offset_seconds
-            for o in self._store.orders_for(market.slug)
-            if o.engine == DEFAULT_ENGINE
-        }
-        for intent in self._store.intents_for(market.slug, engine=DEFAULT_ENGINE):
-            if intent.offset_seconds in submitted_offsets:
-                continue
-            orders = await self._submitter.submit(
-                intent,
-                count=self._settings.trading.submission_count,
-                phase=market.phase,
-                now=now,
-            )
-            self.stats.orders_submitted += len(orders)
-
     async def _reprice_open(self, market_slug: str, now: float) -> None:
-        """Follow the book for THIS engine's resting orders only.
+        """Follow the book for MAJORITY's resting orders.
 
-        MAJORITY orders are routed to their window's repricer. A MAJORITY order
-        repriced under TWAP's policy would be moved to a price inside TWAP's
-        band and outside MAJORITY's own — so the order would be submitted at a
-        price MAJORITY's configuration forbids, by a component that never read
-        MAJORITY's configuration at all. The window-keyed repricer dict makes
-        the per-window band lookup a single dict access.
+        Each order is routed to its window's repricer: a window-independent
+        policy would move an order to a price inside a different band than the
+        one the operator set for that window, and the gates that approved the
+        order would no longer cover the resting price. The window-keyed repricer
+        dict makes the per-window band lookup a single dict access.
         """
         for order in self._fills.unfilled(market_slug):
-            if order.engine == DEFAULT_ENGINE:
-                moved: Order = await self._repricer.maybe_reprice(order, now)
-                if moved.order_id != order.order_id:
-                    self.stats.orders_repriced += 1
-                continue
             if order.engine == MAJORITY_ENGINE:
                 repricer = self._majority_repricers.get(order.offset_seconds)
                 if repricer is None:
@@ -1409,6 +1368,261 @@ class ArcRuntime:
 
     def _live_markets(self) -> tuple[MarketInstance, ...]:
         return tuple(m for m in (self.rotator.current, self.rotator.closing) if m is not None)
+
+    # ── settlement ───────────────────────────────────────────────────────────
+
+    def _cleanup_market(self, slug: str) -> None:
+        """Drop every per-market object the runtime holds for an archived market.
+
+        Dropped on ARCHIVE rather than on CLOSE, alongside every other per-market
+        object. A close-time drop would discard the state while the sweep is still
+        retracting that market's orders, and the deck would show nothing for a
+        market whose orders were still being cancelled. Thrown away, never reset
+        (A11). Called for both archive paths: the rotation event and a settlement
+        that archived directly (rotator.settled emits no event).
+        """
+        self._settlement.pop(slug, None)
+        self.tokens.drop(slug)
+        self._forget_book(slug)
+        self._majority.drop_market(slug)
+
+    async def _late_ptb_retry(self, now: float) -> None:
+        """Fetch PTB for SETTLING markets that missed it during the active window.
+
+        Polymarket publishes the previous market's finalPrice ~25s after close,
+        which is often after the active-window PTB deadline has passed. Without
+        this retry, a missing PTB leaves the market stuck in SETTLING forever
+        because _settle_markets requires market.ptb to determine outcome.
+        This method fetches the previous market's finalPrice one more time at
+        settlement time, when it should be available.
+
+        PTB is display-only for trading, but settlement outcome fundamentally
+        requires a reference price (TWAP > PTB → UP, else DOWN). If PTB is
+        still unavailable after this retry, settlement is postponed (not guessed).
+        """
+        if not isinstance(self._executor, PaperExecutor):
+            return
+        for market in self._live_markets():
+            if market.phase is not MarketPhase.SETTLING:
+                continue
+            if now < market.close_ts + _SETTLE_GRACE_SECONDS:
+                continue
+            if market.ptb is not None:
+                continue
+            await self._cache_previous_close(market.window_ts)
+            try:
+                metadata = await self._discovery.fetch_metadata(market.slug)
+            except FeedError:
+                metadata = None
+            if metadata is None:
+                continue
+            resolution = resolve_ptb(
+                metadata,
+                window_ts=market.window_ts,
+                previous_close=self._previous_close.for_window(market.window_ts),
+            )
+            if not resolution.available:
+                continue
+            if freeze_ptb_for(market, resolution, logger=self._logger):
+                assert resolution.value is not None
+                self._store.save_ptb(market.slug, resolution.value, now)
+                self.stats.ptb_frozen += 1
+                log_event(
+                    logging.INFO,
+                    "PTB Resolved Late",
+                    f"{market.slug} ptb={resolution.value} (fetched at settlement)",
+                    logger=self._logger,
+                )
+
+        # Archived SETTLING markets are no longer in the rotator but still need
+        # PTB and settlement. Same fetch logic, driven from storage rows rather
+        # than live MarketInstance objects. After resolving PTB (or if it was
+        # already saved), attempt settlement inline so these don't wait for a
+        # restart.
+        live_slugs = {m.slug for m in self._live_markets()}
+        for slug in self._store.unsettled_markets():
+            if slug in live_slugs:
+                continue
+            row = self._store.load_market_row(slug)
+            if row is None:
+                continue
+            if str(row["phase"]) != MarketPhase.SETTLING.value:
+                continue
+            close_ts = int(row["close_ts"])
+            window_ts = int(row["window_ts"])
+            if now < close_ts + _SETTLE_GRACE_SECONDS:
+                continue
+
+            ptb: Decimal | None
+            if row["ptb"] is not None:
+                ptb = to_decimal(row["ptb"])
+            else:
+                await self._cache_previous_close(window_ts)
+                try:
+                    metadata = await self._discovery.fetch_metadata(slug)
+                except FeedError:
+                    metadata = None
+                if metadata is None:
+                    continue
+                resolution = resolve_ptb(
+                    metadata,
+                    window_ts=window_ts,
+                    previous_close=self._previous_close.for_window(window_ts),
+                )
+                if not resolution.available or resolution.value is None:
+                    continue
+                ptb = resolution.value
+                self._store.save_ptb(slug, ptb, now)
+                self.stats.ptb_frozen += 1
+                log_event(
+                    logging.INFO,
+                    "PTB Resolved Late (archived)",
+                    f"{slug} ptb={ptb} (fetched at settlement)",
+                    logger=self._logger,
+                )
+
+            # Attempt settlement — same logic as _settle_recovered.
+            twap: Decimal | None
+            if row["settlement_twap"] is not None:
+                twap = to_decimal(row["settlement_twap"])
+            else:
+                collector = SettlementTwapCollector(market_slug=slug, close_ts=close_ts)
+                for obs in self._store.observations_between(
+                    close_ts - SETTLEMENT_WINDOW_SECONDS, close_ts + 1
+                ):
+                    collector.offer(obs)
+                twap = collector.settlement_twap
+            if twap is None:
+                continue
+            self._store.save_settlement_twap(slug, twap, now)
+            self._write_settlement(slug, twap, ptb, now)
+            self._store.save_phase(slug, MarketPhase.SETTLED, now)
+            log_event(
+                logging.INFO,
+                "Archived Market Settled",
+                f"{slug}  twap {dec_str(twap)}  ptb {dec_str(ptb)}",
+                logger=self._logger,
+            )
+
+    def _settle_markets(self, now: float) -> None:
+        """Settle a market whose settlement window has been fully observed.
+
+        V1 only: the paper venue's outcome IS the collected settlement TWAP,
+        computed once the grace period past close has passed, compared against the
+        PTB, and written as one settlement row per engine whose fills hold a
+        position. V2's outcome arrives as a venue resolution event, which is
+        Phase 3 work; until then a live market's row stays UNRESOLVED and recovery
+        re-examines it at every restart.
+
+        Level-triggered like everything else in the loop: every pass re-checks
+        every SETTLING market, and a market whose collector is still incomplete
+        simply waits for the next pass. Nothing is ever invented — a missing TWAP
+        or a missing PTB postpones the settlement instead of guessing at one.
+        """
+        if not isinstance(self._executor, PaperExecutor):
+            return
+        for market in self._live_markets():
+            if market.phase is not MarketPhase.SETTLING:
+                continue
+            if now < market.close_ts + _SETTLE_GRACE_SECONDS:
+                continue
+            collector = self._settlement.get(market.slug)
+            twap = None if collector is None else collector.settlement_twap
+            if twap is None or market.ptb is None:
+                continue
+            self._store.save_settlement_twap(market.slug, twap, now)
+            self._write_settlement(market.slug, twap, market.ptb, now)
+            archived = self.rotator.settled(market.slug, now)
+            if archived:
+                # settled() archives directly and emits no rotation event, so the
+                # per-market cleanup an archived event would carry happens here.
+                self._cleanup_market(archived)
+            log_event(
+                logging.INFO,
+                "Market Settled",
+                f"{market.slug}  twap {dec_str(twap)}  ptb {dec_str(market.ptb)}",
+                logger=self._logger,
+            )
+
+    def _write_settlement(
+        self, slug: str, twap: Decimal, ptb: Decimal, now: float
+    ) -> None:
+        """One settlement row per engine holding a position on this market.
+
+        The outcome is the strict comparison, mirroring the engine's own direction
+        rule: TWAP above PTB is UP, anything else DOWN. Equality resolves DOWN and
+        a position on UP loses it — the same asymmetry the entry side already
+        refuses to trade on. P&L is cost-valued: a winner pays out one per share,
+        a loser nothing.
+        """
+        outcome = Outcome.UP if twap > ptb else Outcome.DOWN
+        direction_by_order = {o.order_id: o.direction for o in self._store.orders_for(slug)}
+        pnl_by_engine: dict[str, Decimal] = {}
+        for fill in self._store.fills_for(slug):
+            direction = direction_by_order.get(fill.order_id)
+            if direction is None:
+                continue
+            won = direction.value == outcome.value
+            delta = (
+                fill.size * (Decimal(1) - fill.price) if won else -fill.size * fill.price
+            )
+            pnl_by_engine[fill.engine] = pnl_by_engine.get(fill.engine, _ZERO) + delta
+        for engine in sorted(pnl_by_engine):
+            self._store.save_settlement(
+                Settlement(
+                    market_slug=slug,
+                    outcome=outcome,
+                    settlement_twap=twap,
+                    ptb=ptb,
+                    settled_at=now,
+                    pnl=pnl_by_engine[engine],
+                    engine=engine,
+                )
+            )
+
+    def _settle_recovered(self, now: float) -> None:
+        """Settle markets a previous process closed but never wrote out.
+
+        The same rule as the loop's settlement, run once over the SETTLING rows on
+        disk at startup. The collector died with the process, so the TWAP is
+        recomputed from the persisted observations across the venue's INCLUSIVE
+        [close - 30s, close] window — the same samples, the same arithmetic, the
+        same answer. A market without the observations or the PTB is left alone:
+        UNRESOLVED is the honest row, and an invented settlement is not.
+        """
+        if not isinstance(self._executor, PaperExecutor):
+            return
+        for slug in self._store.unsettled_markets():
+            row = self._store.load_market_row(slug)
+            if row is None or row["ptb"] is None:
+                continue
+            if str(row["phase"]) != MarketPhase.SETTLING.value:
+                # ACTIVE means the window reopened under the new process; a market
+                # that is still trading is not settlement material.
+                continue
+            ptb = to_decimal(row["ptb"])
+            twap: Decimal | None
+            if row["settlement_twap"] is not None:
+                twap = to_decimal(row["settlement_twap"])
+            else:
+                close_ts = int(row["close_ts"])
+                collector = SettlementTwapCollector(market_slug=slug, close_ts=close_ts)
+                for obs in self._store.observations_between(
+                    close_ts - SETTLEMENT_WINDOW_SECONDS, close_ts + 1
+                ):
+                    collector.offer(obs)
+                twap = collector.settlement_twap
+            if twap is None:
+                continue
+            self._store.save_settlement_twap(slug, twap, now)
+            self._write_settlement(slug, twap, ptb, now)
+            self._store.save_phase(slug, MarketPhase.SETTLED, now)
+            log_event(
+                logging.INFO,
+                "Recovered Market Settled",
+                f"{slug}  twap {dec_str(twap)}  ptb {dec_str(ptb)}",
+                logger=self._logger,
+            )
 
     # ── venue metadata ───────────────────────────────────────────────────────
 
@@ -1491,16 +1705,10 @@ class ArcRuntime:
                 # settled outcome, and that position was never approved by any gate.
                 await self._sweeper.sweep(event.closed, now)
             if event.archived:
-                self._settlement.pop(event.archived, None)
-                self.tokens.drop(event.archived)
-                self._forget_book(event.archived)
-                # Dropped on ARCHIVE rather than on CLOSE, alongside every other
-                # per-market object. A close-time drop would discard the state while
-                # the sweep is still retracting that market's orders, and the deck
-                # would show nothing for a market whose orders were still being
-                # cancelled. Thrown away, never reset (A11).
-                self._majority.drop_market(event.archived)
+                self._cleanup_market(event.archived)
 
+            await self._late_ptb_retry(now)
+            self._settle_markets(now)
             await self._attempt_ptb(now)
             await self._refresh_books(now)
             await self._refresh_wallet(now)
@@ -1522,14 +1730,27 @@ class ArcRuntime:
             await asyncio.sleep(_TICK_SECONDS)
 
     def _gate_on_health(self) -> None:
-        """A blocked feed disables trading; a recovered feed does not re-enable it.
+        """A blocked feed disables trading. A recovered feed re-enables if spec is VERIFIED.
 
-        Re-enabling is the spec check's job and requires VERIFIED status. A watchdog
-        that could enable trading would be a second, weaker authority over the same
-        flag, and the weaker one would win whenever data happened to be flowing.
+        The original design required spec.apply() to re-enable, but that only runs at
+        shutdown — leaving a startup warmup or transient network hiccup as a permanent
+        block for the rest of the session. Re-enabling here still requires VERIFIED spec
+        status, preserving the security invariant while preventing latch-on-stale.
         """
         if self._watchdog.blocked and self._runtime.trading_enabled:
             self._runtime.disable_trading("FEED_STALE")
+        elif not self._watchdog.blocked and not self._runtime.trading_enabled:  # noqa: SIM102
+            # Feed recovered — re-enable if spec is VERIFIED (the authority check).
+            if self._runtime.spec_status == SettlementSpecStatus.VERIFIED:
+                disable_reason = self._runtime.reason
+                if disable_reason in ("FEED_STALE", ""):
+                    self._runtime.enable_trading()
+                    log_event(
+                        logging.INFO,
+                        "Feed Recovered",
+                        "trading re-enabled after feed staleness cleared",
+                        logger=self._logger,
+                    )
 
     async def _feed_loop(self) -> None:
         attempts = self._feed.connect_attempts
@@ -1557,6 +1778,10 @@ class ArcRuntime:
         report = await runner.run(now)
         self.stats.recoveries += 1
         self._recovery = report
+        # A previous process that died between close and archive left SETTLING rows
+        # behind; settle them from the persisted observations now that every fill
+        # for them has been reconciled.
+        self._settle_recovered(now)
         if not report.safe_to_trade and self._runtime.trading_enabled:
             self._runtime.disable_trading("RECOVERY_UNRESOLVED")
 
@@ -1642,11 +1867,10 @@ class ArcRuntime:
         """Persist what THIS run did. Every field has an authoritative source.
 
         No field is derived from an assumption about how the system is supposed to
-        behave. `windows_frozen / fired / expired` come from the Window Engine's own
-        transition counters rather than from markets x configured windows: that
-        product assumes every window of every market froze, which is false whenever
-        PTB was unavailable or a direction was indeterminable, and it would report
-        activity that never happened.
+        behave. The three TWAP window counters are fixed at zero (the TWAP window
+        engine has been removed) and the schema still requires the columns, so a
+        future run must never claim window activity from a process that has no
+        window engine.
 
         Order counts are read back from SQLite filtered on this session's start,
         because `stats.orders_submitted` counts submission calls while the fill rate
@@ -1672,9 +1896,11 @@ class ArcRuntime:
                 "ended_at": ended_at,
                 "duration_seconds": str(max(ended_at - self.started_at, 0.0)),
                 "markets_seen": self.stats.markets_processed,
-                "windows_frozen": self.windows.windows_frozen,
-                "windows_fired": self.windows.windows_fired,
-                "windows_expired": self.windows.windows_expired,
+                # The TWAP Window Engine has been removed; these counters are fixed
+                # at zero. The session schema requires the columns.
+                "windows_frozen": 0,
+                "windows_fired": 0,
+                "windows_expired": 0,
                 "orders_submitted": submitted,
                 "orders_filled": filled,
                 # NULL, not 0.0, when nothing was submitted: a run that placed no

@@ -339,9 +339,9 @@ class TestMetadataStillWins:
 
 
 class TestFailClosed:
-    """No official value, no trading. Never an estimate, never a silent default."""
+    """Missing PTB no longer kills the market — it stays tradable (display-only)."""
 
-    def test_a_market_whose_reference_never_publishes_goes_dead(self, store: Store) -> None:
+    def test_a_market_without_ptb_stays_active(self, store: Store) -> None:
         clock = FrozenClock(now=float(START_TS))
         # No final price for the previous market, ever.
         discovery = _Discovery(clock=clock, final_prices={})
@@ -352,8 +352,8 @@ class TestFailClosed:
 
         market = run.rotator.current
         assert market is not None
-        assert market.phase is MarketPhase.DEAD
-        assert market.dead_reason == DEAD_REASON_PTB_UNAVAILABLE
+        # PTB is display-only — market remains ACTIVE even without a reference.
+        assert market.phase is MarketPhase.ACTIVE
         assert market.ptb is None
         assert run.stats.ptb_unavailable == 1
 
@@ -370,7 +370,7 @@ class TestFailClosed:
         assert market is not None
         assert market.phase is not MarketPhase.DEAD
 
-    def test_the_dead_phase_is_persisted_with_its_reason(self, store: Store) -> None:
+    def test_the_missing_ptb_state_is_persisted(self, store: Store) -> None:
         clock = FrozenClock(now=float(START_TS))
         discovery = _Discovery(clock=clock, final_prices={})
         run = _run(store, clock, discovery)
@@ -381,8 +381,8 @@ class TestFailClosed:
         assert market is not None
         row = store.load_market_row(market.slug)
         assert row is not None
-        assert row["phase"] == MarketPhase.DEAD.value
-        assert row["dead_reason"] == DEAD_REASON_PTB_UNAVAILABLE
+        # Market stays ACTIVE; no dead_reason because PTB is display-only.
+        assert row["phase"] == MarketPhase.ACTIVE.value
 
     def test_a_metadata_request_failure_does_not_end_the_run(self, store: Store) -> None:
         """Operational, not fatal (A8). The process keeps collecting."""
@@ -400,28 +400,34 @@ class TestFailClosed:
         assert market is not None
         assert market.phase is not MarketPhase.DEAD
 
-    def test_a_market_is_marked_dead_only_once(self, store: Store) -> None:
+    def test_ptb_unavailable_is_counted_while_market_stays_alive(self, store: Store) -> None:
+        """The market never goes DEAD on missing PTB, so freeze attempts keep
+        running on each pass. The counter reflects ongoing attempts, not a
+        one-shot kill."""
         clock = FrozenClock(now=float(START_TS))
         discovery = _Discovery(clock=clock, final_prices={})
         run = _run(store, clock, discovery)
 
         _step(run, clock, 299.0)
 
-        assert run.stats.ptb_unavailable == 1
+        assert run.stats.ptb_unavailable >= 1
+        market = run.rotator.current
+        assert market is not None
+        assert market.phase is MarketPhase.ACTIVE
 
-    def test_the_unavailable_line_is_logged_with_its_reason(
+    def test_the_missing_ptb_info_line_is_logged(
         self, store: Store, caplog: pytest.LogCaptureFixture
     ) -> None:
         clock = FrozenClock(now=float(START_TS))
         discovery = _Discovery(clock=clock, final_prices={})
         run = _run(store, clock, discovery)
 
-        with caplog.at_level(logging.ERROR, logger="arc.test.runtime"):
+        with caplog.at_level(logging.INFO, logger="arc.test.runtime"):
             _step(run, clock, 290.0)
 
-        assert "PTB Unavailable" in caplog.text
+        assert "PTB Not Yet Available" in caplog.text
         details = [getattr(r, "arc_detail", "") for r in caplog.records]
-        assert any("no trading this market" in d for d in details)
+        assert any("market stays active" in d for d in details)
 
 
 class TestRetryBehaviour:

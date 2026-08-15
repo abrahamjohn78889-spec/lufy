@@ -87,6 +87,11 @@ function paint() {
       el.classList.toggle('no', raw === false);
     }
   }
+  // §44: translate disable_reason to plain English in the Runtime panel.
+  const drEl = document.querySelector('[data-f="runtime.disable_reason"]');
+  if (drEl && state.runtime) {
+    drEl.textContent = humanizeDisableReason(state.runtime.disable_reason || '');
+  }
   paintBanner();
   paintEngines();
   paintPreflight();
@@ -97,8 +102,10 @@ function paint() {
   paintRecoverySteps();
   paintHealth();
   paintModes();
+  paintPaper();
   paintAnalytics();
-  paintSettings();
+  paintMajorityConfig();
+  paintActiveOrders();
   paintWarnings();
   paintErrorSummary();
   applyPresentation();
@@ -107,17 +114,30 @@ function paint() {
 
 // The disable reason is shown in full, always. A truncated reason is a reason the
 // operator has to go to the logs for, which is the trip this dashboard removes.
+// Raw enum names are mapped to human-readable sentences (§37).
+function humanizeDisableReason(reason) {
+  const map = {
+    'TRADING_DISABLED_SPEC_UNVERIFIED':
+      'Settlement spec not yet verified — trading will start once the market spec is confirmed',
+    'TRADING_DISABLED': 'Trading disabled by system',
+  };
+  return map[reason] || reason;
+}
+
 function paintBanner() {
   const b = $('#banner'), r = state.runtime;
-  if (!r.trading_enabled) {
+  if (r.paused) {
+    b.className = 'banner amber';
+    b.textContent = `TRADING PAUSED — ${state.execution.execution_label} · ${state.runtime.mode}`;
+  } else if (!r.trading_enabled) {
     b.className = 'banner red';
-    b.textContent = `TRADING DISABLED BY SYSTEM — Reason: ${r.disable_reason || 'unspecified'}`;
+    b.textContent = `TRADING DISABLED BY SYSTEM — ${humanizeDisableReason(r.disable_reason || 'unspecified')}`;
   } else if (!r.execution_armed) {
     b.className = 'banner amber';
-    b.textContent = 'TRADING NOT ARMED — the runtime is running; no orders will be submitted.';
+    b.textContent = `TRADING STOPPED — runtime is running but no orders will be submitted.`;
   } else {
     b.className = 'banner green';
-    b.textContent = `TRADING ARMED — ${state.execution.execution_label} · ${state.runtime.mode}`;
+    b.textContent = `TRADING RUNNING — ${state.execution.execution_label} · ${state.runtime.mode}`;
   }
 }
 
@@ -270,7 +290,53 @@ function paintModes() {
   // by whether the orders are real.
   $('#runtime-start').textContent = `START ${active} RUNTIME`;
   $('#runtime-stop').textContent = `STOP ${active} RUNTIME`;
+  // The MAJORITY panel names the mode the runtime is actually running, not the
+  // operator's pending selection: V1 is paper, V2 is live money.
+  const shown = $('#majority-mode');
+  if (shown) shown.textContent = state.runtime.mode === 'V2' ? 'V2 LIVE' : 'V1 PAPER';
 }
+
+// §33: V1 paper bankroll panel. Hidden entirely in V2 where real funds answer
+// through the Wallet block; a visible-but-empty panel would imply the operator
+// had paper funds when they do not. Controls are disabled unless paper.editable,
+// which is true only when the runtime is STOPPED — same guard the route enforces.
+function paintPaper() {
+  const panel = $('#paper-panel');
+  if (!panel) return;
+  const p = state.paper;
+  // V2: status_payload returns paper=null. Hide the whole section.
+  if (p == null) { panel.classList.add('hidden'); return; }
+  panel.classList.remove('hidden');
+  const editable = !!p.editable;
+  const input = $('#paper-start-input');
+  const setBtn = $('#paper-set-start');
+  const resetBtn = $('#paper-reset');
+  if (input) input.disabled = !editable;
+  if (setBtn) setBtn.disabled = !editable;
+  if (resetBtn) resetBtn.disabled = !editable;
+}
+
+$('#paper-set-start')?.addEventListener('click', async () => {
+  const input = $('#paper-start-input');
+  const val = input?.value?.trim();
+  if (!val) { say($('#paper-msg'), false, 'enter a starting balance'); return; }
+  const { ok, data } = await post('/settings?action=paper', { start_balance: val });
+  say($('#paper-msg'), ok,
+      ok ? `Starting balance set to ${data.paper?.start_balance ?? val}.`
+         : (data.detail || 'rejected'));
+  if (ok && input) input.value = '';
+});
+
+$('#paper-reset')?.addEventListener('click', async () => {
+  // The operator must confirm: a reset zeroes realised counters while leaving
+  // history intact. Accidental clicks on a button this consequential are exactly
+  // what the spec's "with confirmation" clause prevents.
+  if (!confirm('Reset paper account? Realised P&L counters will restart from zero. Settlement history is preserved.')) return;
+  const { ok, data } = await post('/settings?action=paper', { reset: true });
+  say($('#paper-msg'), ok,
+      ok ? 'Paper account reset. Starting balance unchanged.'
+         : (data.detail || 'rejected'));
+});
 
 function paintAnalytics() {
   // Counters only. No win rate, no ROI, no Sharpe, no equity curve, no ranking.
@@ -301,8 +367,16 @@ function paintAnalytics() {
 let settingsBuilt = false;
 let majorityWindowsBuilt = false;
 
-const MAJORITY_PRESETS = [3, 5, 7, 10, 15, 25, 40, 60, 90, 120];
+const MAJORITY_PRESETS = [3, 5, 7, 10, 15, 25, 30, 45, 60, 90, 120];
 const MAJORITY_WINDOW_KEYS = ['buffer', 'trigger_price', 'target_limit_price', 'shares', 'entry_price_min', 'entry_price_max'];
+const MAJORITY_WINDOW_LABELS = {
+  buffer: 'Buffer Amount',
+  trigger_price: 'Trigger',
+  target_limit_price: 'Target Limit',
+  shares: 'Shares',
+  entry_price_min: 'Entry Min',
+  entry_price_max: 'Entry Max',
+};
 
 function _majorityWindowRow(win, defaults) {
   const wrap = document.createElement('div');
@@ -312,49 +386,44 @@ function _majorityWindowRow(win, defaults) {
     const val = defaults[key] ?? '';
     const label = document.createElement('label');
     label.className = 'field';
-    label.innerHTML = `<span>${key}</span><input name="majority_w_${win}_${key}" value="${val}">`;
+    label.innerHTML =
+      `<span>${MAJORITY_WINDOW_LABELS[key] || key}</span>` +
+      `<input name="majority_w_${win}_${key}" value="${val}">`;
     wrap.appendChild(label);
   });
   return wrap;
 }
 
-function paintSettings() {
+function paintMajorityConfig() {
   const s = state.settings;
-  $('#lock-pill').textContent = s.locked ? 'LOCKED (trading armed)' : 'EDITABLE';
-  $('#lock-pill').className = `pill ${s.locked ? 'fail' : 'pass'}`;
+  const lockPill = $('#lock-pill');
+  if (lockPill) {
+    lockPill.textContent = s.locked ? 'LOCKED (trading armed)' : 'EDITABLE';
+    lockPill.className = `pill ${s.locked ? 'fail' : 'pass'}`;
+  }
 
   if (!settingsBuilt) {
-    const host = $('#editable');
-
-    // ── TWAP ───────────────────────────────────────────────────────────────
-    const twapFields = [
-      ['buffers', 'Buffers (offset=value, comma separated)',
-        Object.entries(s.buffers).map(([k, v]) => `${k}=${v}`).join(',')],
-      ['execution_windows', 'Enabled Windows', s.execution_windows.join(',')],
-      ['submission_count', 'Submission Count', s.submission_count],
-      ['position_notional_usd', 'Position Size (USD)', s.position_notional_usd],
-    ];
+    const host = $('#majority-editable');
+    if (!host) return;
 
     // ── MAJORITY ───────────────────────────────────────────────────────────
-    const mcfg = s.majority_config || {};
+    const mcfg = s.majority || {};
     const mwinKeys = MAJORITY_WINDOW_KEYS;
 
-    // scalar fields
     const majorityScalarFields = [
-      ['majority_buffer',       'Buffer %',            mcfg.buffer ?? ''],
-      ['majority_trigger_price','Trigger Price',       mcfg.trigger_price ?? ''],
-      ['majority_target_limit_price', 'Target Limit Price', mcfg.target_limit_price ?? ''],
-      ['majority_shares',       'Shares',               mcfg.shares ?? ''],
-      ['majority_entry_price_min', 'Entry Price Min',  mcfg.entry_price_min ?? ''],
-      ['majority_entry_price_max', 'Entry Price Max',  mcfg.entry_price_max ?? ''],
+      ['majority_buffer',       'Buffer Amount (default)', ''],
+      ['majority_trigger_price','Trigger Price',       ''],
+      ['majority_target_limit_price', 'Target Limit Price', ''],
+      ['majority_shares',       'Shares',               ''],
+      ['majority_entry_price_min', 'Entry Price Min',  ''],
+      ['majority_entry_price_max', 'Entry Price Max',  ''],
+      ['majority_price_retry_attempts', 'Retry Attempts', ''],
     ];
 
     const windows = mcfg.windows || [];
-    // Build window-lookup: keyed by execution_window_seconds → window config object.
     const wVals = {};
-    for (const w of windows) { wVals[w.window] = w; }
-    const enabledWins = windows.map((w) => w.window);
-    const winDefaults = windows[0] || {};
+    for (const w of windows) { wVals[w.execution_window_seconds] = w; }
+    const enabledWins = windows.map((w) => w.execution_window_seconds);
 
     // preset bar
     const presetsDiv = document.createElement('div');
@@ -367,21 +436,19 @@ function paintSettings() {
       btn.textContent = w;
       btn.dataset.window = w;
       btn.addEventListener('click', () => {
-        const cur = ($('#majority_windows_input') || {}).value
-          ? $('#majority_windows_input').value.split(',').map(Number).filter(Boolean)
-          : enabledWins;
+        const input = $('#majority_windows_input');
+        const cur = input.value
+          ? input.value.split(',').map(Number).filter(Boolean)
+          : [...enabledWins];
         if (cur.includes(w)) {
-          // remove
           const next = cur.filter((x) => x !== w);
-          $('#majority_windows_input').value = next.join(',');
+          input.value = next.join(',');
           btn.classList.remove('active');
         } else {
-          // add (insert sorted)
           cur.push(w); cur.sort((a, b) => a - b);
-          $('#majority_windows_input').value = cur.join(',');
+          input.value = cur.join(',');
           btn.classList.add('active');
         }
-        // rebuild per-window rows
         _rebuildMajorityWindowRows();
       });
       presetsDiv.appendChild(btn);
@@ -401,7 +468,7 @@ function paintSettings() {
     });
     presetsDiv.appendChild(customInput);
 
-    // majority_enabled: checkbox + hidden so unchecked submits "false", not nothing
+    // majority_enabled checkbox
     const enabledHidden = document.createElement('input');
     enabledHidden.type = 'hidden';
     enabledHidden.name = 'majority_enabled';
@@ -422,17 +489,48 @@ function paintSettings() {
     enabledSpan.textContent = 'Enabled';
     enabledWrap.appendChild(enabledSpan);
 
+    // Three ON/OFF switches. The hidden input carries the true/false the backend
+    // parses; the checkbox and the ON/OFF text are the operator's surface — no
+    // boolean value is ever shown as a word.
+    const switchDefs = [
+      ['majority_trigger_limit_enabled', 'Trigger + Target Price', mcfg.trigger_limit_enabled],
+      ['majority_buffer_enabled', 'Buffer', mcfg.buffer_enabled],
+      ['majority_price_retry_enabled', 'Price Retry', mcfg.price_retry_enabled],
+    ];
+    const switchHost = document.createElement('div');
+    switchHost.id = 'majority-switches';
+    switchHost.replaceChildren(
+      enabledWrap,
+      ...switchDefs.map(([key, label, on]) => {
+        const wrap = document.createElement('label');
+        wrap.className = 'field onoff';
+        wrap.innerHTML =
+          `<input type="hidden" name="${key}" value="${on ? 'true' : 'false'}">` +
+          `<span>${label}</span>` +
+          `<input type="checkbox" data-switch="${key}"${on ? ' checked' : ''}>` +
+          `<span class="onoff-state">${on ? 'ON' : 'OFF'}</span>`;
+        wrap.querySelector('[data-switch]').addEventListener('change', (e) => {
+          wrap.querySelector('input[type="hidden"]').value = e.target.checked ? 'true' : 'false';
+          wrap.querySelector('.onoff-state').textContent = e.target.checked ? 'ON' : 'OFF';
+          paintMajorityConfig();
+        });
+        return wrap;
+      }),
+    );
+    const retryHint = document.createElement('p');
+    retryHint.className = 'cfg-hint';
+    retryHint.textContent =
+      'Price Retry re-prices by +1/-1 tick while Trigger + Target is OFF.';
+
     const scalarHost = document.createElement('div');
     scalarHost.id = 'majority-scalars';
     scalarHost.replaceChildren(
-      enabledWrap,
       ...majorityScalarFields.map(([key, label, value]) => {
         const wrap = document.createElement('label');
         wrap.className = 'field';
         wrap.innerHTML = `<span>${label}</span><input name="${key}" value="${value}">`;
         return wrap;
       }),
-      presetsDiv,
     );
 
     const windowRowsHost = document.createElement('div');
@@ -448,38 +546,65 @@ function paintSettings() {
     }
     _rebuildMajorityWindowRows();
 
-    // section headers
-    const twapHdr = document.createElement('h3'); twapHdr.textContent = 'TWAP';
-    const majorityHdr = document.createElement('h3'); majorityHdr.textContent = 'MAJORITY';
-    host.replaceChildren(
-      twapHdr,
-      ...twapFields.map(([key, label, value]) => {
-        const wrap = document.createElement('label');
-        wrap.className = 'field';
-        wrap.innerHTML = `<span>${label}</span><input name="${key}" value="${value}">`;
-        return wrap;
-      }),
-      majorityHdr,
-      scalarHost,
-      windowRowsHost,
-    );
+    // Organize into sections. Each card groups related fields so the operator can
+    // scan at a glance. No TWAP configuration — TWAP is data support only.
+    const timeCard = document.createElement('div');
+    timeCard.className = 'cfg-card';
+    timeCard.innerHTML = '<h4>Time Window</h4>';
+    timeCard.appendChild(presetsDiv);
+
+    const switchCard = document.createElement('div');
+    switchCard.className = 'cfg-card';
+    switchCard.innerHTML = '<h4>Operator Switches</h4>';
+    switchCard.append(switchHost, retryHint);
+
+    const entryCard = document.createElement('div');
+    entryCard.className = 'cfg-card';
+    entryCard.innerHTML = '<h4>Entry</h4>';
+    entryCard.appendChild(scalarHost);
+
+    const winCard = document.createElement('div');
+    winCard.className = 'cfg-card';
+    winCard.innerHTML = '<h4>Per-Window Overrides</h4>';
+    winCard.appendChild(windowRowsHost);
+
+    host.replaceChildren(timeCard, switchCard, entryCard, winCard);
 
     const notify = $('#notify');
-    notify.replaceChildren(...Object.keys(s.notifications).map((name) => {
-      const l = document.createElement('label');
-      l.className = 'toggle';
-      l.innerHTML =
-        `<input type="checkbox" data-cat="${name}"${s.notifications[name] ? ' checked' : ''}>` +
-        `<span>${s.notification_labels[name]}</span>`;
-      return l;
-    }));
+    if (notify) {
+      notify.replaceChildren(...Object.keys(s.notifications).map((name) => {
+        const l = document.createElement('label');
+        l.className = 'toggle';
+        l.innerHTML =
+          `<input type="checkbox" data-cat="${name}"${s.notifications[name] ? ' checked' : ''}>` +
+          `<span>${s.notification_labels[name]}</span>`;
+        return l;
+      }));
+    }
     settingsBuilt = true;
   }
 
   // The lock is enforced by the backend; disabling the inputs only tells the
-  // operator why before they type, rather than after they press save.
-  $$('#editable input').forEach((i) => { i.disabled = s.locked; });
-  $('#save-settings').disabled = s.locked;
+  // operator why before they type, rather than after they press save. Switch
+  // dependencies are applied here too — fields gated by a switch are disabled
+  // when the switch is OFF, regardless of the lock.
+  const trigBox = $('#majority-editable input[data-switch="majority_trigger_limit_enabled"]');
+  const bufBox = $('#majority-editable input[data-switch="majority_buffer_enabled"]');
+  const retryBox = $('#majority-editable input[data-switch="majority_price_retry_enabled"]');
+  $$('#majority-editable input').forEach((i) => {
+    if (i.dataset.switch) { i.disabled = s.locked; return; }
+    const n = i.name || '';
+    let depOff = false;
+    if (n === 'majority_price_retry_attempts') depOff = !(retryBox && retryBox.checked);
+    else if (n.endsWith('trigger_price') || n.endsWith('target_limit_price')) {
+      depOff = !(trigBox && trigBox.checked);
+    } else if (n.endsWith('_buffer')) {
+      depOff = !(bufBox && bufBox.checked);
+    }
+    i.disabled = s.locked || depOff;
+  });
+  const saveBtn = $('#save-majority-config');
+  if (saveBtn) saveBtn.disabled = s.locked;
 }
 
 function paintWarnings() {
@@ -561,7 +686,7 @@ function setLive(live) {
 
 // ── timers ───────────────────────────────────────────────────────────────────
 
-// Both timers read the same close_ts and the same interpolated clock, so they
+// All countdowns read the same close_ts and the same interpolated clock, so they
 // cannot drift from each other by construction — there is one source, not two.
 let clockSkew = 0;   // serverNow - browserNow, measured on each status frame
 
@@ -571,6 +696,7 @@ function tickTimers() {
   const s = countdown(state.market.close_ts, now);
   $('#timer1').textContent = s;
   $('#timer2').textContent = s;
+  $('#timer3').textContent = s;
 }
 
 // ── socket ───────────────────────────────────────────────────────────────────
@@ -656,7 +782,15 @@ $$('[data-post]').forEach((btn) => {
     // The refusal is shown verbatim. Paraphrasing a system refusal would put the
     // operator's belief about why trading is off out of step with the reason.
     const target = btn.closest('.panel').querySelector('.msg') || $('#control-msg');
-    say(target, ok, ok ? JSON.stringify(data) : (data.detail || 'refused'));
+    if (!ok) { say(target, false, data.detail || 'refused'); return; }
+    // Human-readable confirmations — never dump raw JSON at the operator.
+    const path = btn.dataset.post.split('?')[0];
+    let msg;
+    if (path === '/stop')        msg = `${data.mode} runtime stopped.`;
+    else if (path === '/pause')  msg = `Trading paused. Execution ${data.execution_armed ? 'ARMED' : 'NOT ARMED'}.`;
+    else if (path === '/resume') msg = `Trading resumed. Execution ${data.execution_armed ? 'ARMED' : 'NOT ARMED'}.`;
+    else                         msg = 'Done.';
+    say(target, true, msg);
   });
 });
 
@@ -674,16 +808,50 @@ $$('[data-mode]').forEach((btn) => {
 $('#runtime-start').addEventListener('click', async () => {
   const mode = selectedMode || state.runtime.mode;
   const { ok, data } = await post(`/start?mode=${encodeURIComponent(mode)}`);
-  say($('#control-msg'), ok, ok ? JSON.stringify(data) : (data.detail || 'refused'));
+  const msg = ok
+    ? `${data.mode} runtime started. Execution ${data.execution_armed ? 'ARMED' : 'NOT ARMED'} — trading does not begin until the Limit Order Engine is armed.`
+    : (data.detail || 'refused');
+  say($('#control-msg'), ok, msg);
   if (ok) selectedMode = null;
 });
 
-$('#save-settings').addEventListener('click', async () => {
+// ── MAJORITY START TRADING ────────────────────────────────────────────────────
+// Gathers current config from the form and POSTs to action=start, which applies
+// the config, ensures the runtime is running (restarts if config changed), and
+// arms trading. This is the PRIMARY operator action.
+$('#majority-start').addEventListener('click', async () => {
   const body = {};
-  $$('#editable input').forEach((i) => { body[i.name] = i.value; });
+  $$('#majority-editable input').forEach((i) => {
+    // Skip data-switch checkboxes: they are visual toggles only. Their paired
+    // hidden input carries the true/false the backend parses. Including them
+    // here would add either an empty-string key (no name attr) or a duplicate
+    // that overwrites the hidden input's value.
+    if (!i.name || i.dataset.switch) return;
+    body[i.name] = i.value;
+  });
+  const { ok, data } = await post(
+    '/strategies/MAJORITY/config?action=start', body,
+  );
+  // §16: human-readable message. Mode label from runtime state (V1/V2), not raw enum.
+  const modeLabel = state.runtime.mode === 'V2' ? 'V2 LIVE' : 'V1 PAPER';
+  say($('#majority-msg'), ok,
+      ok ? `TRADING RUNNING — ${modeLabel} • MAJORITY ENGINE`
+         : (data.detail || 'refused'));
+});
+
+// ── SAVE MAJORITY CONFIGURATION ──────────────────────────────────────────────
+// Saves to disk without starting/restarting. The operator edits, saves, then
+// presses START TRADING when ready. Config changes require a restart to take
+// effect — that's the honest architectural constraint.
+$('#save-majority-config').addEventListener('click', async () => {
+  const body = {};
+  $$('#majority-editable input').forEach((i) => {
+    if (!i.name || i.dataset.switch) return;
+    body[i.name] = i.value;
+  });
   const { ok, data } = await post('/settings?action=save', body);
-  say($('#settings-msg'), ok,
-      ok ? 'Saved. Restart required for the engines to pick it up.'
+  say($('#majority-config-msg'), ok,
+      ok ? 'Saved. Press START TRADING to apply.'
          : (data.detail || 'rejected'));
 });
 
@@ -701,6 +869,79 @@ $('#backup').addEventListener('click', async () => {
   loadSnapshots();
 });
 
+// ── Active Limit Orders ───────────────────────────────────────────────────────
+// §23: one card per active window (non-terminal state). Settled windows are
+// removed from this view — they live in the Ledger. Fields come from the
+// MAJORITY states_by_window payload; order-level detail (price, fill, shares)
+// is not yet exposed per-window by the API and will be added in a follow-up.
+
+function paintActiveOrders() {
+  const host = $('#active-orders');
+  if (!host) return;
+  const states = state.majority?.states_by_window ?? {};
+  // Only non-terminal states represent active windows with live orders or
+  // pending decisions. Terminal states (FILLED, SETTLED, REJECTED, etc.) belong
+  // in the Ledger.
+  const entries = Object.entries(states).filter(([_, s]) => !s.terminal);
+  if (!entries.length) {
+    host.replaceChildren();
+    const div = document.createElement('div');
+    div.className = 'check';
+    div.innerHTML = '<span>No active limit orders.</span>';
+    host.appendChild(div);
+    return;
+  }
+  host.replaceChildren(...entries.map(([windowSec, s]) => {
+    const div = document.createElement('div');
+    div.className = 'check loe-card';
+    const remaining = s.close_ts != null
+      ? Math.max(0, Math.round(s.close_ts - state.ts)) + 's'
+      : '—';
+    const row = (label, val) => `<span class="loe-row"><i>${label}</i><b>${val ?? '—'}</b></span>`;
+    div.innerHTML =
+      `<b>${windowSec}s window</b>` +
+      `<span class="dir">${s.selected_side || '—'}</span>` +
+      `<i>${s.state}</i>` +
+      `<span>${remaining} left</span>` +
+      row('Trigger', s.locked_trigger) +
+      row('Buffer', s.buffer) +
+      row('Limit Price', s.limit_price) +
+      row('Fill Price', s.fill_price) +
+      row('Shares', s.shares) +
+      row('Filled', s.filled_shares) +
+      row('Status', s.order_state) +
+      row('Retries', s.retry_count) +
+      row('Live P&L', s.live_pnl);
+    return div;
+  }));
+}
+
+// ── EMERGENCY CLOSE ALL ───────────────────────────────────────────────────────
+// Operator-only. Requires confirmation. Never auto-invoked by the bot.
+$('#emergency-close-all').addEventListener('click', async () => {
+  const confirmed = window.confirm(
+    'EMERGENCY CLOSE ALL TRADES\n\n' +
+    'This will stop all trading and disarm the engine. ' +
+    'Open positions will settle naturally.\n\n' +
+    'Are you sure you want to proceed?',
+  );
+  if (!confirmed) return;
+  // Disarm trading to stop new order submissions
+  const { ok, data } = await post('/strategies/MAJORITY/config?action=disarm');
+  say($('#close-msg'), ok,
+      ok ? 'Trading stopped. Open positions will settle naturally.'
+         : (data.detail || 'failed'));
+});
+
+// ── Telegram Test Button (§34) ────────────────────────────────────────────────
+// Real send attempt, honest outcome. The message text comes from the server so the
+// operator sees exactly what the backend determined — not a paraphrase that might
+// soften a failure or overstate a success.
+$('#telegram-test').addEventListener('click', async () => {
+  const { data } = await post('/settings?action=notifications', { test: true });
+  say($('#notify-msg'), !!data.ok, data.message || data.detail || 'failed');
+});
+
 async function loadSnapshots() {
   const res = await fetch('/settings?snapshot=list');
   const data = await res.json();
@@ -712,34 +953,147 @@ async function loadSnapshots() {
   }));
 }
 
-// ── ledger ───────────────────────────────────────────────────────────────────
+// ── Saved Configurations ─────────────────────────────────────────────────────
+// Named config profiles. Save stores the current settings as a JSON file; Load
+// writes that profile into the settings store and reloads the page so the form
+// reflects the new values. Loading does NOT start trading.
 
-const LEDGER_COLUMNS = [
-  'market', 'window', 'ptb', 'signal_twap', 'settlement_twap', 'direction',
-  'locked_trigger', 'buffer', 'intent_id', 'local_order_id', 'venue_order_id',
-  'submission_time', 'fill_time', 'settlement_time', 'order_price', 'fill_price',
-  'quantity', 'filled_quantity', 'remaining_quantity', 'state_display',
-  'rejection_display', 'buffer_status', 'settlement_result', 'pnl', 'notes',
-];
-// Rendered as UTC / IST / ET from the backend's `<key>_display` block rather than
-// reformatted here: one conversion utility server-side, no zone maths in the browser.
-const TIME_COLUMNS = new Set(['submission_time', 'fill_time', 'settlement_time']);
+let savedConfigs = [];
+
+async function loadSavedConfigs() {
+  const res = await fetch('/settings?configs=list');
+  const data = await res.json();
+  savedConfigs = data.configs || [];
+  const host = $('#saved-configs-list');
+  if (!host) return;
+  if (!savedConfigs.length) {
+    host.replaceChildren();
+    const div = document.createElement('div');
+    div.className = 'check';
+    div.innerHTML = '<span>No saved configurations yet.</span>';
+    host.appendChild(div);
+    return;
+  }
+  host.replaceChildren(...savedConfigs.map((c) => {
+    const row = document.createElement('div');
+    row.className = 'check pass';
+    row.style.cursor = 'pointer';
+    row.innerHTML =
+      `<b>${c.name}</b> <span>${c.windows || '—'}</span> <i>${hhmmss(c.modified)}</i>`;
+    row.addEventListener('click', () => {
+      $('#saved-config-name').value = c.name;
+      say($('#saved-configs-msg'), true, `Selected: ${c.name}. Press Load to apply.`);
+    });
+    return row;
+  }));
+}
+
+$('#save-named-config').addEventListener('click', async () => {
+  const name = $('#saved-config-name').value.trim();
+  if (!name) {
+    say($('#saved-configs-msg'), false, 'Enter a name for the configuration.');
+    return;
+  }
+  const { ok, data } = await post('/settings?action=save_config', { name });
+  say($('#saved-configs-msg'), ok,
+      ok ? `Saved configuration "${data.name}".` : (data.detail || 'failed'));
+  if (ok) loadSavedConfigs();
+});
+
+$('#load-named-config').addEventListener('click', async () => {
+  const name = $('#saved-config-name').value.trim();
+  if (!name) {
+    say($('#saved-configs-msg'), false, 'Enter or select a configuration to load.');
+    return;
+  }
+  const { ok, data } = await post('/settings?action=load_config', { name });
+  if (ok) {
+    say($('#saved-configs-msg'), true,
+        `Loaded "${name}". Press START TRADING to apply.`);
+    // Reload so the form rebuilds with the newly loaded values.
+    setTimeout(() => window.location.reload(), 600);
+  } else {
+    say($('#saved-configs-msg'), false, data.detail || 'failed');
+  }
+});
+
+// ── ledger ───────────────────────────────────────────────────────────────────
 
 function dualTime(row, key) {
   const d = row[`${key}_display`];
   if (!d || !d.utc) return '—';
-  // UTC first: it is the value every stored row is keyed on, and the one an
-  // operator pastes back into a query. The two human zones follow it.
   return `${d.utc_display} / ${d.ist} / ${d.et}`;
+}
+
+// §35 columns — slim, human-readable. Full detail lives in the expandable row.
+const LEDGER_COLUMNS = [
+  'intent_id', 'submission_time', 'market', 'window', 'offset_seconds',
+  'direction', 'order_price', 'locked_trigger', 'quantity', 'local_order_id',
+  'fill_price', 'settlement_result', 'pnl', 'state_display',
+];
+
+function ledgerRangeEpochs(preset) {
+  const now = Math.floor(Date.now() / 1000);
+  if (preset === 'today') {
+    const d = new Date(); d.setHours(0, 0, 0, 0);
+    return { since: Math.floor(d.getTime() / 1000), until: null };
+  }
+  if (preset === 'yesterday') {
+    const d = new Date(); d.setDate(d.getDate() - 1); d.setHours(0, 0, 0, 0);
+    const start = Math.floor(d.getTime() / 1000);
+    return { since: start, until: start + 86400 };
+  }
+  if (preset === '7d') return { since: now - 7 * 86400, until: null };
+  if (preset === '30d') return { since: now - 30 * 86400, until: null };
+  return { since: null, until: null };
 }
 
 function ledgerQuery() {
   const p = new URLSearchParams();
-  if ($('#led-q').value.trim()) p.set('q', $('#led-q').value.trim());
-  if ($('#led-dir').value) p.set('direction', $('#led-dir').value);
-  if ($('#led-state').value) p.set('state', $('#led-state').value);
-  if ($('#led-result').value) p.set('result', $('#led-result').value);
+  const q = $('#led-q').value.trim();
+  if (q) p.set('q', q);
+  const side = $('#led-side').value;
+  if (side) p.set('direction', side);
+  const status = $('#led-status').value;
+  if (status) p.set('status', status);
+  const range = ledgerRangeEpochs($('#led-range').value);
+  if (range.since != null) p.set('since', String(range.since));
+  if (range.until != null) p.set('until', String(range.until));
   return p;
+}
+
+// Plain-English explanations from existing record fields. No backend change needed.
+function whyExplanations(r) {
+  const lines = [];
+  // WHY IT OPENED — use the backend-provided buffer status display value directly.
+  if (r.buffer_status === 'SATISFIED') {
+    lines.push(`Opened because buffer was satisfied (${r.window}).`);
+  } else if (r.rejection_display && r.state_display !== 'Submitted') {
+    lines.push(`Did not open: ${r.rejection_display}.`);
+  } else if (r.buffer_status === 'WAITING') {
+    lines.push('Window is still waiting for conditions to evaluate.');
+  }
+  // WHY THIS SIDE — direction is a backend value; we only display it, never assign.
+  // Only meaningful when an order was actually placed (fill exists).
+  if (r.direction && r.fill_price) {
+    lines.push(`Direction ${r.direction} chosen based on majority signal at freeze.`);
+  }
+  // WHY IT FILLED
+  if (r.fill_price && r.filled_quantity) {
+    lines.push(`Filled ${r.filled_quantity} shares at ${r.fill_price} via limit order.`);
+  } else if (r.state_display === 'Submitted') {
+    lines.push('Order submitted but not yet filled.');
+  }
+  // WHY IT SETTLED THIS WAY
+  if (r.settlement_result && r.settlement_result.indexOf('UNRESOLVED') === -1) {
+    const pnlText = r.pnl ? ` P&L: ${r.pnl}.` : '';
+    lines.push(`Settled as ${r.settlement_result}.${pnlText}`);
+  }
+  // Rejection explanation (for actual order rejections, distinct from buffer/direction skips above)
+  if (r.rejection_display && r.state_display === 'Rejected') {
+    lines.push(`Rejection: ${r.rejection_display}`);
+  }
+  return lines.length ? lines.join('\n') : 'No additional context.';
 }
 
 async function loadLedger() {
@@ -749,16 +1103,71 @@ async function loadLedger() {
   const csv = new URLSearchParams(p); csv.set('format', 'csv');
   $('#led-csv').href = `/history?${csv}`;
 
+  // Summary row (§35)
+  const t = data.totals || {};
+  const paper = state?.paper;
+  const summaryEl = $('#ledger-summary');
+  if (summaryEl) {
+    summaryEl.innerHTML = `
+      <div><span class="lbl">Total Trades</span><b>${text(t.filled_orders)}</b></div>
+      <div><span class="lbl">Wins</span><b class="yes">${text(t.win_count)}</b></div>
+      <div><span class="lbl">Losses</span><b class="no">${text(t.loss_count)}</b></div>
+      <div><span class="lbl">Skipped</span><b>${text(t.buffer_not_satisfied)}</b></div>
+      <div><span class="lbl">Rejected</span><b>${text(t.rejected_orders)}</b></div>
+      <div><span class="lbl">Markets</span><b>${text(t.markets_processed)}</b></div>
+      ${paper ? `<div><span class="lbl">Paper P&amp;L</span><b>${text(paper.realized_pnl)}</b></div>` : ''}
+    `;
+  }
+
   $('#ledger-table tbody').replaceChildren(...(data.records || []).map((r) => {
     const tr = document.createElement('tr');
-    // Rejection reason is a SEPARATE column from state, deliberately: "Rejected"
-    // without POST_ONLY_WOULD_CROSS beside it is a state with no explanation.
     tr.className = (r.state_display || '').toLowerCase().replace(/\s+/g, '-');
+    tr.style.cursor = 'pointer';
     for (const key of LEDGER_COLUMNS) {
       const td = document.createElement('td');
-      td.textContent = TIME_COLUMNS.has(key) ? dualTime(r, key) : text(r[key]);
+      if (key === 'submission_time') {
+        td.textContent = dualTime(r, 'submission_time');
+      } else if (key === 'offset_seconds') {
+        td.textContent = `${r.offset_seconds}s`;
+      } else {
+        td.textContent = text(r[key]);
+      }
       tr.append(td);
     }
+    // Expandable detail row (§35)
+    tr.addEventListener('click', () => {
+      const next = tr.nextElementSibling;
+      if (next && next.classList.contains('ledger-detail')) {
+        next.remove();
+        return;
+      }
+      const detail = document.createElement('tr');
+      detail.className = 'ledger-detail';
+      const td = document.createElement('td');
+      td.colSpan = LEDGER_COLUMNS.length;
+      const ids = [
+        r.intent_id && `Intent: ${r.intent_id}`,
+        r.trace_id && `Trace: ${r.trace_id}`,
+        r.local_order_id && `Local Order: ${r.local_order_id}`,
+        r.venue_order_id && `Venue Order: ${r.venue_order_id}`,
+      ].filter(Boolean).join(' · ');
+      const times = [
+        r.submission_time_display?.utc_display && `Submitted UTC: ${r.submission_time_display.utc_display}`,
+        r.fill_time_display?.utc_display && `Filled UTC: ${r.fill_time_display.utc_display}`,
+        r.settlement_time_display?.utc_display && `Settled UTC: ${r.settlement_time_display.utc_display}`,
+        r.ptb && `PTB: ${r.ptb}`,
+        r.signal_twap && `Signal TWAP: ${r.signal_twap}`,
+        r.settlement_twap && `Settlement TWAP: ${r.settlement_twap}`,
+        r.buffer && `Buffer: ${r.buffer}`,
+      ].filter(Boolean).join(' · ');
+      td.innerHTML = `<div class="ledger-detail-inner">
+        <div class="ids">${ids}</div>
+        <div class="times">${times}</div>
+        <pre class="why">${whyExplanations(r)}</pre>
+      </div>`;
+      detail.append(td);
+      tr.after(detail);
+    });
     return tr;
   }));
 }
@@ -858,31 +1267,59 @@ $('#bt-go').addEventListener('click', async () => {
   drawBacktest(data);
 });
 
-// ── order book ───────────────────────────────────────────────────────────────
-
-$('#book-go').addEventListener('click', async () => {
-  const res = await fetch(`/orderbook?direction=${$('#book-dir').value}`);
-  const data = await res.json();
-  const host = $('#book');
-  host.replaceChildren();
-  const rows = res.ok
-    ? { Market: data.market, Direction: data.direction, 'Best Bid': data.best_bid,
-        'Current Passive Limit Price': data.passive_limit, 'Tick Size': data.tick_size }
-    : { Error: data.detail };
-  for (const [k, v] of Object.entries(rows)) {
-    const dt = document.createElement('dt'); dt.textContent = k;
-    const dd = document.createElement('dd'); dd.textContent = text(v);
-    host.append(dt, dd);
-  }
-});
-
 // ── workspaces ───────────────────────────────────────────────────────────────
 
 function show(name) {
   $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.ws === name));
   $$('.ws').forEach((w) => w.classList.toggle('active', w.id === `ws-${name}`));
   if (name === 'ledger') loadLedger();
-  if (name === 'system') loadSnapshots();
+  if (name === 'analytics') { loadSnapshots(); loadPerformance(); }
+  if (name === 'system') { loadSnapshots(); }
+  if (name === 'tank') loadBook();
+}
+
+// §49 Order Book panel. Fetched on tab open so the operator sees what the engine
+// would join at this instant, not a stale value from a prior frame. Two calls
+// because UP and DOWN are separate books on Polymarket.
+async function loadBook() {
+  const fill = (id, val) => { const el = $(id); if (el) el.textContent = text(val); };
+  try {
+    const [up, down] = await Promise.all([
+      fetch('/orderbook?direction=UP').then(r => r.ok ? r.json() : {}),
+      fetch('/orderbook?direction=DOWN').then(r => r.ok ? r.json() : {}),
+    ]);
+    fill('#book-up-bid', up.best_bid);
+    fill('#book-up-limit', up.passive_limit);
+    fill('#book-down-bid', down.best_bid);
+    fill('#book-down-limit', down.passive_limit);
+    fill('#book-tick', up.tick_size || down.tick_size);
+  } catch (_) { /* silent: book is informational, not operational */ }
+}
+
+// ── performance panel ────────────────────────────────────────────────────────
+// Reads /history for totals that the wallet payload doesn't expose (skips,
+// fills, rejected, average fill latency). Win rate is computed here from
+// server-provided integers only — no float arithmetic on business values.
+async function loadPerformance() {
+  try {
+    const res = await fetch('/history');
+    const data = await res.json();
+    const t = data.totals || {};
+    $('#an-skips').textContent = text(t.buffer_not_satisfied);
+    $('#an-filled').textContent = text(t.filled_orders);
+    $('#an-rejected').textContent = text(t.rejected_orders);
+    $('#an-fill-latency').textContent = t.average_fill_seconds != null
+      ? `${t.average_fill_seconds}s` : '—';
+    // §47 extended analytics. All values pre-computed on the backend; no
+    // arithmetic here because the UI blindness contract forbids it.
+    $('#an-total-trades').textContent = text(t.total_trades);
+    $('#an-realized-pnl').textContent = text(t.realized_pnl);
+    $('#an-avg-trade').textContent = text(t.average_trade_pnl);
+    $('#an-up-side').textContent = t.up_wins != null && t.up_losses != null
+      ? `${text(t.up_wins)} / ${text(t.up_losses)}` : '—';
+    $('#an-down-side').textContent = t.down_wins != null && t.down_losses != null
+      ? `${text(t.down_wins)} / ${text(t.down_losses)}` : '—';
+  } catch (e) { /* silent: wallet bindings still render */ }
 }
 
 $$('.tab').forEach((t) => t.addEventListener('click', () => show(t.dataset.ws)));
@@ -907,12 +1344,8 @@ $$('.jump').forEach((el) => el.addEventListener('click', () => {
 fetch('/status').then((r) => r.json()).then((doc) => {
   state = doc;
   paint();
-  const sel = $('#led-state');
-  Object.keys(doc.execution.orders_by_state || {}).forEach((s) => {
-    const opt = document.createElement('option');
-    opt.textContent = s;
-    sel.append(opt);
-  });
+  // Load saved configs on initial page load
+  loadSavedConfigs();
 }).catch(() => setLive(false));
 
 connect();

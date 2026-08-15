@@ -297,6 +297,14 @@ class LiveExecutor:
         # cannot silently make ARC join the worst price on the book.
         return max(level.price for level in book.bids)
 
+    def mark_price(self, market_slug: str, direction: Direction) -> Decimal | None:
+        """Synchronous mark. The live book is only ever reachable over the wire,
+        so there is no cached value to read without an await — marking a live
+        position from a synchronous payload builder returns None and the card shows
+        the figure as unavailable rather than blocking the whole status document on
+        one round-trip. The paper executor reads its in-memory book directly."""
+        return None
+
     @staticmethod
     async def _drain(paginator: Any) -> list[Any]:
         """Read a paginator to the end. A partial page is never a whole answer.

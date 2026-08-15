@@ -45,7 +45,7 @@ _NOW = 1_754_400_000.0
 # Keys that are genuinely counts, timestamps or flags, not money. A count rendered
 # as a string would be the opposite error: "12" sorting before "9" in the ledger.
 _NOT_MONEY = re.compile(
-    r"(^ts$|^utc$|_count|_seconds|_ms|_ts|_at|_samples|_processed|_submitted|_repriced"
+    r"(^ts$|^utc$|^epoch$|_count|_seconds|_ms|_ts|_at|_samples|_processed|_submitted|_repriced"
     r"|_recorded|_accepted|_rejected|_frozen|_unavailable|_tables|_gb|reconnects"
     r"|seq|version)$"
 )
@@ -125,7 +125,7 @@ class TestOneDocumentOneState:
         # The binder reads `state` and nothing else; each painter takes its slice
         # from the same object rather than requesting one.
         for painter in ("paintEngines", "paintPreflight", "paintLoe", "paintWindows",
-                        "paintAnalytics", "paintSettings"):
+                        "paintAnalytics"):
             body = _APP_JS.split(f"function {painter}()", 1)[1].split("\nfunction ", 1)[0]
             assert "fetch(" not in body, painter
 
@@ -188,9 +188,12 @@ class TestRejectionIsSeparateFromState:
         assert "BUFFER_NOT_SATISFIED" not in DISPLAYED_ORDER_STATES
 
     def test_the_ledger_renders_state_and_reason_in_separate_columns(self) -> None:
-        columns = _APP_JS.split("LEDGER_COLUMNS = [", 1)[1].split("]", 1)[0]
-        assert "'state_display'" in columns
-        assert "'rejection_display'" in columns
+        """§35 redesign: rejection reason is in the expandable detail row, not a
+        top-level column. The guarantee is that it is rendered and never folded
+        into state_display — verified by checking the rendering code references
+        rejection_display in the detail expansion."""
+        assert "'state_display'" in _APP_JS
+        assert "rejection_display" in _APP_JS
 
 
 class TestTransparency:

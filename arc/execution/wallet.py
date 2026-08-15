@@ -29,7 +29,9 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only
     from polymarket import AsyncSecureClient
 
 __all__ = [
+    "STATUS_CONNECTED",
     "STATUS_DISCONNECTED",
+    "STATUS_PAPER",
     "LedgerStats",
     "LiveWallet",
     "PaperWallet",
@@ -48,8 +50,9 @@ _COLLATERAL_DECIMALS: Final[Decimal] = Decimal(10) ** 6
 
 _DAY_SECONDS: Final[float] = 86400.0
 
-_STATUS_CONNECTED: Final[str] = "CONNECTED"
-_STATUS_PAPER: Final[str] = "PAPER (no venue account)"
+# Public because the System page renders them: one spelling, in one place.
+STATUS_CONNECTED: Final[str] = "CONNECTED"
+STATUS_PAPER: Final[str] = "PAPER (no venue account)"
 # Public because the risk engine's wallet gate compares against it. One spelling,
 # in one place: a second literal elsewhere would silently stop matching the day
 # this string changed, and the gate would pass on a disconnected wallet.
@@ -187,7 +190,7 @@ class PaperWallet:
         pending, open_orders = _pending_value(self._store)
         return WalletSnapshot(
             address="",
-            status=_STATUS_PAPER,
+            status=STATUS_PAPER,
             network="",
             provider=Mode.V1.value,
             credentialed=False,
@@ -226,7 +229,7 @@ class LiveWallet:
         network = self._client.environment.name
         credentialed = self._client.credentials is not None
 
-        status = _STATUS_CONNECTED
+        status = STATUS_CONNECTED
         collateral: Decimal | None = None
         try:
             allowance = await self._client.get_balance_allowance(asset_type="COLLATERAL")

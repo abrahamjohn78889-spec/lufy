@@ -95,6 +95,11 @@ class FillEngine:
 
             # The local order is the authoritative bridge to the logical trade.
             fill.trace_id = order.trace_id
+            # And for identity (final spec §32): a venue-reported fill arrives
+            # with no engine column, so it must inherit the engine of the order
+            # it filled. Without this every MAJORITY fill would be recorded
+            # under the TWAP default, and no MAJORITY fill could ever exist.
+            fill.engine = order.engine
 
             # The database arbitrates novelty, not an in-memory set: a set is empty
             # again after a restart and every historical fill would re-apply,

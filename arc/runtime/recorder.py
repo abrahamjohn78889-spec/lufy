@@ -181,7 +181,10 @@ def audit_market(store: Store, slug: str, *, expected_windows: int) -> MarketRec
     orders = store.orders_for(slug)
     fills = store.fills_for(slug)
     intents = store.intents_for(slug)
-    settlement = store.settlement_for(slug)
+    # Engine-agnostic existence check: settlement_for's default engine is the
+    # legacy name, and MAJORITY rows would never satisfy it.
+    settlements = store.settlements_for(slug)
+    settlement = settlements[0] if settlements else None
 
     # A window that fired is a window that should have produced an intent. Anything
     # weaker (counting every window) would report BUFFER_NOT_SATISFIED as a missing

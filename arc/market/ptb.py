@@ -50,7 +50,6 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Final
 
-from arc.domain.enums import MarketPhase
 from arc.domain.models import MarketInstance
 from arc.domain.money import to_decimal
 from arc.domain.timing import MARKET_DURATION_SECONDS
@@ -259,20 +258,18 @@ def freeze_ptb_for(
     *,
     logger: logging.Logger | None = None,
 ) -> bool:
-    """Freeze the resolved PTB onto the market, or mark it DEAD. Returns success.
+    """Freeze the resolved PTB onto the market. Returns success.
 
-    Freezing goes through MarketInstance.freeze_ptb, which refuses a second call
-    even with an identical value (A11/A12). This function therefore cannot be used
-    to refresh a PTB; calling it twice on the same market raises, which is how a
-    code path that believes it may re-fetch is caught.
+    PTB is display-only (user directive). Missing PTB no longer kills the market;
+    it stays tradable. Freezing goes through MarketInstance.freeze_ptb, which
+    refuses a second call even with an identical value (A11/A12).
     """
     if not resolution.available or resolution.value is None:
-        market.phase = MarketPhase.DEAD
-        market.dead_reason = DEAD_REASON_PTB_UNAVAILABLE
+        # PTB is display-only — never kill the market on missing PTB.
         log_event(
-            logging.ERROR,
-            "PTB Unavailable",
-            f"{market.slug} — no trading this market ({resolution.detail})",
+            logging.INFO,
+            "PTB Not Yet Available",
+            f"{market.slug} — PTB missing but market stays active ({resolution.detail})",
             logger=logger,
         )
         return False

@@ -5,9 +5,9 @@
     arc run --mode=v2    the complete pipeline, live execution
 
 There are TWO runtime modes and no third. V1 is not an observation run and not a
-simulator: market engine, window engine, decision engine, risk engine, limit
-order engine, recovery and dashboard all execute, and the only component that
-differs from V2 is the executor.
+simulator: market engine, MAJORITY engine, risk engine, limit order engine,
+recovery and dashboard all execute, and the only component that differs from V2
+is the executor.
 
 `--mode` is required rather than defaulted. A defaulted mode means one forgotten
 flag is the difference between paper and real money, and the mistake is

@@ -41,14 +41,12 @@ from dataclasses import dataclass
 from typing import Final
 
 from arc.clock import Clock
-from arc.decision.engine import DecisionEngine
 from arc.domain.enums import MarketPhase
 from arc.domain.models import MarketInstance, Observation, TwapAccumulator
 from arc.domain.timing import window_ts_for
 from arc.errors import ObservationRejectedError
 from arc.logging_setup import log_event
 from arc.storage.store import Store
-from arc.windows.engine import WindowEngine, WindowPass
 
 __all__ = ["MAX_LIVE_MARKETS", "MarketRotator", "RotationEvent"]
 
@@ -80,12 +78,10 @@ class MarketRotator:
 
     __slots__ = (
         "_clock",
-        "_decisions",
         "_logger",
         "_offsets",
         "_on_settle",
         "_store",
-        "_windows",
         "closing",
         "current",
         "markets_archived",
@@ -101,8 +97,6 @@ class MarketRotator:
         *,
         offsets: tuple[int, ...],
         on_settle: Callable[[MarketInstance], None] | None = None,
-        windows: WindowEngine | None = None,
-        decisions: DecisionEngine | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._store = store
@@ -112,15 +106,6 @@ class MarketRotator:
         # by the rotation path, which is what keeps N's settlement off N+1's
         # critical path.
         self._on_settle = on_settle
-        # Optional so the rotator remains testable on its own. When absent, rotation
-        # behaves exactly as before and windows are simply never driven — which is
-        # why the observation runtime supplies one.
-        self._windows = windows
-        # Also optional, and for the same reason. When absent, fired windows are
-        # recorded and nothing more — which is exactly the behaviour of every
-        # existing rotator test, so wiring the decision layer in cannot change what
-        # they observe.
-        self._decisions = decisions
         self._logger = logger
         self.current: MarketInstance | None = None
         self.closing: MarketInstance | None = None
@@ -158,7 +143,6 @@ class MarketRotator:
 
         if self.current is not None and self.current.window_ts == window_ts:
             self._reap(now)
-            self._drive_windows(now)
             return RotationEvent()
 
         closed = ""
@@ -178,44 +162,7 @@ class MarketRotator:
 
         opened = self._open(window_ts, now)
         self.assert_at_most_two_live()
-        # Drive the new market's windows on the SAME pass that opened it. A 15s window
-        # of a market the process only reached late — after a stall, or on the first
-        # pass following a restart — is already due at open, and waiting for the next
-        # pass to notice would add a whole loop interval to a latency that is already
-        # behind.
-        self._drive_windows(now)
         return RotationEvent(opened=opened, closed=closed, archived=archived)
-
-    def _drive_windows(self, now: float) -> None:
-        """One level-triggered window pass over the live market. Never scheduled.
-
-        Called on EVERY advance(), including the no-op ones inside a window, which is
-        what makes window activation converge from any starting point: a pass that
-        arrives 200 ms after an activation instant still opens the window on that pass
-        (A12, criteria 1-2).
-
-        Only `current` is driven. The closing market is past close_ts, so every one of
-        its windows has already been expired by _close and none can activate.
-        """
-        if self._windows is None or self.current is None:
-            return
-        result = self._windows.pass_over(self.current, now)
-        self._decide(result, now)
-
-    def _decide(self, result: WindowPass, now: float) -> None:
-        """Hand a completed window pass to the Decision Engine.
-
-        Called only when the pass actually fired something. The engine is idempotent
-        and would refuse a duplicate anyway, but running it on every pass would put a
-        `has_intent` query and a fills scan on the feed path several times a second
-        for markets where nothing has fired — which is most of them, most of the time.
-
-        `now` is forwarded as the intent's created_at only. Nothing in the decision
-        layer reads a clock to decide admissibility (A10/D1).
-        """
-        if self._decisions is None or self.current is None or not result.fired:
-            return
-        self._decisions.decide(self.current, now)
 
     def _open(self, window_ts: int, now: float) -> str:
         """Create and persist market N+1. PTB is NOT frozen here.
@@ -278,21 +225,6 @@ class MarketRotator:
         )
         market.dead_reason = str(row["dead_reason"])
 
-        # Frozen windows come back VERBATIM, including direction and locked_trigger.
-        # Recomputation is impossible from here — restore reads the row and passes it
-        # through, and never consults the signal TWAP, which has moved since the freeze.
-        # A recomputed trigger would differ from the one the window actually locked and
-        # the process would trade a strategy nobody configured (A4, criterion 9).
-        if self._windows is not None:
-            restored = self._windows.restore(market)
-            if restored:
-                log_event(
-                    logging.INFO,
-                    "Windows Restored",
-                    f"{market.slug}  {', '.join(f'{o}s' for o in restored)}",
-                    logger=self._logger,
-                )
-
         try:
             phase = MarketPhase(str(row["phase"]))
         except ValueError:
@@ -320,19 +252,6 @@ class MarketRotator:
             market.slug, market.running_sum, market.observation_count, now
         )
         self._store.save_phase(market.slug, MarketPhase.SETTLING, now)
-        # Every window that never crossed ends here, at NO_SIGNAL. Done at close rather
-        # than left to the next pass because this market stops being `current` on this
-        # very transition and would otherwise never be driven again — leaving windows
-        # PENDING forever, which is the orphaned-window state criterion 19 forbids.
-        if self._windows is not None:
-            expired = self._windows.expire_all(market)
-            if expired:
-                log_event(
-                    logging.INFO,
-                    "Windows Expired",
-                    f"{market.slug}  no signal on {', '.join(f'{o}s' for o in expired)}",
-                    logger=self._logger,
-                )
         log_event(
             logging.INFO,
             "Market Closed",
@@ -343,18 +262,21 @@ class MarketRotator:
         if self._on_settle is not None:
             self._on_settle(market)
 
-    def _reap(self, now: float) -> None:
+    def _reap(self, now: float) -> str:
         """Archive the closing market once it has reached a terminal phase.
 
         Archiving on phase rather than on elapsed time: a market that has not settled
         yet still has a resolution event coming, and dropping it on a timer would
-        lose the outcome the settlement record is for.
+        lose the outcome the settlement record is for. Returns the archived slug,
+        or nothing: the caller that asked for the transition is the one that must
+        clean up after it, since no rotation event carries this archive.
         """
         closing = self.closing
         if closing is None:
-            return
+            return ""
         if closing.phase in (MarketPhase.SETTLED, MarketPhase.DEAD):
-            self._archive(closing, now)
+            return self._archive(closing, now)
+        return ""
 
     def _archive(self, market: MarketInstance, now: float) -> str:
         """Persist, archive, and DROP THE REFERENCE (A11).
@@ -373,17 +295,20 @@ class MarketRotator:
         log_event(logging.INFO, "Market Archived", market.slug, logger=self._logger)
         return market.slug
 
-    def settled(self, slug: str, now: float) -> None:
+    def settled(self, slug: str, now: float) -> str:
         """Called when the venue's resolution event lands. Allows archiving.
 
         Separate from _close so that the outcome always comes from the venue's own
-        event and is never inferred from ARC's TWAP (A12).
+        event and is never inferred from ARC's TWAP (A12). Returns the archived
+        slug if the settlement allowed the closing market to be archived: this
+        path emits no rotation event, so the caller must do the per-market cleanup
+        an archived event would otherwise carry.
         """
         for market in self.live:
             if market.slug == slug:
                 market.phase = MarketPhase.SETTLED
                 self._store.save_phase(slug, MarketPhase.SETTLED, now)
-        self._reap(now)
+        return self._reap(now)
 
     # ── observations ─────────────────────────────────────────────────────────
 
@@ -410,20 +335,3 @@ class MarketRotator:
         else:
             self.observations_dropped += 1
         return tuple(accepted)
-
-    def evaluate_windows(self, now: float) -> None:
-        """Re-evaluate the live market's frozen triggers. Called per accepted observation.
-
-        The signal TWAP only moves when an observation lands, so this is the moment a
-        trigger can newly become satisfied. Evaluating here rather than only once per
-        rotation pass is what makes the check continuous (A12) instead of sampled at
-        whatever cadence the market loop happens to run.
-
-        Synchronous and cheap: at most five windows, two Decimal comparisons each, no
-        I/O unless a window actually fires. It runs on the feed path, so anything
-        blocking here would stall every market and every other window (criteria 11, 17).
-        """
-        if self._windows is None or self.current is None:
-            return
-        result = self._windows.pass_over(self.current, now)
-        self._decide(result, now)

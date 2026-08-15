@@ -20,9 +20,7 @@ from arc.domain.enums import DEFAULT_ENGINE, Direction
 from arc.errors import ConfigInvariantError
 from arc.execution.orders import chain_id_for, new_order, next_generation_id, order_id_for
 from arc.majority.config import (
-    MAJORITY_BUFFER_WINDOW_LIMIT_SECONDS,
     MAJORITY_ENGINE,
-    MAJORITY_LONG_WINDOW_DISABLE_REASON,
     build_majority_config,
 )
 from arc.majority.identity import (
@@ -41,6 +39,7 @@ from arc.majority.state import (
 from arc.majority.trigger import (
     BookSnapshot,
     MajorityOutcome,
+    MajorityVerdict,
     determine_majority,
     is_triggered,
     trigger_value,
@@ -112,41 +111,35 @@ class TestMajorityIsOffUntilItIsConfigured:
         assert build().tradable is True
 
 
-class TestTheLongWindowRuleFailsClosed:
-    """>30s with a non-zero buffer has no approved formula, so it refuses to trade."""
+class TestEveryWindowLengthHasAnApprovedBufferFormula:
+    """The final spec defines the buffer for EVERY window length.
 
-    def test_a_long_window_with_a_buffer_is_disabled_not_fatal(self) -> None:
+    >30s: BTC reference ± buffer become two internal memory triggers and the
+    first one satisfied opens the execution opportunity. <=30s: the buffer
+    enters the TWAP-supported entry calculation. Zero: direct entry. There is
+    no length left without a formula, so the builder never fail-closes a
+    window because of its length.
+    """
+
+    def test_a_long_window_with_a_buffer_is_tradable(self) -> None:
         config = build(majority_execution_windows="45", majority_buffer="1.00")
         assert config.enabled is True
-        assert config.tradable is False
-        assert config.windows_by_offset[0].disable_reason == MAJORITY_LONG_WINDOW_DISABLE_REASON
+        assert config.tradable is True
+        assert config.windows_by_offset[0].disable_reason == ""
 
-    def test_the_reason_is_the_exact_operator_facing_text(self) -> None:
-        config = build(majority_execution_windows="45", majority_buffer="2.50")
-        assert config.windows_by_offset[0].disable_reason == (
-            "MAJORITY DISABLED: Execution windows greater than 30 seconds require an "
-            "approved live-price buffer formula that is not currently defined."
-        )
+    def test_the_limit_itself_is_permitted_with_a_buffer(self) -> None:
+        config = build(majority_execution_windows="30", majority_buffer="1.00")
+        assert config.windows_by_offset[0].disable_reason == ""
 
-    def test_a_long_window_with_a_zero_buffer_is_permitted(self) -> None:
-        """45s/buffer-0 is the approved configuration: no formula is needed."""
+    def test_one_second_past_the_limit_is_permitted_with_a_buffer(self) -> None:
+        config = build(majority_execution_windows="31", majority_buffer="1.00")
+        assert config.windows_by_offset[0].disable_reason == ""
+
+    def test_a_zero_buffer_window_is_permitted_at_any_length(self) -> None:
+        """No buffer mathematics at all: direct entry at the MAJORITY direction."""
         config = build(majority_execution_windows="45", majority_buffer="0")
         assert config.windows_by_offset[0].disable_reason == ""
         assert config.tradable is True
-
-    def test_the_limit_itself_is_permitted_with_a_buffer(self) -> None:
-        config = build(
-            majority_execution_windows=str(MAJORITY_BUFFER_WINDOW_LIMIT_SECONDS),
-            majority_buffer="1.00",
-        )
-        assert config.windows_by_offset[0].disable_reason == ""
-
-    def test_one_second_past_the_limit_is_refused_with_a_buffer(self) -> None:
-        config = build(
-            majority_execution_windows=str(MAJORITY_BUFFER_WINDOW_LIMIT_SECONDS + 1),
-            majority_buffer="1.00",
-        )
-        assert config.windows_by_offset[0].disable_reason == MAJORITY_LONG_WINDOW_DISABLE_REASON
 
 
 class TestConfigurationInvariantsThatWouldTradeWrongly:
@@ -162,10 +155,25 @@ class TestConfigurationInvariantsThatWouldTradeWrongly:
         with pytest.raises(ConfigInvariantError, match="must not be negative"):
             build(majority_buffer="-1")
 
-    @pytest.mark.parametrize("price", ["0", "1", "1.5", "-0.1"])
-    def test_a_trigger_outside_zero_to_one_is_fatal(self, price: str) -> None:
-        with pytest.raises(ConfigInvariantError, match="probabilities"):
+    @pytest.mark.parametrize("price", ["0", "-0.1", "-100"])
+    def test_a_non_positive_trigger_is_fatal_at_any_scale(self, price: str) -> None:
+        with pytest.raises(ConfigInvariantError, match="must be positive"):
             build(majority_trigger_price=price)
+
+    @pytest.mark.parametrize("price", ["0", "-0.1", "-100"])
+    def test_a_non_positive_target_is_fatal_at_any_scale(self, price: str) -> None:
+        with pytest.raises(ConfigInvariantError, match="must be positive"):
+            build(majority_target_limit_price=price)
+
+    def test_btc_denominated_trigger_and_target_are_accepted(self) -> None:
+        """A trigger above 1 is a BTC-PRICE level, not an error."""
+        config = build(
+            majority_trigger_price="65050",
+            majority_target_limit_price="65051",
+            majority_entry_price_min="65040",
+            majority_entry_price_max="65060",
+        )
+        assert config.tradable is True
 
     def test_an_inverted_entry_band_is_fatal(self) -> None:
         with pytest.raises(ConfigInvariantError, match="inverted band"):
@@ -207,7 +215,7 @@ class TestConfigurationIsFrozenAndSerialisable:
     def test_the_config_cannot_be_mutated_after_validation(self) -> None:
         config = build()
         with pytest.raises((AttributeError, TypeError)):
-            config.shares = Decimal("999")  # type: ignore[misc]
+            config.shares = Decimal("999")
 
     def test_storage_round_trip_keeps_every_value(self) -> None:
         stored = build().as_storage_dict()
@@ -544,16 +552,15 @@ class TestMultiWindowConfiguration:
         offsets = [w.execution_window_seconds for w in config.windows_by_offset]
         assert offsets == [3, 15, 45]
 
-    def test_a_long_window_does_not_disable_a_short_one(self) -> None:
-        """A 45s/buffer-1 must fail-closed on the 45s row only, not the 15s row."""
+    def test_a_long_window_never_disables_a_short_one(self) -> None:
+        """The final spec gives every window length a buffer formula, so a
+        15s/buffer-1 and a 45s/buffer-1 pair are BOTH tradable."""
         config = build(majority_execution_windows="15,45", majority_buffer="1.00")
         windows_by_offset = {w.execution_window_seconds: w for w in config.windows_by_offset}
         assert windows_by_offset[15].disable_reason == ""
-        assert windows_by_offset[45].disable_reason == MAJORITY_LONG_WINDOW_DISABLE_REASON
-        # `tradable` is FALSE because at least one window is fail-closed, but the
-        # tradable_windows helper still exposes the 15s window for the engine.
-        assert config.tradable is False
-        assert [w.execution_window_seconds for w in config.tradable_windows] == [15]
+        assert windows_by_offset[45].disable_reason == ""
+        assert config.tradable is True
+        assert [w.execution_window_seconds for w in config.tradable_windows] == [15, 45]
 
     def test_no_windows_means_disabled(self) -> None:
         config = build(majority_enabled="true", majority_execution_windows="")
@@ -640,12 +647,10 @@ class TestPersistentSideLockReconstruction:
             )
 
 
-def _up_verdict():
+def _up_verdict() -> MajorityVerdict:
     """A UP verdict whose majority decision is UP. Used to assert the lock
     refuses a same-side retry, which is the case the test cares about.
     """
-    from arc.majority.trigger import MajorityOutcome, MajorityVerdict
-
     return MajorityVerdict(
         outcome=MajorityOutcome.UP,
         best_bid_up=Decimal("0.85"),

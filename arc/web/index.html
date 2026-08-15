@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <!--
-  ARC Operations Center. Eight workspaces, one WebSocket, no framework.
+  ARC Operations Center. Six workspaces, one WebSocket, no framework.
 
   Every value on this page is rendered from the backend status document by its
   data-f path. There is no arithmetic in this file and none in app.js: Direction,
@@ -10,7 +10,7 @@
   Decimals arrive as STRINGS and are written to the DOM verbatim. Nothing calls
   parseFloat on a price anywhere in this project.
 -->
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -27,9 +27,7 @@
     <button class="tab" data-ws="ledger">LEDGER</button>
     <button class="tab" data-ws="analytics">ANALYTICS</button>
     <button class="tab" data-ws="system">SYSTEM</button>
-    <button class="tab" data-ws="settings">SETTINGS</button>
     <button class="tab" data-ws="backtest">BACKTEST</button>
-    <button class="tab" data-ws="book">ORDER BOOK</button>
   </nav>
   <div id="link" class="link down">DISCONNECTED</div>
 </header>
@@ -48,9 +46,6 @@
     <div class="timer-meta">
       <div class="slug" data-f="market.slug">—</div>
       <div class="sub">next <span data-f="market.next_market">—</span></div>
-      <!-- The wall clocks. Rendered by the backend from the same instant every
-           other value on the deck was built from, so they cannot drift from the
-           data beside them. Never used for any calculation. -->
       <div class="sub clocks">
         IST <span data-f="clocks.ist">—</span>
         · ET <span data-f="clocks.et">—</span>
@@ -67,115 +62,267 @@
     </div>
   </section>
 
-  <div class="grid">
+  <!-- §21: two-column layout. Timer stays full-width at top. LEFT column holds
+       operational panels; RIGHT column holds MAJORITY engine and config. -->
+  <div class="ops-columns">
 
+    <!-- ── LEFT COLUMN ─────────────────────────────────────────────────────── -->
+    <div class="ops-col ops-left">
+
+      <section class="panel span-full">
+        <h2>Runtime Control</h2>
+        <div class="mode-row">
+          <button class="mode" id="mode-v1" data-mode="V1">V1 · PAPER</button>
+          <button class="mode" id="mode-v2" data-mode="V2">V2 · LIVE</button>
+        </div>
+        <p class="note">Select a runtime, then START RUNTIME. Runtime running is not trading running.</p>
+        <div class="controls">
+          <button class="big go" id="runtime-start">START RUNTIME</button>
+          <button class="big stop" id="runtime-stop" data-post="/stop">STOP RUNTIME</button>
+        </div>
+        <div id="control-msg" class="msg"></div>
+      </section>
+
+      <section class="panel span-full">
+        <h2>Preflight <span class="pill" data-f="preflight.result">—</span></h2>
+        <div class="kv"><span>Runtime Verification</span><b data-f="preflight.ready" data-flag>—</b></div>
+        <div id="preflight" class="checks"></div>
+      </section>
+
+      <!-- §19: Running TWAP enriched with Current BTC, Difference, Age, update status.
+           Data source for MAJORITY, not a trading engine. -->
+      <section class="panel span-full">
+        <h2>Running TWAP</h2>
+        <div class="big-values">
+          <div><span class="lbl">Running Signal TWAP</span><b data-f="market.signal_twap">—</b></div>
+          <div><span class="lbl">Settlement TWAP (official 30s)</span><b data-f="market.settlement_twap">—</b></div>
+          <div><span class="lbl">Current BTC Price</span><b data-f="market.btc_price">—</b></div>
+          <div><span class="lbl">Signal − Settlement Difference</span><b data-f="market.signal_settlement_diff">—</b></div>
+          <div><span class="lbl">Feed Age</span><b data-f="runtime.feed_age_ms" data-ms>—</b></div>
+          <div><span class="lbl">Observations</span><b data-f="market.observation_count">0</b></div>
+          <div><span class="lbl">Frozen PTB</span><b data-f="market.ptb">—</b></div>
+          <div><span class="lbl">Frozen Direction</span><b data-f="derived.frozen_direction">—</b></div>
+          <div><span class="lbl">Locked Trigger</span><b data-f="derived.locked_trigger">—</b></div>
+          <div><span class="lbl">Active Window</span><b data-f="derived.current_window">—</b></div>
+          <div><span class="lbl">Configured Buffer</span><b data-f="derived.buffer">—</b></div>
+        </div>
+        <p class="note">Frozen values never change. Feed age shows how stale the latest observation is.</p>
+      </section>
+
+      <!-- Limit Order Engine lifecycle — the stages MAJORITY moves through. -->
+      <section class="panel span-full">
+        <h2>Limit Order Engine</h2>
+        <ol id="loe" class="lifecycle">
+          <li data-stage="WAITING_FOR_WINDOW">Waiting For Window</li>
+          <li data-stage="WINDOW_OPEN">Window Open</li>
+          <li data-stage="VALUES_FROZEN">Values Frozen</li>
+          <li data-stage="INTENT_CREATED">ExecutionIntent Created</li>
+          <li data-stage="ORDER_SUBMITTED">Order Submitted</li>
+          <li data-stage="WAITING_FOR_FILL">Waiting For Fill</li>
+          <li data-stage="FILLED">Filled</li>
+          <li data-stage="BUFFER_NOT_SATISFIED">BUFFER_NOT_SATISFIED</li>
+          <li data-stage="SETTLEMENT">Settlement</li>
+        </ol>
+        <div id="windows" class="windows"></div>
+      </section>
+
+      <!-- ── WALLET / BALANCE ─────────────────────────────────────────────── -->
+      <section class="panel span-full">
+        <h2>Wallet</h2>
+        <div class="wallet">
+          <dl class="kv">
+            <dt>Address</dt><dd data-f="wallet.address">—</dd>
+            <dt>Status</dt><dd data-f="wallet.status">—</dd>
+            <dt>Network</dt><dd data-f="wallet.network">—</dd>
+            <dt>Provider</dt><dd data-f="wallet.provider">—</dd>
+            <dt>Credentialed</dt><dd data-f="wallet.credentialed" data-flag>—</dd>
+          </dl>
+          <dl class="kv">
+            <dt>Available Balance</dt><dd data-f="wallet.available_balance">—</dd>
+            <dt>Reserved</dt><dd data-f="wallet.reserved_balance">—</dd>
+            <dt>In Open Positions</dt><dd data-f="wallet.balance_in_open_positions">—</dd>
+            <dt>Buying Power</dt><dd data-f="wallet.buying_power">—</dd>
+            <dt>Total Account Value</dt><dd data-f="wallet.total_account_value">—</dd>
+          </dl>
+          <dl class="kv">
+            <dt>Current Exposure</dt><dd data-f="wallet.current_exposure">—</dd>
+            <dt>Position Value</dt><dd data-f="wallet.current_position_value">—</dd>
+            <dt>Pending Position Value</dt><dd data-f="wallet.pending_position_value">—</dd>
+            <dt>Open Positions</dt><dd data-f="wallet.open_position_count">—</dd>
+            <dt>Unrealized P/L</dt><dd data-f="wallet.unrealized_pnl">—</dd>
+          </dl>
+          <dl class="kv">
+            <dt>Realized Today</dt><dd data-f="wallet.realized_today">—</dd>
+            <dt>Realized This Run</dt><dd data-f="wallet.realized_run">—</dd>
+            <dt>Realized Lifetime</dt><dd data-f="wallet.realized_lifetime">—</dd>
+            <dt>Wins</dt><dd data-f="wallet.wins">—</dd>
+            <dt>Losses</dt><dd data-f="wallet.losses">—</dd>
+            <dt>Markets Settled</dt><dd data-f="wallet.markets_settled">—</dd>
+          </dl>
+        </div>
+      </section>
+
+      <!-- ── V1 PAPER BANKROLL (§33) ─────────────────────────────────────── -->
+      <!-- Visible only in V1; null in V2 where real funds answer through the
+           Wallet block above. The arithmetic lives in arc.runtime.paper_account;
+           this panel only renders what the status document already computed. -->
+      <section class="panel span-full" id="paper-panel">
+        <h2>Paper Bankroll (V1)</h2>
+        <div class="wallet">
+          <dl class="kv">
+            <dt>Starting Balance</dt><dd data-f="paper.start_balance">—</dd>
+            <dt>Balance</dt><dd data-f="paper.balance">—</dd>
+            <dt>Available</dt><dd data-f="paper.available">—</dd>
+            <dt>Committed</dt><dd data-f="paper.committed">—</dd>
+          </dl>
+          <dl class="kv">
+            <dt>Realized P&amp;L</dt><dd data-f="paper.realized_pnl">—</dd>
+            <dt>Unrealized P&amp;L</dt><dd data-f="paper.unrealized_pnl">—</dd>
+            <dt>Wins</dt><dd data-f="paper.wins">—</dd>
+            <dt>Losses</dt><dd data-f="paper.losses">—</dd>
+          </dl>
+          <dl class="kv">
+            <dt>Total Trades</dt><dd data-f="paper.total_trades">—</dd>
+            <dt>Open Trades</dt><dd data-f="paper.open_trades">—</dd>
+            <dt>Skipped Windows</dt><dd data-f="paper.skipped">—</dd>
+            <dt>Editable</dt><dd data-f="paper.editable" data-flag>—</dd>
+          </dl>
+        </div>
+        <div class="paper-controls">
+          <label class="field">
+            <span>Starting Bankroll</span>
+            <input type="text" id="paper-start-input" placeholder="e.g. 100" autocomplete="off">
+          </label>
+          <button id="paper-set-start">SET STARTING BALANCE</button>
+          <button id="paper-reset" class="danger">RESET PAPER ACCOUNT</button>
+          <div id="paper-msg" class="msg"></div>
+        </div>
+      </section>
+
+      <!-- Gate 19's own arithmetic, beside the wallet it reads. -->
+      <section class="panel span-full">
+        <h2>Balance Check (G19)</h2>
+        <dl class="kv">
+          <dt>Available</dt><dd data-f="balance.available">—</dd>
+          <dt>Required</dt><dd data-f="balance.required">—</dd>
+          <dt>Difference</dt><dd data-f="balance.difference">—</dd>
+          <dt>Sufficient</dt><dd data-f="balance.sufficient" data-flag>—</dd>
+          <dt>Last Refresh</dt><dd data-f="balance.last_refresh" data-time>—</dd>
+          <dt>Refresh Age</dt><dd data-f="balance.refresh_age_ms" data-ms>—</dd>
+        </dl>
+      </section>
+
+    </div>
+
+    <!-- ── RIGHT COLUMN ────────────────────────────────────────────────────── -->
+    <div class="ops-col ops-right">
+
+      <!-- ── MAJORITY ENGINE — TOP / PRIMARY AREA OF OPS DECK ─────────────── -->
+      <section class="panel span-full majority-panel">
+        <h2>MAJORITY Engine <span class="pill" data-f="majority.state">—</span></h2>
+        <dl class="kv">
+          <dt>Status</dt><dd data-f="runtime.status">—</dd>
+          <dt>Mode</dt><dd id="majority-mode">—</dd>
+          <dt>Enabled</dt><dd data-f="majority.config.enabled">—</dd>
+          <dt>Tradable</dt><dd data-f="majority.config.tradable">—</dd>
+          <dt>Disable Reason</dt><dd data-f="majority.config.disable_reason">—</dd>
+          <dt>Current Market</dt><dd data-f="market.slug">—</dd>
+          <dt>Current Window</dt><dd data-f="derived.current_window">—</dd>
+          <dt>Countdown</dt><dd id="timer3" data-countdown>--:--</dd>
+          <dt>MAJORITY Direction</dt><dd data-f="majority.selected_side">—</dd>
+          <dt>Entry State</dt><dd data-f="majority.state">—</dd>
+          <dt>Order State</dt><dd data-f="derived.loe_stage">—</dd>
+          <dt>Unrealized P&amp;L</dt><dd data-f="wallet.unrealized_pnl">—</dd>
+          <dt>Realized P&amp;L (Run)</dt><dd data-f="wallet.realized_run">—</dd>
+        </dl>
+
+        <div class="controls majority-controls">
+          <button class="big go" id="majority-start">START TRADING</button>
+          <button class="big" id="majority-pause" data-post="/pause">PAUSE TRADING</button>
+          <button class="big" id="majority-resume" data-post="/resume">RESUME TRADING</button>
+          <button class="big stop" id="majority-stop"
+                  data-post="/strategies/MAJORITY/config?action=disarm">
+            STOP TRADING
+          </button>
+        </div>
+        <div id="majority-msg" class="msg"></div>
+
+        <table class="stream" id="majority-windows">
+          <thead><tr>
+            <th>Window</th><th>Trigger</th><th>Target</th><th>Shares</th>
+            <th>Band</th><th>State</th><th>Side</th><th>Verdict</th>
+            <th>Trigger UP</th><th>Trigger DOWN</th>
+            <th>Decision UP</th><th>Decision DOWN</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+        <p class="note">The side is chosen from the DECISION book, which is a second
+          read taken after the trigger fired. INDETERMINATE is never tie-broken.</p>
+      </section>
+
+      <!-- ── ACTIVE LIMIT ORDERS ──────────────────────────────────────────── -->
+      <section class="panel span-full">
+        <h2>Active Limit Orders</h2>
+        <div id="active-orders" class="checks"></div>
+        <div class="controls" style="margin-top: 12px;">
+          <button class="big emergency-close" id="emergency-close-all">
+            EMERGENCY CLOSE ALL TRADES
+          </button>
+        </div>
+        <div id="close-msg" class="msg"></div>
+        <p class="note">Operator-only action. Requires confirmation. Never auto-invoked.</p>
+      </section>
+
+      <!-- ── MAJORITY CONFIGURATION ───────────────────────────────────────── -->
+      <section class="panel span-full majority-config-panel">
+        <h2>MAJORITY Configuration <span class="pill" id="lock-pill">—</span></h2>
+        <p class="note">Locked while trading is armed: Stop Trading → Edit → Start Trading.</p>
+        <div id="majority-editable"></div>
+        <div class="controls">
+          <button id="save-majority-config">Save Configuration</button>
+        </div>
+        <div id="majority-config-msg" class="msg"></div>
+      </section>
+
+      <!-- ── SAVED CONFIGURATIONS ─────────────────────────────────────────── -->
+      <section class="panel span-full majority-config-panel">
+        <h2>Saved Configurations</h2>
+        <p class="note">Loading populates the form but does not start trading — press START TRADING to apply.</p>
+        <div class="controls">
+          <input id="saved-config-name" type="text" placeholder="config name (e.g. aggressive)"
+                 style="flex: 1; min-width: 180px;">
+          <button id="save-named-config">Save Current Config</button>
+          <button id="load-named-config">Load Selected Config</button>
+        </div>
+        <div id="saved-configs-msg" class="msg"></div>
+        <div id="saved-configs-list" class="checks" style="margin-top: 8px;"></div>
+      </section>
+
+    </div>
+  </div>
+
+  <!-- Remaining operational panels below the two-column layout -->
+  <div class="grid">
     <section class="panel span2">
       <h2>Runtime</h2>
       <dl class="kv">
-        <dt>Runtime Status</dt><dd data-f="runtime.status">—</dd>
+        <dt>Status</dt><dd data-f="runtime.status">—</dd>
         <dt>Current Market</dt><dd data-f="market.slug">—</dd>
         <dt>Next Market</dt><dd data-f="market.next_market">—</dd>
         <dt>Market Phase</dt><dd data-f="market.phase">—</dd>
         <dt>Current Window</dt><dd data-f="derived.current_window">—</dd>
-        <dt>Current Strategy</dt><dd data-f="settings.strategy">—</dd>
-        <dt>Current Provider</dt><dd data-f="settings.provider">—</dd>
-        <dt>Trading Enabled</dt><dd data-f="runtime.trading_enabled" data-flag>—</dd>
-        <dt>Execution Armed</dt><dd data-f="runtime.execution_armed" data-flag>—</dd>
+        <dt>Strategy</dt><dd data-f="settings.strategy">—</dd>
+        <dt>Data Provider</dt><dd data-f="settings.provider">—</dd>
+        <dt>Trading Allowed</dt><dd data-f="runtime.trading_enabled" data-flag>—</dd>
+        <dt>Order Execution Active</dt><dd data-f="runtime.execution_armed" data-flag>—</dd>
         <dt>Paused</dt><dd data-f="runtime.paused" data-flag>—</dd>
-        <dt>Disable Reason</dt><dd data-f="runtime.disable_reason">—</dd>
+        <dt>Why Trading Is Off</dt><dd data-f="runtime.disable_reason">—</dd>
       </dl>
     </section>
 
     <section class="panel span2">
       <h2>Engines</h2>
       <div id="engines" class="engines"></div>
-    </section>
-
-    <!-- Runtime and trading, displayed as the two separate acts they are. Starting
-         the runtime brings up feeds, CLOB, engines and recovery and arms nothing;
-         trading is the operator's own button afterwards. One combined control
-         would make looking at the system the same act as trading with it. -->
-    <section class="panel span2">
-      <h2>Runtime Control</h2>
-      <div class="mode-row">
-        <button class="mode" id="mode-v1" data-mode="V1">V1 · PAPER</button>
-        <button class="mode" id="mode-v2" data-mode="V2">V2 · LIVE</button>
-      </div>
-      <p class="note">
-        Select a runtime, then START RUNTIME. The two can never run at once — starting
-        one stops the other. Runtime running is not trading running.
-      </p>
-      <div class="controls">
-        <button class="big go" id="runtime-start">START RUNTIME</button>
-        <button class="big stop" id="runtime-stop" data-post="/stop">STOP RUNTIME</button>
-      </div>
-      <div id="control-msg" class="msg"></div>
-    </section>
-
-    <section class="panel span2">
-      <h2>Trading Control (Limit Order Engine)</h2>
-      <p class="note">
-        The Limit Order Engine's own gate. Configure buffers, windows and submission
-        count on the Settings page first; START TRADING opens the operator gate and
-        nothing else. PAUSE holds new ExecutionIntents while resting orders continue
-        to be managed. STOP TRADING disarms; every feed, accumulator and recovery
-        service keeps running.
-      </p>
-      <div class="controls">
-        <button class="big go" data-post="/strategies/arc_twap_locked_buffer/config?action=arm">
-          START TRADING
-        </button>
-        <button class="big" data-post="/pause">PAUSE TRADING</button>
-        <button class="big" data-post="/resume">RESUME TRADING</button>
-        <button class="big stop"
-                data-post="/strategies/arc_twap_locked_buffer/config?action=disarm">
-          STOP TRADING
-        </button>
-      </div>
-      <div id="trading-msg" class="msg"></div>
-    </section>
-
-    <section class="panel span2">
-      <h2>Preflight <span class="pill" data-f="preflight.result">—</span></h2>
-      <!-- READY is derived, never a runtime status: the status set is exactly the
-           five the contract names, and a sixth would be a second answer to "is it
-           running". This says the fifteen subsystems are up. -->
-      <div class="kv"><span>Runtime Verification</span><b data-f="preflight.ready" data-flag>—</b></div>
-      <div id="preflight" class="checks"></div>
-    </section>
-
-    <!-- The three quantities that must never be conflated, side by side. -->
-    <section class="panel span3">
-      <h2>Running TWAP</h2>
-      <div class="big-values">
-        <div><span class="lbl">Running Signal TWAP</span><b data-f="market.signal_twap">—</b></div>
-        <div><span class="lbl">Settlement TWAP (official 30s, live)</span>
-             <b data-f="market.settlement_twap">—</b></div>
-        <div><span class="lbl">Frozen PTB</span><b data-f="market.ptb">—</b></div>
-        <div><span class="lbl">Frozen Direction</span><b data-f="derived.frozen_direction">—</b></div>
-        <div><span class="lbl">Locked Trigger</span><b data-f="derived.locked_trigger">—</b></div>
-        <div><span class="lbl">Active Window</span><b data-f="derived.current_window">—</b></div>
-        <div><span class="lbl">Configured Buffer</span><b data-f="derived.buffer">—</b></div>
-      </div>
-      <p class="note">Frozen values never change. Observations
-        <span data-f="market.observation_count">0</span>.</p>
-    </section>
-
-    <!-- Largest panel on the deck: the operator's primary control surface. -->
-    <section class="panel span3">
-      <h2>Limit Order Engine</h2>
-      <ol id="loe" class="lifecycle">
-        <li data-stage="WAITING_FOR_WINDOW">Waiting For Window</li>
-        <li data-stage="WINDOW_OPEN">Window Open</li>
-        <li data-stage="VALUES_FROZEN">Values Frozen</li>
-        <li data-stage="INTENT_CREATED">ExecutionIntent Created</li>
-        <li data-stage="ORDER_SUBMITTED">Order Submitted</li>
-        <li data-stage="WAITING_FOR_FILL">Waiting For Fill</li>
-        <li data-stage="FILLED">Filled</li>
-        <li data-stage="BUFFER_NOT_SATISFIED">BUFFER_NOT_SATISFIED</li>
-        <li data-stage="SETTLEMENT">Settlement</li>
-      </ol>
-      <div id="windows" class="windows"></div>
     </section>
 
     <section class="panel span2">
@@ -190,44 +337,6 @@
         <dt>Closing Market</dt><dd data-f="market.closing.slug">—</dd>
         <dt>Closing Settlement TWAP</dt><dd data-f="market.closing.settlement_twap">—</dd>
       </dl>
-    </section>
-
-    <!-- The SECOND engine. Its own panel rather than extra rows on the TWAP panels:
-         MAJORITY shares this process and nothing else with TWAP — not its trigger,
-         not its selected side, not its orders — and interleaving the two would
-         invite reading one engine's number as the other's.
-
-         Both books are shown because the two-step rule is the whole point. The
-         trigger read is why the sequence started; the DECISION read is what the
-         side was chosen from, and it is a different read taken at a later instant.
-         A panel showing one book would make the operator believe the side came
-         from the bids that crossed the threshold. -->
-    <section class="panel span2">
-      <h2>MAJORITY Engine <span class="pill" data-f="majority.state">—</span></h2>
-      <dl class="kv">
-        <dt>Enabled</dt><dd data-f="majority.config.enabled">—</dd>
-        <dt>Tradable</dt><dd data-f="majority.config.tradable">—</dd>
-        <dt>Disable Reason</dt><dd data-f="majority.config.disable_reason">—</dd>
-        <dt>Market</dt><dd data-f="majority.market_slug">—</dd>
-      </dl>
-      <table class="stream" id="majority-windows">
-        <thead><tr>
-          <th>Window</th><th>Trigger</th><th>Target</th><th>Shares</th>
-          <th>Band</th><th>State</th><th>Side</th><th>Verdict</th>
-          <th>Trigger UP</th><th>Trigger DOWN</th>
-          <th>Decision UP</th><th>Decision DOWN</th>
-        </tr></thead>
-        <tbody>
-          <!-- one row per configured MAJORITY window, populated from
-               majority.config.windows (the configuration) and
-               majority.states_by_window (the live state). An empty table means
-               MAJORITY has no windows configured; the panel still reads as
-               honest OFF rather than a blank error. -->
-        </tbody>
-      </table>
-      <p class="note">The side is chosen from the DECISION book, which is a second
-        read taken after the trigger fired. The side that crossed the trigger is not
-        necessarily the side bought. INDETERMINATE is never tie-broken.</p>
     </section>
 
     <section class="panel span2">
@@ -301,59 +410,6 @@
         <dt>Spec Status</dt><dd data-f="runtime.spec_status">—</dd>
       </dl>
     </section>
-
-    <!-- Bottom of the deck, per spec. Every UNAVAILABLE is literal: a blank here
-         reads as zero to an operator sizing a position. -->
-    <section class="panel span4">
-      <h2>Wallet</h2>
-      <div class="wallet">
-        <dl class="kv">
-          <dt>Address</dt><dd data-f="wallet.address">—</dd>
-          <dt>Status</dt><dd data-f="wallet.status">—</dd>
-          <dt>Network</dt><dd data-f="wallet.network">—</dd>
-          <dt>Provider</dt><dd data-f="wallet.provider">—</dd>
-          <dt>Credentialed</dt><dd data-f="wallet.credentialed" data-flag>—</dd>
-        </dl>
-        <dl class="kv">
-          <dt>Available Balance</dt><dd data-f="wallet.available_balance">—</dd>
-          <dt>Reserved</dt><dd data-f="wallet.reserved_balance">—</dd>
-          <dt>In Open Positions</dt><dd data-f="wallet.balance_in_open_positions">—</dd>
-          <dt>Buying Power</dt><dd data-f="wallet.buying_power">—</dd>
-          <dt>Total Account Value</dt><dd data-f="wallet.total_account_value">—</dd>
-        </dl>
-        <dl class="kv">
-          <dt>Current Exposure</dt><dd data-f="wallet.current_exposure">—</dd>
-          <dt>Position Value</dt><dd data-f="wallet.current_position_value">—</dd>
-          <dt>Pending Position Value</dt><dd data-f="wallet.pending_position_value">—</dd>
-          <dt>Open Positions</dt><dd data-f="wallet.open_position_count">—</dd>
-          <dt>Unrealized P/L</dt><dd data-f="wallet.unrealized_pnl">—</dd>
-        </dl>
-        <dl class="kv">
-          <dt>Realized Today</dt><dd data-f="wallet.realized_today">—</dd>
-          <dt>Realized This Run</dt><dd data-f="wallet.realized_run">—</dd>
-          <dt>Realized Lifetime</dt><dd data-f="wallet.realized_lifetime">—</dd>
-          <dt>Wins</dt><dd data-f="wallet.wins">—</dd>
-          <dt>Losses</dt><dd data-f="wallet.losses">—</dd>
-          <dt>Markets Settled</dt><dd data-f="wallet.markets_settled">—</dd>
-        </dl>
-      </div>
-    </section>
-
-    <!-- Gate 19's own arithmetic, beside the wallet it reads. Available comes
-         from the venue; Required is what one order costs; Difference is what the
-         gate compares. A blank Available means no official source published one,
-         which is not zero. -->
-    <section class="panel span2">
-      <h2>Balance Check (G19)</h2>
-      <dl class="kv">
-        <dt>Available</dt><dd data-f="balance.available">—</dd>
-        <dt>Required</dt><dd data-f="balance.required">—</dd>
-        <dt>Difference</dt><dd data-f="balance.difference">—</dd>
-        <dt>Sufficient</dt><dd data-f="balance.sufficient" data-flag>—</dd>
-        <dt>Last Refresh</dt><dd data-f="balance.last_refresh" data-time>—</dd>
-        <dt>Refresh Age</dt><dd data-f="balance.refresh_age_ms" data-ms>—</dd>
-      </dl>
-    </section>
   </div>
 </main>
 
@@ -373,6 +429,31 @@
       </div>
     </div>
   </section>
+  <!-- §36 Market Context: BTC section + feed health, read-only from status doc -->
+  <div class="grid" style="margin-bottom:10px">
+    <section class="panel span2">
+      <h2>Market Context</h2>
+      <dl class="kv">
+        <dt>BTC Price</dt><dd data-f="market.btc_price">—</dd>
+        <dt>Phase</dt><dd data-f="market.phase">—</dd>
+        <dt>Observations</dt><dd data-f="market.observation_count">—</dd>
+        <dt>Opens</dt><dd data-f="market.opens_display.utc_display">—</dd>
+        <dt>Closes</dt><dd data-f="market.closes_display.utc_display">—</dd>
+        <dt>Signal − Settlement</dt><dd data-f="market.signal_settlement_diff">—</dd>
+      </dl>
+    </section>
+    <section class="panel span2">
+      <h2>Order Book</h2>
+      <dl class="kv" id="tank-book">
+        <dt>UP Best Bid</dt><dd id="book-up-bid">—</dd>
+        <dt>UP Passive Limit</dt><dd id="book-up-limit">—</dd>
+        <dt>DOWN Best Bid</dt><dd id="book-down-bid">—</dd>
+        <dt>DOWN Passive Limit</dt><dd id="book-down-limit">—</dd>
+        <dt>Tick Size</dt><dd id="book-tick">—</dd>
+      </dl>
+      <p class="note">The book the Limit Order Engine reads. Refreshed on tab open.</p>
+    </section>
+  </div>
   <div class="toolbar">
     <input id="tank-q" type="search" placeholder="filter events">
     <select id="tank-sev">
@@ -390,28 +471,33 @@
 
 <!-- ════════════════════════════ LEDGER ════════════════════════════ -->
 <main class="ws" id="ws-ledger">
+  <!-- §35 summary row -->
+  <div class="ledger-summary big-values" id="ledger-summary"></div>
   <div class="toolbar">
-    <input id="led-q" type="search" placeholder="market · window · order id · intent · direction">
-    <select id="led-dir"><option value="">any direction</option>
-      <option>UP</option><option>DOWN</option><option>NO_DIRECTION</option></select>
-    <select id="led-state"><option value="">any state</option></select>
-    <select id="led-result"><option value="">any result</option>
-      <option>WIN</option><option>LOSS</option></select>
+    <select id="led-range">
+      <option value="">All</option>
+      <option value="today">Today</option>
+      <option value="yesterday">Yesterday</option>
+      <option value="7d">7 Days</option>
+      <option value="30d">30 Days</option>
+    </select>
+    <select id="led-side"><option value="">Any Side</option>
+      <option value="UP">UP</option><option value="DOWN">DOWN</option></select>
+    <select id="led-status"><option value="">Any Status</option>
+      <option value="open">Open</option><option value="win">Win</option>
+      <option value="loss">Loss</option><option value="skipped">Skipped</option>
+      <option value="cancelled">Cancelled</option></select>
+    <input id="led-q" type="search" placeholder="market / trade / order ID">
     <button id="led-go">Search</button>
     <a id="led-csv" href="/history?format=csv">Export CSV</a>
-    <span class="note">The only history there is. No Orders page, no Trade History page.</span>
   </div>
   <div class="scroll-x">
     <table class="stream" id="ledger-table">
       <thead><tr>
-        <th>Market</th><th>Window</th><th>PTB</th><th>Signal TWAP</th><th>Settlement TWAP</th>
-        <th>Direction</th><th>Locked Trigger</th><th>Buffer</th><th>Intent</th>
-        <th>Local Order</th><th>Venue Order</th>
-        <th>Submitted<br><small>UTC / IST / ET</small></th>
-        <th>Filled<br><small>UTC / IST / ET</small></th>
-        <th>Settled<br><small>UTC / IST / ET</small></th>
-        <th>Order Price</th><th>Fill Price</th><th>Qty</th><th>Filled Qty</th><th>Remaining</th>
-        <th>State</th><th>Rejection</th><th>Buffer Status</th><th>Result</th><th>PnL</th><th>Notes</th>
+        <th>Trade</th><th>Entry Time</th><th>Market</th><th>Window</th>
+        <th>Sec Left</th><th>Side</th><th>Entry Price</th><th>Target Limit</th>
+        <th>Shares</th><th>Order</th><th>Fill</th><th>Settlement</th>
+        <th>P&amp;L</th><th>Result</th>
       </tr></thead>
       <tbody></tbody>
     </table>
@@ -421,6 +507,31 @@
 <!-- ════════════════════════════ ANALYTICS ════════════════════════════ -->
 <main class="ws" id="ws-analytics">
   <div class="grid">
+    <section class="panel span2">
+      <h2>Performance</h2>
+      <dl class="kv">
+        <dt>Realized Today</dt><dd data-f="wallet.realized_today">—</dd>
+        <dt>Realized This Run</dt><dd data-f="wallet.realized_run">—</dd>
+        <dt>Realized Lifetime</dt><dd data-f="wallet.realized_lifetime">—</dd>
+        <dt>Unrealized P/L</dt><dd data-f="wallet.unrealized_pnl">—</dd>
+        <dt>Wins</dt><dd data-f="wallet.wins">—</dd>
+        <dt>Losses</dt><dd data-f="wallet.losses">—</dd>
+        <dt>Win Rate</dt><dd data-f="wallet.win_rate">—</dd>
+        <dt>Skips (buffer not satisfied)</dt><dd id="an-skips">—</dd>
+        <dt>Filled Orders</dt><dd id="an-filled">—</dd>
+        <dt>Rejected Orders</dt><dd id="an-rejected">—</dd>
+        <dt>Markets Settled</dt><dd data-f="wallet.markets_settled">—</dd>
+        <dt>Avg Fill Latency</dt><dd id="an-fill-latency">—</dd>
+        <dt>Total Trades</dt><dd id="an-total-trades">—</dd>
+        <dt>Realized P/L (all)</dt><dd id="an-realized-pnl">—</dd>
+        <dt>Avg Trade P/L</dt><dd id="an-avg-trade">—</dd>
+        <dt>UP Wins / Losses</dt><dd id="an-up-side">—</dd>
+        <dt>DOWN Wins / Losses</dt><dd id="an-down-side">—</dd>
+      </dl>
+      <p class="note">Wins, losses and win rate come from settled trades only.
+         Skips are windows that never submitted because the buffer was not
+         satisfied.</p>
+    </section>
     <section class="panel span2">
       <h2>Operator Analytics</h2>
       <dl class="kv" id="analytics"></dl>
@@ -471,20 +582,17 @@
         <dt>Tables</dt><dd data-f="system.sqlite_tables">—</dd>
         <dt>Schema Version</dt><dd data-f="system.schema_version">—</dd>
         <dt>Active Provider</dt><dd data-f="system.active_provider">—</dd>
-        <dt>Wallet</dt><dd data-f="system.wallet" data-flag>—</dd>
+        <dt>Wallet</dt><dd data-f="system.wallet">—</dd>
         <dt>RTDS</dt><dd data-f="system.rtds">—</dd>
         <dt>WebSocket</dt><dd data-f="system.websocket">—</dd>
-        <dt>RPC</dt><dd data-f="system.rpc" data-flag>—</dd>
-        <dt>Telegram</dt><dd data-f="settings.telegram_configured" data-flag>—</dd>
+        <dt>RPC</dt><dd data-f="system.rpc">—</dd>
+        <dt>Telegram</dt><dd data-f="settings.telegram_configured">—</dd>
         <dt>Mode</dt><dd data-f="system.mode">—</dd>
         <dt>Runtime Uptime</dt><dd data-f="system.runtime_uptime_seconds" data-dur>—</dd>
       </dl>
     </section>
     <section class="panel span2">
       <h2>Venue</h2>
-      <!-- The endpoints ARC is actually dialling, not the ones .env was meant to
-           set. An operator debugging a dead connection needs to see the value in
-           force, not re-derive it from a file they cannot read over the tunnel. -->
       <dl class="kv">
         <dt>CLOB Host</dt><dd data-f="system.clob_host">—</dd>
         <dt>CLOB HTTP</dt><dd data-f="system.clob_http_url">—</dd>
@@ -500,13 +608,24 @@
       <p class="note">Timestamped local file. Nothing is uploaded anywhere.</p>
       <div id="snapshots" class="checks"></div>
     </section>
+
+    <!-- Telegram Notifications moved from Settings to System page. -->
+    <section class="panel span4">
+      <h2>Telegram Notifications</h2>
+      <p class="note">Notification only. Telegram can never control trading, and
+        there is no inbound path. Toggles apply immediately and are not locked by
+        trading, so a noisy category can be silenced while it is firing.</p>
+      <div id="notify" class="toggles"></div>
+      <div class="controls" style="margin-top: 12px;">
+        <button id="telegram-test">Send Test Notification</button>
+      </div>
+      <div id="notify-msg" class="msg"></div>
+    </section>
+
     <section class="panel span2">
       <h2>Configuration Warnings</h2>
       <ul id="warnings" class="plain"></ul>
     </section>
-    <!-- Supervisor LIFECYCLE, not trading status. The runtime's own status is the
-         closed five-value set shown on the OPS Deck; this is the state of the
-         object that owns it, and it belongs here and nowhere else. -->
     <section class="panel span2">
       <h2>Supervisor</h2>
       <dl class="kv">
@@ -518,8 +637,6 @@
         <dt>Risk Eval (max)</dt><dd data-f="runtime.risk_eval_max_ms" data-ms>—</dd>
       </dl>
     </section>
-    <!-- Every risk gate, by permanent ID. Gates that need a live window to mean
-         anything read PER WINDOW rather than a PASS nobody measured. -->
     <section class="panel span4">
       <h2>Risk Gates <small data-f="runtime.gates_summary">—</small></h2>
       <details id="gates-detail">
@@ -535,46 +652,8 @@
   </div>
 </main>
 
-<!-- ════════════════════════════ SETTINGS ════════════════════════════ -->
-<main class="ws" id="ws-settings">
-  <div class="grid">
-    <section class="panel span2">
-      <h2>Editable <span class="pill" id="lock-pill">—</span></h2>
-      <p class="note">Locked while trading is armed: Stop Trading → Edit → Save →
-        Start Trading. A buffer edited under a resting order would leave that order
-        enforcing a rule that no longer exists.</p>
-      <div id="editable"></div>
-      <button id="save-settings">Save configuration</button>
-      <div id="settings-msg" class="msg"></div>
-    </section>
-
-    <section class="panel span2">
-      <h2>Strategy</h2>
-      <dl class="kv">
-        <dt>Strategy</dt><dd data-f="settings.strategy">—</dd>
-        <dt>Editable</dt><dd data-f="settings.strategy_editable" data-flag>—</dd>
-      </dl>
-      <p class="note">Read-only text, not a selector. One strategy exists (A17);
-        a dropdown with one entry invites the belief that others do.</p>
-      <h2>Provider</h2>
-      <dl class="kv"><dt>Active Provider</dt><dd data-f="settings.provider">—</dd></dl>
-      <p class="note">Configuration only. Not selectable from the running dashboard.</p>
-    </section>
-
-    <section class="panel span4">
-      <h2>Telegram Notifications</h2>
-      <p class="note">Notification only. Telegram can never control trading, and
-        there is no inbound path. Toggles apply immediately and are not locked by
-        trading, so a noisy category can be silenced while it is firing.</p>
-      <div id="notify" class="toggles"></div>
-      <div id="notify-msg" class="msg"></div>
-    </section>
-  </div>
-</main>
-
 <!-- ════════════════════════════ BACKTEST ════════════════════════════ -->
 <main class="ws" id="ws-backtest">
-  <!-- Non-dismissible by construction: it is not a dialog and has no close control. -->
   <div class="warn-banner" id="bt-warning">
     Signal visualization only. Not performance. Polymarket settles on a 30-second
     TWAP. Spot candles cannot reproduce settlement outcomes.
@@ -594,22 +673,6 @@
         <th>Buffer</th><th>Trigger Up / Down</th><th>Crossed</th></tr></thead>
       <tbody></tbody>
     </table>
-  </div>
-</main>
-
-<!-- ════════════════════════════ ORDER BOOK ════════════════════════════ -->
-<main class="ws" id="ws-book">
-  <div class="grid">
-    <section class="panel span2">
-      <h2>Order Book Monitor</h2>
-      <div class="toolbar">
-        <select id="book-dir"><option>UP</option><option>DOWN</option></select>
-        <button id="book-go">Read book</button>
-      </div>
-      <dl class="kv" id="book"></dl>
-      <p class="note">Displays the book the Limit Order Engine already uses. It
-        determines no Direction, Strategy, PTB or Trigger.</p>
-    </section>
   </div>
 </main>
 

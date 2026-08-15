@@ -53,6 +53,12 @@ class TwapProvider(Protocol):
     @property
     def disconnects(self) -> int: ...
 
+    # The System page reads this directly to render CONNECTED/DISCONNECTED as a
+    # human-readable word. Adding it here keeps the type-checker honest about
+    # every concrete provider exposing it, which is what mypy was flagging in
+    # arc/api/models.py when `run.feed.connected` had no Protocol backing.
+    connected: bool
+
     def messages(self) -> AsyncIterator[str | bytes]: ...
 
 

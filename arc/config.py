@@ -212,6 +212,15 @@ class ArcSettings(BaseSettings):
     # trading path, so an enabled engine with a blank field is a fatal error, not a
     # substituted guess. They seed SQLite once, like every other trading value.
     majority_enabled: bool = False
+    # Spec §10: ONE combined switch — editable trigger + target limit price.
+    # Final spec §5 switch 2: the buffer entry condition ON/OFF.
+    # Spec §11: optional ±1-tick price retry. All three default OFF (conservative).
+    majority_trigger_limit_enabled: bool = False
+    majority_buffer_enabled: bool = False
+    majority_price_retry_enabled: bool = False
+    # Final spec §20: same-price attempts before the first reprice. Range 5-10,
+    # validated by the builder; the default here is the safe end of the range.
+    majority_price_retry_attempts: int = 5
     majority_execution_window_seconds: int = 0
     majority_execution_windows: str = ""
     majority_buffer: str = ""
@@ -313,7 +322,7 @@ class ArcSettings(BaseSettings):
     # poll interval — the dashboard never polls (the socket pushes), and this only
     # sets how often the countdown re-renders between frames.
     refresh_rate_ms: int = 250
-    theme: str = "dark"
+    theme: str = "light"
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -1075,6 +1084,10 @@ def env_majority_config_values(env: ArcSettings) -> dict[str, str]:
     return env_majority_values(
         enabled=env.majority_enabled,
         execution_windows=windows,
+        trigger_limit_enabled=env.majority_trigger_limit_enabled,
+        buffer_enabled=env.majority_buffer_enabled,
+        price_retry_enabled=env.majority_price_retry_enabled,
+        price_retry_attempts=env.majority_price_retry_attempts,
         buffer=env.majority_buffer,
         trigger_price=env.majority_trigger_price,
         target_limit_price=env.majority_target_limit_price,

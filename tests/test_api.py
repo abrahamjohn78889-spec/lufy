@@ -228,7 +228,7 @@ class TestDecimalContract:
         assert _numbers(client.get("/settings").json(), money=_MONEY) == []
         assert _numbers(client.get("/history").json(), money=_MONEY) == []
         assert _numbers(
-            client.get("/strategies/arc_twap_locked_buffer/config").json(), money=_MONEY
+            client.get("/strategies/MAJORITY/config").json(), money=_MONEY
         ) == []
 
 
@@ -239,8 +239,8 @@ class TestBothGatesAreIndependent:
     two gates are tested where the operator actually presses them.
     """
 
-    ARM = "/strategies/arc_twap_locked_buffer/config?action=arm"
-    DISARM = "/strategies/arc_twap_locked_buffer/config?action=disarm"
+    ARM = "/strategies/MAJORITY/config?action=arm"
+    DISARM = "/strategies/MAJORITY/config?action=disarm"
 
     def test_arming_cannot_open_a_closed_system_gate(
         self, client: TestClient, run: ArcRuntime
@@ -298,27 +298,28 @@ class TestConfigurationLock:
         assert "not editable" in response.json()["detail"]
 
     def test_a_valid_edit_is_saved_and_reports_the_restart(self, client: TestClient) -> None:
-        body = client.post("/settings", json={"submission_count": "2"}).json()
+        body = client.post("/settings", json={"majority_shares": "2"}).json()
         assert body["saved"] is True
         assert body["restart_required"] is True
-        assert body["values"]["submission_count"] == "2"
+        assert body["values"]["majority_shares"] == "2"
 
 
 class TestStrategyIsReadOnly:
-    def test_only_one_strategy_exists_and_it_is_pinned(self, client: TestClient) -> None:
+    def test_only_one_engine_exists_and_it_is_pinned(self, client: TestClient) -> None:
+        """MAJORITY is the only trading engine; TWAP survives as data only."""
         entries = client.get("/strategies").json()
-        assert [e["id"] for e in entries] == ["arc_twap_locked_buffer"]
+        assert [e["id"] for e in entries] == ["MAJORITY"]
         assert entries[0]["pinned"] is True
         assert entries[0]["disableable"] is False
 
     def test_the_parameters_are_not_writable(self, client: TestClient) -> None:
-        """A17: the strategy is pinned, so the parameter write path must refuse.
+        """The engine is pinned, so the parameter write path must refuse.
 
-        The route itself is not refused outright any more — it carries START and
-        STOP TRADING — but a POST that tries to edit the strategy still 405s and
-        the message says where buffers and windows are edited instead.
+        The route itself is not refused outright — it carries START and
+        STOP TRADING — but a POST that tries to edit the engine still 405s and
+        the message says where the values are edited instead.
         """
-        response = client.post("/strategies/arc_twap_locked_buffer/config")
+        response = client.post("/strategies/MAJORITY/config")
         assert response.status_code == 405
         assert "Settings page" in response.json()["detail"]
 

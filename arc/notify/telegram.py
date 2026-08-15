@@ -98,15 +98,14 @@ EVENT_CATEGORY: Final[dict[str, str]] = {
     "Recovery Started": "recovery",
     "Recovery Complete": "recovery",
     "PTB Frozen": "ptb_frozen",
-    "Window Open": "window_open",
-    # Freezing IS the instant direction is determined, and the log line carries the
-    # direction, the TWAP, the PTB, the buffer and the trigger.
-    "Window Frozen": "direction_frozen",
-    "Window No Direction": "direction_frozen",
-    # Firing is the instant the locked trigger is crossed, which is a different
-    # moment from the freeze and the one the operator is waiting on.
-    "Window Fired": "trigger_fired",
-    "Intent Created": "intent_created",
+    # MAJORITY is the only trading engine; these are the labels it actually emits.
+    "MAJORITY Market Opened": "window_open",
+    # Determination IS the instant the direction is locked, and the log line carries
+    # the outcome and the fresh CLOB evidence it was read from.
+    "MAJORITY Determined": "direction_frozen",
+    "MAJORITY No Trade": "direction_frozen",
+    "MAJORITY Triggered": "trigger_fired",
+    "MAJORITY Intent Created": "intent_created",
     "Orders Submitted": "order_submitted",
     "Partial Fill": "partial_fill",
     "Order Filled": "order_filled",
@@ -117,14 +116,13 @@ EVENT_CATEGORY: Final[dict[str, str]] = {
     # never saw is a position they do not know they hold.
     "Order Reconciled": "reconciled",
     "Post-Only Would Cross": "rejected",
-    "Intent Denied": "rejected",
-    "Submission Skipped": "rejected",
+    "MAJORITY Denied": "rejected",
+    "MAJORITY Submission Skipped": "rejected",
     "Order Rejected": "rejected",
     "Order Unknown": "rejected",
-    # A window whose trigger never crossed is BUFFER_NOT_SATISFIED. It is a strategy
-    # outcome, not an error, which is why it is its own category rather than a warning.
-    "Window No Signal": "buffer_not_satisfied",
-    "Windows Expired": "buffer_not_satisfied",
+    # A market closed with windows that never triggered is the MAJORITY analogue of
+    # buffer-not-satisfied: an engine outcome, not an error.
+    "MAJORITY Windows Expired": "buffer_not_satisfied",
     "Settlement Window": "settlement",
     "Market Closed": "settlement",
 }

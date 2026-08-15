@@ -420,7 +420,7 @@ class TestTradingIsTheOtherButton:
     def test_arming_is_a_separate_act_from_starting(self, client: TestClient) -> None:
         client.post("/start?mode=V1")
         assert client.get("/status").json()["runtime"]["execution_armed"] is False
-        armed = client.post("/strategies/arc_twap_locked_buffer/config?action=arm").json()
+        armed = client.post("/strategies/MAJORITY/config?action=arm").json()
         assert armed["execution_armed"] is True
         client.post("/stop")
 
@@ -429,8 +429,8 @@ class TestTradingIsTheOtherButton:
         also tore down the observation stack would blind the operator at exactly
         the moment they reached for it."""
         client.post("/start?mode=V1")
-        client.post("/strategies/arc_twap_locked_buffer/config?action=arm")
-        body = client.post("/strategies/arc_twap_locked_buffer/config?action=disarm").json()
+        client.post("/strategies/MAJORITY/config?action=arm")
+        body = client.post("/strategies/MAJORITY/config?action=disarm").json()
         assert body["execution_armed"] is False
         assert client.get("/status").json()["runtime"]["status"] == RuntimeStatus.RUNNING_V1
         client.post("/stop")

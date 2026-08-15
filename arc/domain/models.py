@@ -498,6 +498,12 @@ class MarketInstance:
     settlement_twap: Decimal | None = None
     dead_reason: str = ""
     _ptb: Decimal | None = field(default=None, repr=False)
+    # The most recent BTC SPOT observation this market has seen. MAJORITY's
+    # >30s BTC memory triggers (§6) capture this as their reference at window
+    # open and compare later ticks against ref ± buffer. Supporting data only —
+    # it never decides a direction; the MAJORITY decision does. Last observation
+    # wins: feed freshness is judged by the runtime's health gates, not here.
+    _last_btc: Decimal | None = field(default=None, repr=False)
 
     @classmethod
     def create(cls, window_ts: int, offsets: tuple[int, ...]) -> MarketInstance:
@@ -557,6 +563,12 @@ class MarketInstance:
     # ── observations ─────────────────────────────────────────────────────────
 
     @property
+    def last_btc(self) -> Decimal | None:
+        """The latest BTC spot price observed for this market. None before the
+        first observation. Supporting data for MAJORITY's entry triggers."""
+        return self._last_btc
+
+    @property
     def signal_twap(self) -> Decimal | None:
         """ARC's own cumulative mean over this market. The STRATEGY INPUT.
 
@@ -587,6 +599,7 @@ class MarketInstance:
             raise ObservationRejectedError(
                 f"{self.slug} is {self.phase} and does not accept observations"
             )
+        self._last_btc = observation.price
         self.accumulator.add(observation.price)
 
     # ── windows ──────────────────────────────────────────────────────────────

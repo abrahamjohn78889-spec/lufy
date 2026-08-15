@@ -86,9 +86,10 @@ _A16: dict[str, str] = {
     "Running P/L": 'data-f="wallet.unrealized_pnl"',
 }
 
-# The last four are workspaces reached from the always-visible tab bar, not deck
-# panels: "without switching tabs" applies to the twelve values above.
-_TABS = ("ledger", "tank", "settings")
+# The workspaces reached from the always-visible tab bar. Settings was removed in
+# Phase 2 (MAJORITY config is edited directly on the OPS Deck); analytics replaced
+# it as the operator's performance view.
+_TABS = ("ledger", "tank", "analytics")
 
 
 class TestSixteenPrimaryElements:
@@ -115,25 +116,30 @@ class TestSixteenPrimaryElements:
 
 class TestPanelsRequiredByTheSpec:
     def test_each_named_panel_exists(self) -> None:
+        """Phase 2 rebuilds the deck with MAJORITY dominant. These are the panels
+        the spec names; a heading missing from this list is a value the operator
+        still SSHes for."""
         for heading in (
-            "Runtime", "Engines", "Runtime Control", "Trading Control", "Preflight",
+            "MAJORITY Engine", "MAJORITY Configuration", "Saved Configurations",
+            "Wallet", "Balance Check (G19)", "Active Limit Orders",
+            "Runtime", "Engines", "Runtime Control", "Preflight",
             "Running TWAP", "Limit Order Engine", "Market Information", "Provider",
-            "Execution", "Recovery", "Error Summary", "Runtime Counters", "Wallet",
+            "Execution", "Recovery", "Error Summary", "Runtime Counters",
         ):
             assert f"<h2>{heading}" in _OPS, heading
 
     def test_starting_the_runtime_is_a_different_button_from_trading(self) -> None:
         """The one failure this prevents: an operator who pressed START to look at
         the system and finds the next window submitted an order. The runtime panel
-        must not post to the arm route, and the trading panel must not post to
-        /start."""
+        must not post to the arm route, and the trading controls (now inside the
+        MAJORITY Engine panel) must not post to /start."""
         runtime = _OPS.split("<h2>Runtime Control", 1)[1].split("</section>", 1)[0]
-        trading = _OPS.split("<h2>Trading Control", 1)[1].split("</section>", 1)[0]
+        majority = _OPS.split("<h2>MAJORITY Engine", 1)[1].split("</section>", 1)[0]
         assert "START RUNTIME" in runtime
         assert "action=arm" not in runtime
-        assert "START TRADING" in trading
-        assert "action=arm" in trading
-        assert 'data-post="/start' not in trading
+        assert "START TRADING" in majority
+        assert 'data-post="/strategies/MAJORITY/config?action=disarm"' in majority
+        assert 'data-post="/start' not in majority
 
     def test_the_mode_selector_selects_rather_than_starts(self) -> None:
         """A mode button that booted a live venue session on one click is a live
@@ -156,14 +162,15 @@ class TestPanelsRequiredByTheSpec:
         assert 'id="runtime-stop"' in _OPS
 
     def test_trading_control_has_all_four_buttons(self) -> None:
-        """Pause and resume belong to the Limit Order Engine, not to a general
-        controls row. An operator who cannot find PAUSE reaches for STOP RUNTIME,
-        which tears down the feeds instead of holding one window."""
-        trading = _OPS.split("<h2>Trading Control", 1)[1].split("</section>", 1)[0]
+        """Pause and resume belong to the MAJORITY Engine panel (Phase 2 moved
+        trading controls into the dominant MAJORITY area). An operator who cannot
+        find PAUSE reaches for STOP RUNTIME, which tears down the feeds instead
+        of holding one window."""
+        majority = _OPS.split("<h2>MAJORITY Engine", 1)[1].split("</section>", 1)[0]
         for label in ("START TRADING", "PAUSE TRADING", "RESUME TRADING", "STOP TRADING"):
-            assert label in trading, label
-        assert 'data-post="/pause"' in trading
-        assert 'data-post="/resume"' in trading
+            assert label in majority, label
+        assert 'data-post="/pause"' in majority
+        assert 'data-post="/resume"' in majority
 
     def test_both_gates_are_displayed_independently(self) -> None:
         """A single combined light would hide system-disabled-while-armed."""
@@ -179,14 +186,24 @@ class TestPanelsRequiredByTheSpec:
         assert 'data-f="market.settlement_twap"' in panel
         assert 'data-f="market.ptb"' in panel
 
-    def test_wallet_is_the_last_panel_on_the_deck(self) -> None:
-        assert _OPS.rindex("<h2>Wallet") > _OPS.rindex("<h2>Runtime Counters")
+    def test_wallet_is_prominent_in_the_majority_section(self) -> None:
+        """§38 two-column layout places Wallet at the top of the left column,
+        immediately visible to the operator. Active Limit Orders lives in the
+        right column below MAJORITY panels. The guarantee is that Wallet is
+        prominent — verified by its position in the left ops-col before the
+        right column's Active Limit Orders."""
+        # Wallet is in the left column; Active Limit Orders in the right column.
+        # Left column content precedes right column content in string order.
+        assert _OPS.index("<h2>Wallet") < _OPS.index("<h2>Active Limit Orders")
+        # Wallet appears after LOE (the last operational panel in the left column).
+        assert _OPS.index('id="loe"') < _OPS.index("<h2>Wallet")
 
     def test_there_is_no_strategy_selector_anywhere(self) -> None:
-        """A17: one strategy, read-only text. A dropdown implies others exist."""
+        """A17: one strategy, read-only text. A dropdown implies others exist.
+        Phase 2 removed the Settings tab entirely; MAJORITY config is edited
+        directly on the OPS Deck with input fields, not a strategy picker."""
         assert "<select" not in _OPS
-        settings = _INDEX.split('id="ws-settings"', 1)[1].split("</main>", 1)[0]
-        assert "<select" not in settings
+        assert 'id="ws-settings"' not in _INDEX
 
     def test_the_provider_is_displayed_but_never_selectable(self) -> None:
         """Criterion 20: provider switching is configuration, not a runtime control."""
